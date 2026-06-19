@@ -157,17 +157,6 @@ gh release edit vX.Y.Z --prerelease=false
 
 Stable machines pick it up on their next check.
 
-### Enabling signing (one-time, maintainers)
-
-```
-python tools/gen_keypair.py
-```
-
-Add the printed **private seed** as the repo Actions secret `PROXYFORCE_SIGNING_KEY`,
-and paste the printed **public key** into `core/updater.py` → `RELEASE_PUBKEY_B64`.
-Until this is configured, releases build unsigned and the auto-updater refuses them
-(manual install still works).
-
 ---
 
 ## Build from Source
