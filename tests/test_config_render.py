@@ -60,9 +60,11 @@ class SplitRouteGuardTests(unittest.TestCase):
 
 
 class LocalProxyInboundTests(unittest.TestCase):
-    """The Edge-update fix: a local mixed inbound the Windows system proxy points at,
-    so proxy-aware apps (incl. the Edge updater) use TCP CONNECT through sing-box
-    instead of attempting the QUIC/direct path that fails (error 0x80072EFE)."""
+    """Part of the Edge-update fix: a local mixed inbound the Windows system proxy
+    points at for HTTPS, so proxy-aware apps (incl. the Edge updater) reach the
+    corporate proxy via TCP CONNECT through sing-box. (Plaintext HTTP takes a separate
+    local forward-proxy — see tests/test_local_proxy — because the corporate proxy
+    403s CONNECT on :80, the real cause of error 0x80072EFE.)"""
 
     def _config(self):
         cfg = ProxyConfig(host="203.0.113.10", port=800)

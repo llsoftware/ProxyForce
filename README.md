@@ -5,8 +5,8 @@ Transparent corporate-proxy redirector for Windows.
 apps that are hardcoded to ignore proxy settings (e.g. AnythingLLM).** Capture
 happens at the network layer (a TUN adapter), so it doesn't depend on any app
 cooperating. ProxyForce also points the Windows system proxy at its own local
-sing-box listener while it runs (so proxy-aware apps route through ProxyForce over
-TCP — and don't attempt QUIC/direct around it) and suppresses IPv6 (AAAA) so
+listeners while it runs (so proxy-aware apps — including the Microsoft Edge updater
+— route through ProxyForce instead of around it) and suppresses IPv6 (AAAA) so
 dual-stack apps fall back to IPv4 — nothing leaks around the proxy.
 
 Works on **Windows 10 22H2+** and **Windows 11**, on bare metal and in VMs
@@ -31,15 +31,18 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
   so it always knows the target hostname, then issues `CONNECT <hostname>:port` to
   your corporate proxy. Because capture is at the network layer, this works even
   for apps that are hardcoded to ignore proxy settings — no per-app config needed.
-- **The Windows system proxy points at ProxyForce's own local sing-box listener
-  while it runs** (both the per-user WinINET setting *and* machine-wide WinHTTP),
-  then is restored exactly as it was on stop. Proxy-aware apps (browsers, the
-  Microsoft Edge updater, …) therefore send `CONNECT` to ProxyForce over TCP and
-  sing-box forwards them to the corporate proxy — they never believe they're on
-  direct internet and never attempt HTTP-3/QUIC (which the UDP reject below kills;
-  that was the cause of Edge update error `0x80072EFE`). Loopback/intranet and your
-  bypass list stay direct. The TUN remains the catch-all for apps that ignore proxy
-  settings. The original is snapshotted to
+- **The Windows system proxy points at ProxyForce while it runs** (both the per-user
+  WinINET setting *and* machine-wide WinHTTP), then is restored exactly as it was on
+  stop. It is set **protocol-split** so each scheme takes its working path: **HTTPS**
+  goes to sing-box's local listener (`CONNECT`, native and fast), while **plaintext
+  HTTP** goes to a small local **forward-proxy** that relays it to the corporate proxy
+  as a normal `GET http://…`. That split is what fixes the **Microsoft Edge updater**
+  (error `0x80072EFE`): Edge downloads its payload via Delivery Optimization over
+  **plaintext HTTP on port 80**, and many corporate proxies (including the one this was
+  diagnosed against) allow `CONNECT` only to :443 and return **403** to `CONNECT` on
+  :80 — so port-80 traffic must leave as a forward-proxy `GET`, which it now does.
+  Loopback/intranet and your bypass list stay direct. The TUN remains the catch-all for
+  apps that ignore proxy settings. The original is snapshotted to
   `C:\ProgramData\ProxyForce\proxy_backup.json`, so it's restored even after a crash.
 - **IPv6 is suppressed** (AAAA answered with NODATA) so dual-stack apps fall back to
   IPv4 → fakeip → proxy. The TUN is IPv4-only by design (avoids a Windows 10 IPv6

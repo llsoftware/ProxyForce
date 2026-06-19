@@ -60,6 +60,7 @@ a = Analysis(
         'core.singbox_controller',
         'core.config_store',
         'core.system_proxy',
+        'core.local_proxy',
         # auto-updater (lazily imported in main.py for --apply-update)
         'core.updater',
         'core._version',

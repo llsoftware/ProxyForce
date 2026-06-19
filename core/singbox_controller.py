@@ -265,7 +265,10 @@ class SingBoxController:
         self._proc: Optional[subprocess.Popen] = None
         self._log_fh = None
         self._clash_port = 0
-        self._local_proxy_port = 0   # local mixed inbound the system proxy points at
+        self._local_proxy_port = 0   # local mixed inbound the system proxy points at (HTTPS)
+        self._http_proxy_port = 0    # local forward-proxy for plaintext HTTP (the port-80 fix)
+        self._http_proxy = None
+        self._proxy_connect_host = ""  # corp proxy IP resolved pre-DNS-hijack (forward proxy)
         self._exit_code = 0
         self._stop_event = threading.Event()
         self._monitor: Optional[threading.Thread] = None
@@ -415,14 +418,16 @@ class SingBoxController:
                     "strict_route": True,
                     "stack": "system",
                 },
-                # Local HTTP/SOCKS listener that the Windows system proxy points at
-                # (see _takeover_system_proxy). Proxy-aware apps — including the
-                # Microsoft Edge updater — send TCP CONNECT here instead of believing
-                # they're on direct internet and attempting HTTP-3/QUIC (which the
-                # all-UDP reject below kills, the root cause of Edge update error
-                # 0x80072EFE). sing-box forwards these to the corporate proxy via the
-                # same route rules (final = proxy-out), authenticated centrally. The
-                # TUN remains the catch-all for apps that ignore proxy settings.
+                # Local HTTP/SOCKS listener that the Windows system proxy points at for
+                # HTTPS (the https= entry; see _takeover_system_proxy). Proxy-aware apps
+                # — including the Microsoft Edge updater — send TCP CONNECT here and
+                # sing-box forwards them to the corporate proxy (final = proxy-out),
+                # authenticated centrally. Plaintext HTTP (port 80) does NOT come here:
+                # the corporate proxy returns 403 to CONNECT on :80 (proven 2026-06-19),
+                # which is all sing-box's outbound can do — so port-80 traffic is sent to
+                # ProxyForce's local forward-proxy (core/local_proxy) instead, which
+                # relays it as a normal forward-proxy GET. The TUN remains the catch-all
+                # for apps that ignore proxy settings.
                 {
                     "type": "mixed",
                     "tag": "local-in",
@@ -474,6 +479,19 @@ class SingBoxController:
 
         self._clash_port = _free_loopback_port()
         self._local_proxy_port = _free_loopback_port()
+        # Resolve the corporate proxy's REAL IP now — BEFORE sing-box hijacks DNS to
+        # fakeip — so the local forward-proxy (started after green) dials the real
+        # upstream rather than a fakeip that would loop back into the TUN. For an
+        # IP-literal proxy this is just the host; for a hostname we best-effort resolve
+        # and reject a fakeip answer (a stale TUN from a crashed run).
+        self._proxy_connect_host = self.config.host
+        if not _looks_like_cidr_or_ip(self.config.host):
+            try:
+                ip = socket.gethostbyname(self.config.host)
+                if not ip.startswith(("198.18.", "198.19.")):
+                    self._proxy_connect_host = ip
+            except Exception:
+                pass
         cfg_path = self._write_config(self._clash_port)
 
         # Validate the generated config before running — turns a malformed config
@@ -621,6 +639,9 @@ class SingBoxController:
         # any user traffic — do not rely on auto_route alone (it under-installed
         # these on Win 10, the root cause of "green but no capture").
         self._enforce_capture_routes()
+        # Bring up the local plaintext-HTTP forward proxy BEFORE the system-proxy
+        # takeover (the takeover points the http= entry at it). See _start_http_proxy.
+        self._start_http_proxy()
         # v2.1.9: take over the Windows system proxy. While a system proxy is set,
         # cooperating apps (browsers) send traffic STRAIGHT to it and never produce
         # the "direct" traffic the TUN captures — they bypass ProxyForce entirely.
@@ -638,8 +659,9 @@ class SingBoxController:
                 self._set_state(SingBoxState.ERROR)
                 self._log(f"sing-box exited unexpectedly (code {self._proc.returncode}). "
                           f"{self._tail_log()}", "error")
-                # The engine died with the system proxy disabled — restore it so the
-                # machine isn't left with no working proxy path.
+                # The engine died — tear down the forward proxy and restore the system
+                # proxy so the machine isn't left with no working proxy path.
+                self._stop_http_proxy()
                 self._restore_system_proxy()
                 self._close_log()
                 return
@@ -902,20 +924,73 @@ class SingBoxController:
                 parts.append(e)
         return ";".join(parts)
 
+    # ── local forward-proxy (plaintext-HTTP / port-80 fix) ─────────────────────────
+
+    def _start_http_proxy(self) -> bool:
+        """Start the loopback forward-proxy that relays plaintext HTTP (port 80) to the
+        corporate proxy as a forward-proxy GET. This is the fix for the Edge updater and
+        any port-80 download: the corporate proxy returns 403 to CONNECT on :80 (which
+        is all sing-box's outbound can do), but happily serves the same URL as a normal
+        forward-proxy GET. See core/local_proxy for the full rationale. Best-effort: on
+        failure HTTPS still works via sing-box and only plaintext HTTP stays broken."""
+        try:
+            from core import local_proxy
+            basic = self.config.auth_type == "basic"
+            prx = local_proxy.LocalForwardProxy(
+                self._proxy_connect_host or self.config.host, int(self.config.port),
+                username=(self.config.username if basic else ""),
+                password=(self.config.password if basic else ""),
+                on_log=self.on_log)
+            self._http_proxy_port = prx.start()
+            self._http_proxy = prx
+            self._log(f"Local HTTP forward-proxy up on 127.0.0.1:{self._http_proxy_port} "
+                      f"→ relays plaintext HTTP to the corporate proxy as a forward GET "
+                      f"(fixes port-80 downloads such as the Edge updater).")
+            return True
+        except Exception as e:
+            self._http_proxy = None
+            self._http_proxy_port = 0
+            self._log(f"Could not start the local HTTP forward-proxy ({e}); plaintext-HTTP "
+                      f"(port 80) may fail behind a CONNECT-only proxy.", "warning")
+            return False
+
+    def _stop_http_proxy(self):
+        prx = self._http_proxy
+        self._http_proxy = None
+        self._http_proxy_port = 0
+        if prx is not None:
+            try:
+                prx.stop()
+            except Exception:
+                pass
+
     def _takeover_system_proxy(self):
-        """Point the Windows system proxy (WinINET + WinHTTP) at ProxyForce's local
-        sing-box listener (127.0.0.1:<port>) while it runs. Proxy-aware apps — incl.
-        the Microsoft Edge updater — then use TCP CONNECT through sing-box and never
-        attempt the QUIC/direct path that fails behind the corporate proxy. The TUN
-        still captures apps that ignore proxy settings. The previous config is
+        """Point the Windows system proxy (WinINET + WinHTTP) at ProxyForce while it
+        runs, using a PROTOCOL-SPLIT proxy so each scheme takes its working path:
+
+          https=127.0.0.1:<sing-box mixed>  — TLS via CONNECT (sing-box, native/fast)
+          http =127.0.0.1:<local forward>   — plaintext HTTP relayed as a forward-proxy
+                                              GET (core/local_proxy)
+
+        The split is the fix for the Edge updater: the corporate proxy 403s CONNECT to
+        :80, so plaintext-HTTP downloads (Delivery Optimization) must leave as a
+        forward-proxy GET, which sing-box's CONNECT-only outbound cannot produce. If the
+        forward proxy did not start, fall back to the single sing-box listener (HTTPS
+        keeps working; port-80 stays broken). Proxy-aware apps then route through us; the
+        TUN still captures apps that ignore proxy settings. The previous config is
         snapshotted and restored on stop (crash-recovered from proxy_backup.json)."""
         try:
             from core import system_proxy
-            server = f"127.0.0.1:{self._local_proxy_port}"
+            if self._http_proxy_port:
+                server = (f"http=127.0.0.1:{self._http_proxy_port};"
+                          f"https=127.0.0.1:{self._local_proxy_port}")
+            else:
+                server = f"127.0.0.1:{self._local_proxy_port}"
             prev = system_proxy.point_at(server, self._build_proxy_bypass())
             was = f" (was: {prev})" if prev else ""
             self._log(f"Windows system proxy pointed at ProxyForce ({server}){was} — "
-                      f"proxy-aware apps now route through sing-box; original restored on stop.")
+                      f"HTTPS via sing-box, plaintext HTTP via the local forward-proxy; "
+                      f"original restored on stop.")
         except Exception as e:
             self._log(f"Could not take over the Windows system proxy: {e}", "warning")
 
@@ -1159,18 +1234,21 @@ class SingBoxController:
                 sp_state = system_proxy.current_state()
             except Exception as e:
                 sp_state = f"<unavailable: {e}>"
-            ours = f"127.0.0.1:{self._local_proxy_port}"
-            sp_ok = ours in sp_state
-            section(fh, "System proxy (should point at ProxyForce's local listener)", sp_state,
+            mixed = f"127.0.0.1:{self._local_proxy_port}"
+            fwd = f"127.0.0.1:{self._http_proxy_port}" if self._http_proxy_port else ""
+            ours = (f"http={fwd};https={mixed}" if fwd else mixed)
+            sp_ok = (mixed in sp_state) and (not fwd or fwd in sp_state)
+            section(fh, "System proxy (should point at ProxyForce's local listeners)", sp_state,
                     (f"PASS — system proxy points at ProxyForce ({ours}); proxy-aware apps "
-                     "route through sing-box over TCP CONNECT"
+                     "route HTTPS through sing-box (CONNECT) and plaintext HTTP through the "
+                     "local forward-proxy (forward GET)"
                      if sp_ok else
-                     "WARN — system proxy does not point at ProxyForce. Takeover may have been "
-                     "blocked (GPO?) or overridden by a per-app/group-policy proxy; proxy-aware "
-                     "apps may bypass capture or attempt QUIC."))
+                     "WARN — system proxy does not fully point at ProxyForce. Takeover may have "
+                     "been blocked (GPO?) or overridden by a per-app/group-policy proxy; "
+                     "proxy-aware apps may bypass capture."))
             step(sp_ok,
                  f"Windows system proxy points at ProxyForce ({ours})" if sp_ok
-                 else "Windows system proxy does NOT point at ProxyForce (proxy-aware apps may bypass)")
+                 else "Windows system proxy does NOT fully point at ProxyForce (proxy-aware apps may bypass)")
 
             # ── What sing-box itself saw ──
             conns = self._clash_get("/connections") or {}
@@ -1327,7 +1405,9 @@ class SingBoxController:
         while time.time() < end and self._tun_adapter_exists():
             time.sleep(0.3)
 
-        # Put the Windows system proxy back exactly as we found it.
+        # Stop the local forward-proxy and put the Windows system proxy back exactly
+        # as we found it.
+        self._stop_http_proxy()
         self._restore_system_proxy()
 
         self.stats.active_connections = 0

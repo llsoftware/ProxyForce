@@ -159,11 +159,17 @@ class TestApplySwap(unittest.TestCase):
         self._real_spawn = updater._spawn
         self._real_checks = updater._HEALTH_CHECKS
         self._real_interval = updater._HEALTH_INTERVAL
+        # Keep _applog() out of the REAL %ProgramData%\ProxyForce\update\apply.log:
+        # _apply_swap logs via update_dir(), so without this the test pollutes live
+        # state and its "did not stay up" line looks like a real failed auto-update.
+        self._real_update_dir = updater.update_dir
+        updater.update_dir = lambda: self._root
         updater._HEALTH_CHECKS = 2
         updater._HEALTH_INTERVAL = 0.01
 
     def tearDown(self):
         updater._spawn = self._real_spawn
+        updater.update_dir = self._real_update_dir
         updater._HEALTH_CHECKS = self._real_checks
         updater._HEALTH_INTERVAL = self._real_interval
 
