@@ -40,6 +40,10 @@ _DEFAULTS = {
     "start_minimized": False,
     "log_level": "info",
     "appearance": "system",   # "light" | "dark" | "system" (follow OS)
+    # ── Auto-update ──
+    "auto_update_check": True,      # nightly background check while running
+    "update_hour": 3,               # local hour (0-23) for the nightly check / "install tonight"
+    "update_channel": "stable",     # "stable" (releases) | "dev" (incl. pre-releases)
 }
 
 

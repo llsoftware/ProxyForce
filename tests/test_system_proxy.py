@@ -68,6 +68,36 @@ class BackupRoundTripTests(unittest.TestCase):
         self.assertEqual(bytes.fromhex(restored["winhttp"][0]), original)
 
 
+class PointAtTests(unittest.TestCase):
+    """point_at() must SET the proxy (not disable it) and keep the crash-safe backup
+    semantics. _set is stubbed so the real registry/netsh is never touched."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_dir = system_proxy._data_dir
+        self._orig_set = system_proxy._set
+        system_proxy._data_dir = lambda: self._tmp
+        self._calls = []
+        system_proxy._set = lambda server, bypass: self._calls.append((server, bypass))
+
+    def tearDown(self):
+        system_proxy._data_dir = self._orig_dir
+        system_proxy._set = self._orig_set
+
+    def test_points_at_server_and_writes_backup(self):
+        system_proxy.point_at("127.0.0.1:18080", "<local>;127.*")
+        self.assertEqual(self._calls[-1], ("127.0.0.1:18080", "<local>;127.*"))
+        self.assertIsNotNone(system_proxy._read_backup())   # original snapshotted
+
+    def test_crash_safe_keeps_first_backup(self):
+        system_proxy.point_at("127.0.0.1:18080", "b1")
+        first = system_proxy._read_backup()
+        prev = system_proxy.point_at("127.0.0.1:9999", "b2")   # second call mid-takeover
+        self.assertEqual(prev, "")                              # doesn't re-snapshot
+        self.assertEqual(self._calls[-1], ("127.0.0.1:9999", "b2"))   # but still re-asserts
+        self.assertEqual(system_proxy._read_backup(), first)   # true original preserved
+
+
 class ReadOnlyReadersTests(unittest.TestCase):
     """Snapshot + current_state only READ the registry — safe to call live."""
 

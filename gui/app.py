@@ -10,6 +10,7 @@ import threading
 import queue
 import re
 import time
+from datetime import datetime
 import tkinter as tk
 from tkinter import messagebox
 
@@ -20,6 +21,8 @@ sys.path.insert(0, os.path.join(BASE_DIR, ".."))
 
 from core.config_store import load_config, save_config, save_autostart
 from core.singbox_controller import SingBoxController, SingBoxState, make_proxy_config
+from core import updater
+from core._version import __version__ as _PF_VERSION
 
 try:
     from PIL import Image, ImageDraw
@@ -41,7 +44,7 @@ try:
 except ImportError:
     _HAS_TRAY = False
 
-_APP_VERSION = "2.1.10"
+_APP_VERSION = _PF_VERSION
 DATA_DIR    = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "ProxyForce")
 SINGBOX_LOG = os.path.join(DATA_DIR, "singbox", "singbox.log")
 _ANSI_RE    = re.compile(r"\x1b\[[0-9;]*m")
@@ -468,6 +471,36 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._check(s4, "autostart",       "Launch at logon  (UAC prompt appears at sign-in)")
         self._check(s4, "start_minimized", "Start minimized to system tray")
 
+        s5 = self._section("UPDATES")
+        self._lbl(s5, "Update Channel")
+        chan_var = tk.StringVar(value="Stable")
+        self._vars["_channel_display"] = chan_var
+        ctk.CTkSegmentedButton(
+            s5, values=["Stable", "Development"], variable=chan_var,
+            fg_color=THEME["card2"], selected_color=THEME["accent_dk"],
+            selected_hover_color=THEME["accent"], unselected_color=THEME["card2"],
+            unselected_hover_color=THEME["border"], text_color=THEME["text"],
+            font=ctk.CTkFont("Segoe UI", 10, weight="bold"), corner_radius=6,
+        ).pack(anchor="w", pady=6)
+        self._check(s5, "auto_update_check", "Check for updates nightly (in the background)")
+        self._lbl(s5, "Nightly check / install hour (local, 0–23)")
+        hour_var = tk.StringVar(value="3")
+        self._vars["update_hour"] = hour_var
+        ctk.CTkOptionMenu(
+            s5, values=[str(h) for h in range(24)], variable=hour_var, width=80,
+            fg_color=THEME["input_bg"], button_color=THEME["accent_dk"],
+            button_hover_color=THEME["accent"], text_color=THEME["text"],
+            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+        ).pack(anchor="w", pady=4)
+        self._upd_status = ctk.CTkLabel(
+            s5, text=f"ProxyForce v{_APP_VERSION}",
+            font=ctk.CTkFont("Segoe UI", 10), text_color=THEME["muted"])
+        self._upd_status.pack(anchor="w", pady=(12, 2))
+        self._upd_progress = ctk.CTkProgressBar(s5, height=8, corner_radius=4,
+                                                progress_color=THEME["accent"])
+        self._upd_progress.set(0)
+        # packed on demand by set_update_progress()
+
         ctk.CTkFrame(self, fg_color="transparent", height=8).pack()
 
     def get_values(self) -> dict:
@@ -475,12 +508,18 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         for k, v in self._vars.items():
             if k == "_auth_display":
                 d["auth_type"] = _AUTH_INTERNAL.get(v.get(), "none")
+            elif k == "_channel_display":
+                d["update_channel"] = "dev" if v.get() == "Development" else "stable"
             else:
                 d[k] = v.get()
         try:
             d["port"] = int(d.get("port", 8080))
         except (ValueError, TypeError):
             d["port"] = 8080
+        try:
+            d["update_hour"] = max(0, min(23, int(d.get("update_hour", 3))))
+        except (ValueError, TypeError):
+            d["update_hour"] = 3
         raw = self._bypass_text.get("1.0", "end").strip() if self._bypass_text else ""
         d["bypass_list"] = [ln.strip() for ln in raw.splitlines() if ln.strip()]
         return d
@@ -489,11 +528,31 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         for k, var in self._vars.items():
             if k == "_auth_display":
                 var.set(_AUTH_DISPLAY.get(str(d.get("auth_type", "none")).lower(), "None"))
+            elif k == "_channel_display":
+                var.set("Development" if str(d.get("update_channel", "stable")).lower() == "dev"
+                        else "Stable")
             elif k in d:
                 var.set(d[k])
         if "bypass_list" in d and self._bypass_text:
             self._bypass_text.delete("1.0", "end")
             self._bypass_text.insert("1.0", "\n".join(d["bypass_list"]))
+
+    def set_update_status(self, text: str, color: str = None):
+        lbl = getattr(self, "_upd_status", None)
+        if lbl:
+            lbl.configure(text=text, text_color=color or THEME["muted"])
+
+    def set_update_progress(self, frac):
+        """frac in [0,1] shows/updates the bar; None hides it."""
+        bar = getattr(self, "_upd_progress", None)
+        if not bar:
+            return
+        if frac is None or frac < 0:
+            bar.pack_forget()
+        else:
+            if not bar.winfo_manager():
+                bar.pack(fill="x", pady=(2, 6))
+            bar.set(max(0.0, min(1.0, float(frac))))
 
     def repaint_theme(self):
         ib = cc("input_bg")
@@ -558,6 +617,10 @@ class ProxyForceApp(ctk.CTk):
 
         if _HAS_TRAY:
             self._setup_tray()
+
+        # Auto-update: nightly background check timer + reconnect after an update swap.
+        threading.Thread(target=self._update_timer_loop, daemon=True).start()
+        self.after(1200, self._maybe_resume_after_update)
 
         if start_minimized:
             self.withdraw()
@@ -815,6 +878,15 @@ class ProxyForceApp(ctk.CTk):
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=12)
 
+        ctk.CTkButton(btn_row, text="CHECK FOR UPDATES",
+                      command=lambda: self._check_for_updates(manual=True),
+                      fg_color=THEME["card2"], hover_color=THEME["border"],
+                      text_color=THEME["text"], border_width=1,
+                      border_color=THEME["border"],
+                      font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
+                      corner_radius=8, width=180, height=38
+                      ).pack(side="left", padx=4)
+
         ctk.CTkButton(btn_row, text="TEST PROXY",
                       command=self._test_proxy,
                       fg_color=THEME["card2"], hover_color=THEME["border"],
@@ -958,6 +1030,165 @@ class ProxyForceApp(ctk.CTk):
 
         threading.Thread(target=do_test, daemon=True).start()
 
+    # ── Updates ───────────────────────────────────────────────────────────────
+
+    def _pending_staged(self):
+        """Return {tag, version, dir} if a verified, newer build is already staged."""
+        st = updater.load_state()
+        tag, ddir = st.get("staged_tag"), st.get("staged_dir")
+        if tag and ddir and os.path.isdir(ddir) \
+                and updater.version_gt(tag, updater.current_version()):
+            return {"tag": tag, "version": st.get("staged_version") or tag.lstrip("vV"),
+                    "dir": ddir}
+        return None
+
+    def _check_for_updates(self, manual: bool = False):
+        """Check the selected channel, then download+verify+stage in a worker thread.
+        If a verified build is already staged, go straight to the install prompt."""
+        pend = self._pending_staged()
+        if pend:
+            if manual:
+                self._prompt_install(pend["tag"], pend["version"])
+            return
+        cfg = load_config()
+        if not cfg.get("host"):
+            if manual:
+                messagebox.showwarning("ProxyForce", "Configure a proxy host in Settings first.")
+            return
+        self._settings_panel.set_update_status("Checking for updates…", THEME["text"])
+
+        def work():
+            try:
+                info = updater.check_latest(cfg)
+            except Exception as e:
+                self._queue.put(("upd_error", f"Update check failed: {e}"))
+                return
+            if not info:
+                chan = "Development" if cfg.get("update_channel") == "dev" else "Stable"
+                self._queue.put(("upd_status",
+                    f"Up to date — v{updater.current_version()} ({chan})", THEME["muted"]))
+                if manual:
+                    self._queue.put(("log", "No updates available.", "info"))
+                return
+            self._queue.put(("log", f"Update {info.version} available — downloading…", "info"))
+            self._queue.put(("upd_status", f"Downloading {info.version}…", THEME["text"]))
+            try:
+                def prog(done, total):
+                    if total:
+                        self._queue.put(("upd_progress", done / total))
+                ddir = updater.download(info, cfg, prog)
+                self._queue.put(("upd_progress", None))
+                self._queue.put(("upd_status", f"Verifying {info.version}…", THEME["text"]))
+                if not updater.verify(info, ddir):
+                    self._queue.put(("upd_error",
+                        "Verification FAILED (signature/checksum) — update rejected."))
+                    return
+                staged = updater.stage(info, ddir)
+                st = updater.load_state()
+                st.update({"staged_tag": info.tag, "staged_version": info.version,
+                           "staged_dir": staged})
+                st.pop("apply_at_hour", None)
+                updater.save_state(st)
+                self._queue.put(("upd_ready", info.tag, info.version, manual))
+            except Exception as e:
+                self._queue.put(("upd_progress", None))
+                self._queue.put(("upd_error", f"Update download failed: {e}"))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _prompt_install(self, tag: str, version: str):
+        hour = int(load_config().get("update_hour", 3))
+        ans = messagebox.askyesnocancel(
+            "ProxyForce Update",
+            f"Update {version} is downloaded and verified.\n\n"
+            f"•  Yes — install now (brief disconnect, then auto-reconnect)\n"
+            f"•  No — install tonight at {hour:02d}:00\n"
+            f"•  Cancel — remind me later")
+        if ans is True:
+            self._apply_staged()
+        elif ans is False:
+            st = updater.load_state()
+            st["apply_at_hour"] = hour
+            updater.save_state(st)
+            self._settings_panel.set_update_status(
+                f"v{version} will install at {hour:02d}:00", THEME["accent"])
+            self._log(f"Update {version} scheduled to install at {hour:02d}:00.", "info")
+        else:
+            self._settings_panel.set_update_status(
+                f"v{version} ready — install via Check for Updates", THEME["accent"])
+            self._log(f"Update {version} staged; install later.", "info")
+
+    def _apply_staged(self):
+        pend = self._pending_staged()
+        if not pend:
+            self._log("No staged update to install.", "warning")
+            return
+        if not getattr(sys, "frozen", False):
+            messagebox.showinfo("ProxyForce",
+                "Self-update only runs in the packaged build, not from source.")
+            return
+        install_dir = os.path.dirname(sys.executable)
+        staged = pend["dir"]
+        self._settings_panel.set_update_status("Validating staged build…", THEME["text"])
+        self._log("Validating staged build (selftest)…", "info")
+
+        def work():
+            if not updater.selftest_staged(staged):
+                self._queue.put(("upd_error", "Staged build failed selftest — not installing."))
+                return
+            st = updater.load_state()
+            st["resume_proxy"] = self._last_state in ("running", "waiting", "starting")
+            updater.save_state(st)
+            self._queue.put(("upd_do_apply", staged, install_dir))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _notify_tray(self, title: str, msg: str):
+        try:
+            if getattr(self, "_tray", None):
+                self._tray.notify(msg, title)
+        except Exception:
+            pass
+
+    def _maybe_resume_after_update(self):
+        """On startup after an update swap, reconnect if we were running, and clean
+        up old staging folders."""
+        try:
+            st = updater.load_state()
+            if st.get("resume_proxy"):
+                st["resume_proxy"] = False
+                updater.save_state(st)
+                self._log("Reconnecting after update…", "info")
+                self._start_engine()
+            updater.cleanup_staging()
+        except Exception:
+            pass
+
+    def _update_timer_loop(self):
+        """Once-a-day background check at the configured hour, and scheduled
+        ('install tonight') applies. Hour-granularity, fired at most once/day."""
+        while self._running:
+            try:
+                cfg = load_config()
+                now = datetime.now()
+                today = now.strftime("%Y-%m-%d")
+                st = updater.load_state()
+                if (cfg.get("auto_update_check") and cfg.get("host")
+                        and int(cfg.get("update_hour", 3)) == now.hour
+                        and st.get("last_check_date") != today):
+                    st["last_check_date"] = today
+                    updater.save_state(st)
+                    self._queue.put(("upd_check", False))
+                st = updater.load_state()
+                ah = st.get("apply_at_hour")
+                if ah is not None and int(ah) == now.hour and st.get("staged_dir"):
+                    st.pop("apply_at_hour", None)
+                    updater.save_state(st)
+                    self._queue.put(("upd_apply",))
+            except Exception:
+                pass
+            time.sleep(300)
+
     # ── Logging ───────────────────────────────────────────────────────────────
 
     def _log(self, msg: str, level: str = "info"):
@@ -1059,6 +1290,8 @@ class ProxyForceApp(ctk.CTk):
                 pystray.MenuItem("Start Proxy",     self._tray_start),
                 pystray.MenuItem("Stop Proxy",      self._tray_stop),
                 pystray.Menu.SEPARATOR,
+                pystray.MenuItem("Check for updates", self._tray_check),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("Quit",            self._tray_quit),
             )
             self._tray = pystray.Icon("ProxyForce", img, "ProxyForce", menu)
@@ -1077,6 +1310,9 @@ class ProxyForceApp(ctk.CTk):
 
     def _tray_stop(self, icon=None, item=None):
         self._queue.put(("tray_stop",))
+
+    def _tray_check(self, icon=None, item=None):
+        self._queue.put(("upd_check", True))
 
     def _tray_quit(self, icon=None, item=None):
         self._queue.put(("quit",))
@@ -1147,6 +1383,41 @@ class ProxyForceApp(ctk.CTk):
                     self._start_engine()
                 elif tag == "tray_stop":
                     self._stop_engine()
+                elif tag == "upd_status":
+                    self._settings_panel.set_update_status(
+                        item[1], item[2] if len(item) > 2 else None)
+                elif tag == "upd_progress":
+                    self._settings_panel.set_update_progress(item[1])
+                elif tag == "upd_error":
+                    self._settings_panel.set_update_progress(None)
+                    self._settings_panel.set_update_status(item[1])
+                    self._log(item[1], "error")
+                elif tag == "upd_ready":
+                    rtag, rver, rmanual = item[1], item[2], item[3]
+                    self._settings_panel.set_update_progress(None)
+                    self._settings_panel.set_update_status(
+                        f"v{rver} ready to install", THEME["accent"])
+                    self._log(f"Update {rver} downloaded and verified.", "success")
+                    if rmanual:
+                        self._prompt_install(rtag, rver)
+                    else:
+                        self._notify_tray("ProxyForce update ready",
+                                          f"v{rver} is ready — open ProxyForce to install.")
+                elif tag == "upd_check":
+                    self._check_for_updates(manual=item[1])
+                elif tag == "upd_apply":
+                    self._apply_staged()
+                elif tag == "upd_do_apply":
+                    staged, install_dir = item[1], item[2]
+                    self._log("Installing update — ProxyForce will restart…", "info")
+                    try:
+                        updater.begin_apply(staged, install_dir, os.getpid(), "--minimized")
+                    except Exception as e:
+                        self._log(f"Could not launch the updater: {e}", "error")
+                        self._settings_panel.set_update_status("Update failed to launch")
+                    else:
+                        self._do_quit()
+                        return
                 elif tag == "quit":
                     self._do_quit()
                     return
