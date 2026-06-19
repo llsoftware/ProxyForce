@@ -265,6 +265,7 @@ class SingBoxController:
         self._proc: Optional[subprocess.Popen] = None
         self._log_fh = None
         self._clash_port = 0
+        self._local_proxy_port = 0   # local mixed inbound the system proxy points at
         self._exit_code = 0
         self._stop_event = threading.Event()
         self._monitor: Optional[threading.Thread] = None
@@ -413,7 +414,21 @@ class SingBoxController:
                     # so the Win 10 IPv6 neighbour-discovery crash cannot recur.
                     "strict_route": True,
                     "stack": "system",
-                }
+                },
+                # Local HTTP/SOCKS listener that the Windows system proxy points at
+                # (see _takeover_system_proxy). Proxy-aware apps — including the
+                # Microsoft Edge updater — send TCP CONNECT here instead of believing
+                # they're on direct internet and attempting HTTP-3/QUIC (which the
+                # all-UDP reject below kills, the root cause of Edge update error
+                # 0x80072EFE). sing-box forwards these to the corporate proxy via the
+                # same route rules (final = proxy-out), authenticated centrally. The
+                # TUN remains the catch-all for apps that ignore proxy settings.
+                {
+                    "type": "mixed",
+                    "tag": "local-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": self._local_proxy_port or 18080,
+                },
             ],
             "outbounds": [
                 proxy_out,
@@ -458,6 +473,7 @@ class SingBoxController:
             return
 
         self._clash_port = _free_loopback_port()
+        self._local_proxy_port = _free_loopback_port()
         cfg_path = self._write_config(self._clash_port)
 
         # Validate the generated config before running — turns a malformed config
@@ -872,20 +888,34 @@ class SingBoxController:
 
     # ── system-proxy takeover (make capture universal) ────────────────────────────
 
+    def _build_proxy_bypass(self) -> str:
+        """WinINET/WinHTTP ProxyOverride for the local-listener takeover: keep
+        loopback/intranet (and the engine's bypass set) DIRECT so only real
+        outbound goes through ProxyForce."""
+        cfg = self.config
+        parts = ["<local>", "localhost", "127.*"]
+        if getattr(cfg, "exclude_private", True):
+            parts += ["10.*", "192.168.*"] + [f"172.{n}.*" for n in range(16, 32)]
+        for entry in (cfg.bypass_list or []):
+            e = entry.strip()
+            if e and not _looks_like_cidr_or_ip(e):   # ProxyOverride uses host wildcards, not CIDR
+                parts.append(e)
+        return ";".join(parts)
+
     def _takeover_system_proxy(self):
-        """Disable the Windows system proxy while ProxyForce runs so no proxy-aware
-        app can bypass the TUN. The previous config is snapshotted and restored on
-        stop (and crash-recovered from proxy_backup.json on the next start)."""
+        """Point the Windows system proxy (WinINET + WinHTTP) at ProxyForce's local
+        sing-box listener (127.0.0.1:<port>) while it runs. Proxy-aware apps — incl.
+        the Microsoft Edge updater — then use TCP CONNECT through sing-box and never
+        attempt the QUIC/direct path that fails behind the corporate proxy. The TUN
+        still captures apps that ignore proxy settings. The previous config is
+        snapshotted and restored on stop (crash-recovered from proxy_backup.json)."""
         try:
             from core import system_proxy
-            prev = system_proxy.take_over()
-            if prev:
-                self._log(f"Windows system proxy disabled while ProxyForce runs "
-                          f"(was: {prev}) — all apps now route through capture; "
-                          f"original will be restored on stop.")
-            else:
-                self._log("Windows system proxy neutralized (WinINET + WinHTTP) so "
-                          "no app can bypass capture; restored on stop.")
+            server = f"127.0.0.1:{self._local_proxy_port}"
+            prev = system_proxy.point_at(server, self._build_proxy_bypass())
+            was = f" (was: {prev})" if prev else ""
+            self._log(f"Windows system proxy pointed at ProxyForce ({server}){was} — "
+                      f"proxy-aware apps now route through sing-box; original restored on stop.")
         except Exception as e:
             self._log(f"Could not take over the Windows system proxy: {e}", "warning")
 
@@ -1121,23 +1151,26 @@ class SingBoxController:
                  if proxy_reachable else
                  f"upstream proxy NOT reachable ({host}:{port})")
 
-            # ── System proxy: must be OFF, or proxy-aware apps bypass the TUN ──
+            # ── System proxy: must point at OUR local listener (so proxy-aware apps,
+            # incl. the Edge updater, route through sing-box over TCP — not QUIC/direct
+            # and not some other proxy that would bypass us) ──
             try:
                 from core import system_proxy
                 sp_state = system_proxy.current_state()
             except Exception as e:
                 sp_state = f"<unavailable: {e}>"
-            sp_off = ("ProxyEnable=0" in sp_state and "AutoConfigURL=''" in sp_state
-                      and "Direct access" in sp_state)
-            section(fh, "System proxy (must be OFF during capture)", sp_state,
-                    ("PASS — system proxy neutralized; no app can bypass the TUN to a proxy"
-                     if sp_off else
-                     "WARN — a system proxy still appears set; proxy-aware apps (e.g. browsers) "
-                     "may send straight to it and bypass ProxyForce. Takeover may have been "
-                     "blocked (GPO?) or a per-app proxy is configured."))
-            step(sp_off,
-                 "Windows system proxy neutralized — no app can bypass to a proxy" if sp_off
-                 else "Windows system proxy still appears set (proxy-aware apps may bypass)")
+            ours = f"127.0.0.1:{self._local_proxy_port}"
+            sp_ok = ours in sp_state
+            section(fh, "System proxy (should point at ProxyForce's local listener)", sp_state,
+                    (f"PASS — system proxy points at ProxyForce ({ours}); proxy-aware apps "
+                     "route through sing-box over TCP CONNECT"
+                     if sp_ok else
+                     "WARN — system proxy does not point at ProxyForce. Takeover may have been "
+                     "blocked (GPO?) or overridden by a per-app/group-policy proxy; proxy-aware "
+                     "apps may bypass capture or attempt QUIC."))
+            step(sp_ok,
+                 f"Windows system proxy points at ProxyForce ({ours})" if sp_ok
+                 else "Windows system proxy does NOT point at ProxyForce (proxy-aware apps may bypass)")
 
             # ── What sing-box itself saw ──
             conns = self._clash_get("/connections") or {}

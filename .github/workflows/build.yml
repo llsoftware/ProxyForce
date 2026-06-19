@@ -67,6 +67,24 @@ jobs:
           $tag = "${{ github.ref_name }}"
           Compress-Archive -Path dist\ProxyForce\* -DestinationPath "ProxyForce-$tag-win64.zip"
 
+      # Integrity manifest consumed by the in-app auto-updater (and humans).
+      - name: Generate SHA256SUMS
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zip = "ProxyForce-$tag-win64.zip"
+          $h = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+          "$h  $zip" | Out-File -FilePath SHA256SUMS -Encoding ascii -NoNewline
+          "" | Out-File -FilePath SHA256SUMS -Encoding ascii -Append   # trailing newline
+
+      # Detached Ed25519 signature over SHA256SUMS, verified in-app with the embedded
+      # public key. No-ops (unsigned release) if the secret isn't configured.
+      - name: Sign SHA256SUMS (Ed25519)
+        env:
+          PROXYFORCE_SIGNING_KEY: ${{ secrets.PROXYFORCE_SIGNING_KEY }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          python tools/sign_release.py SHA256SUMS "ProxyForce-$tag-win64.zip.sig"
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
@@ -88,6 +106,15 @@ jobs:
             > **Note:** A UAC prompt appears when ProxyForce requests administrator rights at startup (required for the TUN network adapter). This is normal.
 
             > **Windows Defender false positive?** If Defender flags the download, go to Windows Security → Virus & threat protection → Protection history → find the item → **Allow**. This is a known false positive for unsigned network-proxy tools — we submit each release to Microsoft's portal for hash clearance.
-          files: "ProxyForce-*-win64.zip"
+
+            <!-- This release is published to the DEVELOPMENT channel (pre-release).
+                 After testing, promote it to the STABLE channel with:
+                   gh release edit ${{ github.ref_name }} --prerelease=false  -->
+          files: |
+            ProxyForce-*-win64.zip
+            SHA256SUMS
+            ProxyForce-*-win64.zip.sig
           draft: false
-          prerelease: false
+          # Every release lands on the DEVELOPMENT channel first; promote to stable by
+          # clearing this flag on the release (gh release edit <tag> --prerelease=false).
+          prerelease: true

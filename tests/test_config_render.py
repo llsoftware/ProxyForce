@@ -59,6 +59,35 @@ class SplitRouteGuardTests(unittest.TestCase):
         self.assertNotIn("inet4_route_address", tun)
 
 
+class LocalProxyInboundTests(unittest.TestCase):
+    """The Edge-update fix: a local mixed inbound the Windows system proxy points at,
+    so proxy-aware apps (incl. the Edge updater) use TCP CONNECT through sing-box
+    instead of attempting the QUIC/direct path that fails (error 0x80072EFE)."""
+
+    def _config(self):
+        cfg = ProxyConfig(host="203.0.113.10", port=800)
+        c = SingBoxController(cfg)
+        c._local_proxy_port = 18080
+        return c._render_config(12345)
+
+    def test_local_mixed_inbound_present(self):
+        inbounds = self._config()["inbounds"]
+        local = [i for i in inbounds if i.get("tag") == "local-in"]
+        self.assertEqual(len(local), 1, "exactly one local-in inbound expected")
+        self.assertEqual(local[0].get("type"), "mixed")
+        self.assertEqual(local[0].get("listen"), "127.0.0.1")
+        self.assertEqual(local[0].get("listen_port"), 18080)
+
+    def test_tun_still_present(self):
+        # The TUN must remain the catch-all alongside the new local inbound.
+        inbounds = self._config()["inbounds"]
+        self.assertTrue(any(i.get("type") == "tun" for i in inbounds))
+
+    def test_route_final_is_proxy_out(self):
+        # local-in traffic must egress through the corporate proxy.
+        self.assertEqual(self._config()["route"]["final"], "proxy-out")
+
+
 class IPv6LeakGuardTests(unittest.TestCase):
 
     def test_aaaa_is_suppressed_to_nodata(self):

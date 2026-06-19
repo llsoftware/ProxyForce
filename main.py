@@ -18,7 +18,7 @@ import json
 import subprocess
 import logging
 
-APP_VERSION = "2.1.10"
+from core._version import __version__ as APP_VERSION
 
 # Global mutex handle — kept alive for the process lifetime to maintain the lock.
 _SINGLE_INST_MUTEX = None
@@ -146,6 +146,18 @@ def main():
     # ── Build-machine smoke test (CI / offline build validation) ──
     if "--selftest" in sys.argv:
         run_selftest(logger)
+        return
+
+    # ── Update apply-worker (spawned by the elevated GUI from the staged copy).
+    # Must run elevated and must BYPASS the single-instance guard (the outgoing
+    # instance still holds the mutex until it exits, which this worker waits for).
+    if "--apply-update" in sys.argv:
+        if not is_admin():
+            relaunch_as_admin()
+            return
+        from core import updater
+        logger.info(f"ProxyForce v{APP_VERSION} apply-update worker starting.")
+        updater.apply_worker(sys.argv[1:])
         return
 
     # ── Elevation check first — non-admin launch just relaunches and exits.

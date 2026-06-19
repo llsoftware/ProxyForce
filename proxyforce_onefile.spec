@@ -60,6 +60,14 @@ a = Analysis(
         'core.singbox_controller',
         'core.config_store',
         'core.system_proxy',
+        # auto-updater (lazily imported in main.py for --apply-update)
+        'core.updater',
+        'core._version',
+        'core._ed25519',
+        'hashlib',
+        'zipfile',
+        'urllib.parse',
+        'datetime',
         # GUI framework
         'customtkinter',
         # System tray

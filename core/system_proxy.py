@@ -210,6 +210,49 @@ def take_over() -> str:
     return prev
 
 
+def _set(server: str, bypass: str):
+    """Point WinINET (per-user) + WinHTTP (per-machine) at `server`."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _INET_SETTINGS, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, server)
+            if bypass:
+                winreg.SetValueEx(k, "ProxyOverride", 0, winreg.REG_SZ, bypass)
+            # A leftover PAC (AutoConfigURL) is NOT gated by ProxyEnable and would
+            # override our fixed proxy — remove it.
+            try:
+                winreg.DeleteValue(k, "AutoConfigURL")
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
+    try:
+        args = ["netsh", "winhttp", "set", "proxy", f"proxy-server={server}"]
+        if bypass:
+            args.append(f"bypass-list={bypass}")
+        subprocess.run(args, capture_output=True, creationflags=_NO_WINDOW, timeout=15)
+    except Exception:
+        pass
+    _broadcast()
+
+
+def point_at(server: str, bypass: str = "") -> str:
+    """Snapshot (crash-safe) then POINT the WinINET + WinHTTP proxy at `server`
+    (ProxyForce's local sing-box listener, e.g. 127.0.0.1:18080) instead of
+    disabling it. Proxy-aware apps then use it over TCP CONNECT and never attempt
+    the direct/QUIC path — which is what was breaking the Edge updater. Non-proxy
+    apps are still caught by the TUN. Returns the previous proxy string."""
+    if _read_backup() is None:
+        snap = _snapshot()
+        _write_backup(snap)
+        prev = _wininet_proxy_on(snap)
+    else:
+        prev = ""   # mid-takeover from a previous run; original already saved
+    _set(server, bypass)
+    return prev
+
+
 def restore() -> bool:
     """Restore the snapshotted system proxy. Idempotent: no backup → no-op.
     Returns True if a restore was performed."""
