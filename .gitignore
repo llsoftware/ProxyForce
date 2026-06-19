@@ -1,0 +1,21 @@
+# Claude Code local config
+.claude/
+
+# Build output
+dist/
+build/
+*.spec.bak
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Offline wheels (downloaded locally; CI fetches from PyPI)
+offline_wheels/
+
+# PyInstaller work dirs
+*.egg-info/
+
+# Generated app icon (CI rebuilds it via tools/make_assets.py before each build)
+assets/

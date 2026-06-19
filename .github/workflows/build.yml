@@ -1,0 +1,93 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install customtkinter pystray pillow pyinstaller
+
+      # Rebuild the PyInstaller bootloader from source so ProxyForce.exe carries a
+      # unique stub hash — the prebuilt pip-wheel bootloader is fingerprinted by
+      # Defender's ML engine (Sabsik.TE.A!ml). windows-latest has MSVC via VS 2022.
+      # Falls back gracefully (warning, no failure) if the clone or build fails.
+      - name: Rebuild PyInstaller bootloader from source
+        shell: pwsh
+        run: |
+          $version = (pip show pyinstaller | Select-String "^Version:").ToString().Trim() -replace "Version: ",""
+          Write-Host "PyInstaller version: $version"
+          git clone --depth 1 --branch "v$version" https://github.com/pyinstaller/pyinstaller.git _pyi
+          if (-not $?) {
+            Write-Warning "Could not clone PyInstaller v$version from GitHub — using prebuilt bootloader (AV hardening step skipped)"
+            exit 0
+          }
+          Set-Location _pyi/bootloader
+          python ./waf distclean all
+          if (-not $?) {
+            Write-Warning "Bootloader build failed — using prebuilt bootloader (AV hardening step skipped)"
+            Set-Location $env:GITHUB_WORKSPACE
+            exit 0
+          }
+          Set-Location ..
+          pip install . --force-reinstall --quiet
+          Set-Location $env:GITHUB_WORKSPACE
+          Write-Host "Bootloader rebuilt successfully"
+
+      - name: Run unit tests (Win 10 launch supervisor logic)
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+      - name: Generate icon
+        run: python tools/make_assets.py
+
+      - name: Build with PyInstaller (onedir)
+        run: python -m PyInstaller proxyforce_onefile.spec --clean --noconfirm
+
+      - name: Smoke test (verify imports + sing-box)
+        run: dist\ProxyForce\ProxyForce.exe --selftest
+
+      - name: Package onedir as zip
+        run: |
+          $tag = "${{ github.ref_name }}"
+          Compress-Archive -Path dist\ProxyForce\* -DestinationPath "ProxyForce-$tag-win64.zip"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "ProxyForce ${{ github.ref_name }}"
+          body: |
+            ## Installation
+
+            1. Download `ProxyForce-${{ github.ref_name }}-win64.zip`
+            2. Extract the zip to any folder (e.g. `C:\Tools\ProxyForce\`)
+            3. Double-click `ProxyForce.exe` and approve the UAC elevation prompt
+            4. Open the **Settings** tab, enter your proxy host/port, and click **Start Proxy**
+
+            > ⚠️ **Keep the folder intact** — `ProxyForce.exe` needs the `_internal\` folder next to it.
+
+            **Minimise to tray:** Click the window × button — enforcement keeps running in the background. Use **Quit** from the tray menu to exit.
+
+            **Requirements:** Windows 10/11 64-bit. No Python or other software needed.
+
+            > **Note:** A UAC prompt appears when ProxyForce requests administrator rights at startup (required for the TUN network adapter). This is normal.
+
+            > **Windows Defender false positive?** If Defender flags the download, go to Windows Security → Virus & threat protection → Protection history → find the item → **Allow**. This is a known false positive for unsigned network-proxy tools — we submit each release to Microsoft's portal for hash clearance.
+          files: "ProxyForce-*-win64.zip"
+          draft: false
+          prerelease: false
