@@ -3,6 +3,7 @@ and signature/checksum verification (the security-critical path)."""
 
 import os
 import sys
+import time
 import base64
 import hashlib
 import tempfile
@@ -197,6 +198,37 @@ class TestArgParse(unittest.TestCase):
             ["--apply-update", "--target", r"C:\Tools\ProxyForce", "--wait-pid", "1234"])
         self.assertEqual(kv["target"], r"C:\Tools\ProxyForce")
         self.assertEqual(kv["wait-pid"], "1234")
+
+
+class TestApplyWorkerFreesDir(unittest.TestCase):
+    """Regression: the worker must FREE the install dir (kill stragglers locking it)
+    BEFORE swapping — otherwise os.rename(install -> .old) hits PermissionError(13)
+    'being used by another process' and the update silently rolls back (the real
+    failure observed on the box)."""
+
+    def setUp(self):
+        self._orig = (updater._wait_pid_exit, updater._free_install_dir,
+                      updater._apply_swap, updater._applog, time.sleep)
+        self.calls = []
+        updater._applog = lambda m: None
+        updater._wait_pid_exit = lambda pid, timeout=0: self.calls.append("wait")
+        updater._free_install_dir = lambda target, timeout=30.0: (
+            self.calls.append(("free", target)) or True)
+        updater._apply_swap = lambda staged, target, relaunch: (
+            self.calls.append(("swap", target)) or True)
+        time.sleep = lambda *_a, **_k: None
+
+    def tearDown(self):
+        (updater._wait_pid_exit, updater._free_install_dir,
+         updater._apply_swap, updater._applog, time.sleep) = self._orig
+
+    def test_frees_dir_between_wait_and_swap(self):
+        updater.apply_worker(
+            ["--apply-update", "--target", r"C:\X\ProxyForce", "--wait-pid", "42"])
+        self.assertEqual([c if isinstance(c, str) else c[0] for c in self.calls],
+                         ["wait", "free", "swap"])
+        self.assertEqual(self.calls[1], ("free", r"C:\X\ProxyForce"))
+        self.assertEqual(self.calls[2], ("swap", r"C:\X\ProxyForce"))
 
 
 if __name__ == "__main__":

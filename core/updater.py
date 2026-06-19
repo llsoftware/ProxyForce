@@ -393,15 +393,90 @@ def _applog(msg: str):
         pass
 
 
+def _kill_image(name: str):
+    """Force-kill every process with this image name (best-effort)."""
+    try:
+        subprocess.run(["taskkill", "/F", "/IM", name],
+                       capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
+    except Exception:
+        pass
+
+
+def _procs_under(prefix_norm: str, exclude_pid: int):
+    """PIDs of running processes whose executable image lives under `prefix_norm`
+    (a normcased absolute path ending in os.sep), excluding `exclude_pid`. Used to
+    find anything still running FROM the install dir we are about to rename."""
+    ps = ("Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath} | "
+          "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }")
+    pids = []
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                           capture_output=True, text=True,
+                           creationflags=_CREATE_NO_WINDOW, timeout=20)
+        for line in (r.stdout or "").splitlines():
+            pid_s, sep, path = line.strip().partition("|")
+            if not sep or not path.strip():
+                continue
+            try:
+                pid = int(pid_s.strip())
+            except ValueError:
+                continue
+            if pid != exclude_pid and os.path.normcase(path.strip()).startswith(prefix_norm):
+                pids.append(pid)
+    except Exception:
+        pass
+    return pids
+
+
+def _free_install_dir(target: str, timeout: float = 30.0) -> bool:
+    """Guarantee nothing is locking the install dir before we rename it — the fix for
+    the swap's PermissionError(13) 'being used by another process'.
+
+    On Windows a directory cannot be renamed while ANY process has a file open in it
+    OR has its current directory inside it. Two things run FROM the install tree and
+    cause exactly that error during a self-update swap:
+      * sing-box.exe — ProxyForce launches it with its CWD inside _internal\\singbox\\,
+        so it pins the whole dir even mid-teardown. Force-kill it: it is stateless and
+        the relaunched build restarts it.
+      * the outgoing GUI ProxyForce.exe — if it is slow to fully exit after stop()
+        (lingering threads), or is an orphan from a crashed/rolled-back run, it keeps
+        ProxyForce.exe + the _internal DLLs mapped.
+    The worker itself runs from the STAGED dir (never under target), so it is never a
+    target here. Kill sing-box, then kill/await any ProxyForce-under-target until the
+    dir is clear or we time out."""
+    me = os.getpid()
+    prefix = os.path.normcase(os.path.abspath(target)).rstrip("\\/") + os.sep
+    _kill_image("sing-box.exe")
+    deadline = time.time() + timeout
+    while True:
+        lockers = _procs_under(prefix, exclude_pid=me)
+        if not lockers:
+            return True
+        _applog(f"install dir locked by pids {lockers} — killing before swap")
+        for pid in lockers:
+            try:
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=10)
+            except Exception:
+                pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(1.5)
+
+
 def apply_worker(argv):
     """The `--apply-update` worker. Runs from the staged copy with the install dir
-    free to overwrite. Waits for the outgoing process to exit, then swaps."""
+    free to overwrite. Waits for the outgoing process to exit, frees the install dir
+    of any straggler (sing-box / a slow-exiting or orphaned GUI) that would block the
+    directory rename, then swaps."""
     opts = _parse_kv(argv)
     target = opts.get("target")
     wait_pid = int(opts.get("wait-pid") or 0)
     staged = os.path.dirname(os.path.abspath(sys.executable))
     _applog(f"apply start: target={target} staged={staged} wait_pid={wait_pid}")
     _wait_pid_exit(wait_pid, timeout=120)
+    freed = _free_install_dir(target)
+    _applog(f"install dir freed={freed}")
     time.sleep(1.0)                             # let handles/AV release
     _apply_swap(staged, target, "--minimized")
 
@@ -415,7 +490,7 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
     try:
         if os.path.isdir(backup):
             shutil.rmtree(backup, ignore_errors=True)
-        _retry(lambda: os.rename(target, backup))   # move old aside
+        _retry(lambda: os.rename(target, backup), tries=20)   # move old aside
         # dirs_exist_ok so a retry after a partial copy doesn't trip FileExistsError.
         _retry(lambda: shutil.copytree(staged, target, dirs_exist_ok=True))  # install new
         _applog("swap ok")
