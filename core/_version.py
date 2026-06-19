@@ -5,4 +5,4 @@ releases). `version_info.txt` (the Windows PE version resource) is bumped separa
 as part of cutting a release.
 """
 
-__version__ = "2.1.10"
+__version__ = "2.1.11"
