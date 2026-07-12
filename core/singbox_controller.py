@@ -40,6 +40,8 @@ from typing import Optional, Callable, List
 
 import logging
 
+from core._version import __version__ as APP_VERSION
+
 logger = logging.getLogger("proxyforce.singbox")
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -132,6 +134,12 @@ _READY_TIMEOUT   = 30      # seconds to wait for the Clash API per attempt
 _ADAPTER_WAIT    = 15      # seconds to wait for a stale TUN adapter to disappear
 _ADAPTER_SETTLE  = 3.0     # extra settle so CreateAdapter doesn't race teardown
 
+# sing-box log levels we allow the config's log_level to select. Kept deliberately
+# small: "debug" is the verbose capture trace (large logs on long runs — see
+# _render_config), "info" the sane default, "warn" the quietest useful level.
+_SINGBOX_LOG_LEVELS = {"debug", "info", "warn"}
+_DEFAULT_LOG_LEVEL  = "info"
+
 
 class SingBoxState(Enum):
     STOPPED = "stopped"
@@ -151,6 +159,7 @@ class ProxyConfig:
     exclude_private: bool = True    # send RFC1918 / ULA / link-local direct
     exclude_loopback: bool = True
     bypass_list: list = None        # extra hosts/CIDRs to send DIRECT
+    log_level: str = "info"         # sing-box log verbosity (see _SINGBOX_LOG_LEVELS)
 
     def __post_init__(self):
         if self.bypass_list is None:
@@ -162,7 +171,6 @@ class ConnectionStats:
     active_connections: int = 0
     total_connections: int = 0
     bytes_forwarded: int = 0
-    errors: int = 0
     start_time: float = 0.0
 
     def uptime_str(self) -> str:
@@ -212,14 +220,30 @@ def _find_singbox_exe() -> Optional[str]:
     return None
 
 
-def _free_loopback_port() -> int:
-    """Grab a free 127.0.0.1 TCP port for the Clash API (avoids reserved ranges)."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+def _free_loopback_ports(n: int = 1) -> List[int]:
+    """Grab `n` DISTINCT free 127.0.0.1 TCP ports.
+
+    All sockets are held open until every port has been chosen, then closed
+    together — otherwise allocating them one-at-a-time (bind→read→close, repeat)
+    lets the OS hand the just-freed port back on the next call, so two "free"
+    ports could collide (e.g. clash_port == local_proxy_port → one sing-box bind
+    fails). Holding them open guarantees distinct ports.
+    """
+    socks = []
     try:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
+        for _ in range(n):
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.bind(("127.0.0.1", 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
     finally:
-        s.close()
+        for s in socks:
+            s.close()
+
+
+def _free_loopback_port() -> int:
+    """Grab a single free 127.0.0.1 TCP port for the Clash API."""
+    return _free_loopback_ports(1)[0]
 
 
 def _looks_like_cidr_or_ip(entry: str) -> Optional[str]:
@@ -246,6 +270,7 @@ def make_proxy_config(cfg: dict) -> "ProxyConfig":
         exclude_private=cfg.get("exclude_private", True),
         exclude_loopback=cfg.get("exclude_loopback", True),
         bypass_list=cfg.get("bypass_list", []),
+        log_level=cfg.get("log_level", _DEFAULT_LOG_LEVEL),
     )
 
 
@@ -260,7 +285,6 @@ class SingBoxController:
         self.on_log = on_log
         self.state = SingBoxState.STOPPED
         self.stats = ConnectionStats()
-        self._debug = False
 
         self._proc: Optional[subprocess.Popen] = None
         self._log_fh = None
@@ -272,7 +296,10 @@ class SingBoxController:
         self._exit_code = 0
         self._stop_event = threading.Event()
         self._monitor: Optional[threading.Thread] = None
+        # _seen_conn_ids is pruned to the CURRENTLY-ACTIVE ids each poll so it stays
+        # bounded on long runs; _total_connections is the monotonic lifetime count.
         self._seen_conn_ids = set()
+        self._total_connections = 0
         # v2.1.10: stream each new connection to the GUI log as sing-box
         # establishes it, so the user can watch traffic being captured/routed.
         self._trace_conns = True
@@ -362,11 +389,18 @@ class SingBoxController:
             proxy_out["username"] = cfg.username
             proxy_out["password"] = cfg.password
 
+        # Log level from config (validated). "debug" captures every sniff / route /
+        # CONNECT decision — invaluable for diagnostics but large on long runs, so it
+        # is opt-in via Settings; "info" is the default. The decisive diagnostics
+        # (routes / DNS / reachability) come from PowerShell + the Clash API, not this
+        # log, so a quieter level does not blind _run_diagnostics.
+        level = (cfg.log_level or "").strip().lower()
+        if level not in _SINGBOX_LOG_LEVELS:
+            level = _DEFAULT_LOG_LEVEL
+
         return {
             "log": {
-                # Diagnostic build: full detail unconditionally, so singbox.log
-                # captures every sniff / route / CONNECT decision for the report.
-                "level": "debug",
+                "level": level,
                 "timestamp": True,
             },
             "experimental": {
@@ -464,6 +498,7 @@ class SingBoxController:
         self._set_state(SingBoxState.STARTING)
         self._stop_event.clear()
         self._seen_conn_ids = set()
+        self._total_connections = 0
         self.stats = ConnectionStats(start_time=time.time())
 
         if not self.config.host:
@@ -477,8 +512,7 @@ class SingBoxController:
             self._log("sing-box.exe not found in the install folder (vendor/singbox).", "error")
             return
 
-        self._clash_port = _free_loopback_port()
-        self._local_proxy_port = _free_loopback_port()
+        self._clash_port, self._local_proxy_port = _free_loopback_ports(2)
         # Resolve the corporate proxy's REAL IP now — BEFORE sing-box hijacks DNS to
         # fakeip — so the local forward-proxy (started after green) dials the real
         # upstream rather than a fakeip that would loop back into the TUN. For an
@@ -773,16 +807,23 @@ class SingBoxController:
         # Detect NEW connections this tick so we can both count totals and trace
         # them live to the GUI (the "watch it connect" view the user asked for).
         new = []
+        active_ids = set()
         for c in conns:
             cid = c.get("id")
             if not cid:
                 continue
+            active_ids.add(cid)
             if cid not in self._seen_conn_ids:
-                self._seen_conn_ids.add(cid)
                 new.append(c)
         if self._trace_conns and new:
             self._emit_conn_trace(new)
-        self.stats.total_connections = len(self._seen_conn_ids)
+        # Bound _seen_conn_ids to the currently-active ids (Clash ids are unique per
+        # connection and never reused, so dropping closed ones is safe and keeps the
+        # set from growing without limit on long runs); track the lifetime total in a
+        # monotonic counter rather than the set's size.
+        self._total_connections += len(new)
+        self._seen_conn_ids = active_ids
+        self.stats.total_connections = self._total_connections
         down = data.get("downloadTotal", 0) or 0
         up = data.get("uploadTotal", 0) or 0
         self.stats.bytes_forwarded = down + up
@@ -1059,7 +1100,7 @@ class SingBoxController:
         except Exception:
             return
         try:
-            fh.write("ProxyForce diagnostics — v2.1.10\n")
+            fh.write(f"ProxyForce diagnostics — v{APP_VERSION}\n")
             fh.write(time.strftime("Generated: %Y-%m-%d %H:%M:%S\n"))
             fh.write(f"Proxy target : {self.config.host}:{self.config.port} "
                      f"(auth={self.config.auth_type})\n")
