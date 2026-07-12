@@ -90,6 +90,30 @@ class LocalProxyInboundTests(unittest.TestCase):
         self.assertEqual(self._config()["route"]["final"], "proxy-out")
 
 
+class LogLevelTests(unittest.TestCase):
+    """The sing-box log level must come from ProxyConfig.log_level (validated), not
+    be hardcoded — "debug" is verbose and grows singbox.log on long runs, so it must
+    be opt-in with "info" as the safe default."""
+
+    def _level(self, log_level=None):
+        kw = {} if log_level is None else {"log_level": log_level}
+        cfg = ProxyConfig(host="203.0.113.10", port=800, **kw)
+        return SingBoxController(cfg)._render_config(12345)["log"]["level"]
+
+    def test_default_is_info(self):
+        self.assertEqual(self._level(), "info")
+
+    def test_debug_is_honored(self):
+        self.assertEqual(self._level("debug"), "debug")
+
+    def test_warn_is_honored(self):
+        self.assertEqual(self._level("warn"), "warn")
+
+    def test_unknown_level_falls_back_to_info(self):
+        self.assertEqual(self._level("trace"), "info")   # not in the whitelist
+        self.assertEqual(self._level(""), "info")
+
+
 class IPv6LeakGuardTests(unittest.TestCase):
 
     def test_aaaa_is_suppressed_to_nodata(self):

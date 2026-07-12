@@ -8,7 +8,9 @@ to the system tray — enforcement runs until you Quit from the tray menu.
 The elevated GUI owns and runs sing-box directly as a child subprocess.
 A Windows Job Object ensures sing-box is killed if the GUI crashes.
 
-Build:  pyinstaller proxyforce_onefile.spec  ->  dist\\ProxyForce.exe  (single file)
+Build:  pyinstaller proxyforce_onefile.spec  ->  dist\\ProxyForce\\ProxyForce.exe
+        (onedir: ProxyForce.exe alongside its _internal\\ folder — zip the whole
+        dist\\ProxyForce\\ folder to distribute)
 """
 
 import sys
@@ -17,6 +19,7 @@ import ctypes
 import json
 import subprocess
 import logging
+from logging.handlers import RotatingFileHandler
 
 from core._version import __version__ as APP_VERSION
 
@@ -41,14 +44,24 @@ def get_exe_path() -> str:
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 def setup_logging():
-    data_dir = get_data_dir()
-    os.makedirs(data_dir, exist_ok=True)
-    log_file = os.path.join(data_dir, "proxyforce.log")
-    logging.basicConfig(
-        filename=log_file,
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    # File logging is best-effort: never let a log-file problem (unwritable
+    # ProgramData, a locked file, an ACL issue) crash the launcher. The app still
+    # runs and logs to nowhere if the handler can't be created.
+    try:
+        data_dir = get_data_dir()
+        os.makedirs(data_dir, exist_ok=True)
+        log_file = os.path.join(data_dir, "proxyforce.log")
+        # Rotate so the app log can't grow without bound across long-running sessions.
+        handler = RotatingFileHandler(
+            log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+        # Avoid stacking duplicate handlers if setup_logging() runs more than once.
+        if not any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+            root.addHandler(handler)
+    except Exception:
+        pass
     return logging.getLogger("proxyforce.main")
 
 
@@ -95,7 +108,7 @@ def run_selftest(logger):
     print(f"ProxyForce v{APP_VERSION} selftest…")
     try:
         from core.singbox_controller import (
-            SingBoxController, ProxyConfig, _find_singbox_exe, make_proxy_config)
+            SingBoxController, ProxyConfig, _find_singbox_exe)
         from core.config_store import load_config     # noqa: F401
         import urllib.request                         # noqa: F401
         print("[ok] imports (controller, config_store, urllib.request)")

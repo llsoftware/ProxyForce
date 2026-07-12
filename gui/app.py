@@ -147,6 +147,10 @@ _AUTH_INTERNAL = {v: k for k, v in _AUTH_DISPLAY.items()}
 _APPEARANCE_MAP  = {"☀ Light": "light", "🖥 Auto": "system", "🌙 Dark": "dark"}
 _APPEARANCE_RMAP = {v: k for k, v in _APPEARANCE_MAP.items()}
 
+# sing-box log verbosity (must match core.singbox_controller._SINGBOX_LOG_LEVELS).
+_LOGLEVEL_DISPLAY  = {"info": "Info", "debug": "Debug (verbose)", "warn": "Warnings only"}
+_LOGLEVEL_INTERNAL = {v: k for k, v in _LOGLEVEL_DISPLAY.items()}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar navigation button
@@ -470,6 +474,15 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         s4 = self._section("APP OPTIONS")
         self._check(s4, "autostart",       "Launch at logon  (UAC prompt appears at sign-in)")
         self._check(s4, "start_minimized", "Start minimized to system tray")
+        self._lbl(s4, "Engine log level  —  Debug is verbose (larger logs)")
+        loglvl_var = tk.StringVar(value=_LOGLEVEL_DISPLAY["info"])
+        self._vars["_loglevel_display"] = loglvl_var
+        ctk.CTkOptionMenu(
+            s4, values=list(_LOGLEVEL_DISPLAY.values()), variable=loglvl_var, width=180,
+            fg_color=THEME["input_bg"], button_color=THEME["accent_dk"],
+            button_hover_color=THEME["accent"], text_color=THEME["text"],
+            font=ctk.CTkFont("Segoe UI", 11), corner_radius=6,
+        ).pack(anchor="w", pady=4)
 
         s5 = self._section("UPDATES")
         self._lbl(s5, "Update Channel")
@@ -510,6 +523,8 @@ class SettingsPanel(ctk.CTkScrollableFrame):
                 d["auth_type"] = _AUTH_INTERNAL.get(v.get(), "none")
             elif k == "_channel_display":
                 d["update_channel"] = "dev" if v.get() == "Development" else "stable"
+            elif k == "_loglevel_display":
+                d["log_level"] = _LOGLEVEL_INTERNAL.get(v.get(), "info")
             else:
                 d[k] = v.get()
         try:
@@ -531,6 +546,9 @@ class SettingsPanel(ctk.CTkScrollableFrame):
             elif k == "_channel_display":
                 var.set("Development" if str(d.get("update_channel", "stable")).lower() == "dev"
                         else "Stable")
+            elif k == "_loglevel_display":
+                var.set(_LOGLEVEL_DISPLAY.get(str(d.get("log_level", "info")).lower(),
+                                              _LOGLEVEL_DISPLAY["info"]))
             elif k in d:
                 var.set(d[k])
         if "bypass_list" in d and self._bypass_text:
@@ -859,10 +877,9 @@ class ProxyForceApp(ctk.CTk):
         self._card_total  = StatCard(stats, "Total",     "0")
         self._card_bytes  = StatCard(stats, "Forwarded", "0 B")
         self._card_uptime = StatCard(stats, "Uptime",    "00:00:00")
-        self._card_errors = StatCard(stats, "Errors",    "0")
 
         for c in (self._card_active, self._card_total, self._card_bytes,
-                  self._card_uptime, self._card_errors):
+                  self._card_uptime):
             c.pack(side="left", fill="both", expand=True, padx=4)
 
         # Event log
@@ -986,7 +1003,6 @@ class ProxyForceApp(ctk.CTk):
                                                   on_state_change=on_state,
                                                   on_stats_update=on_stats,
                                                   on_log=on_log)
-                engine._debug = (vals.get("log_level") == "debug")
                 self._engine  = engine
                 engine.start()
             except Exception as e:
@@ -1236,7 +1252,6 @@ class ProxyForceApp(ctk.CTk):
         self._card_active.update_value(str(st.active_connections))
         self._card_total.update_value(str(st.total_connections))
         self._card_bytes.update_value(st.bytes_str())
-        self._card_errors.update_value(str(st.errors))
         uptime = st.uptime_str()
         self._card_uptime.update_value(uptime)
         self._uptime_var.set(f"Uptime: {uptime}" if uptime else "")
@@ -1270,7 +1285,7 @@ class ProxyForceApp(ctk.CTk):
         self._hero_beacon._redraw(1.0)
         # Stat cards
         for card in (self._card_active, self._card_total, self._card_bytes,
-                     self._card_uptime, self._card_errors):
+                     self._card_uptime):
             card.repaint_theme()
         # Log panels
         self._dash_log.repaint_theme()
@@ -1411,7 +1426,7 @@ class ProxyForceApp(ctk.CTk):
                     staged, install_dir = item[1], item[2]
                     self._log("Installing update — ProxyForce will restart…", "info")
                     try:
-                        updater.begin_apply(staged, install_dir, os.getpid(), "--minimized")
+                        updater.begin_apply(staged, install_dir, os.getpid())
                     except Exception as e:
                         self._log(f"Could not launch the updater: {e}", "error")
                         self._settings_panel.set_update_status("Update failed to launch")

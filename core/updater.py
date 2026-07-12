@@ -319,11 +319,13 @@ def selftest_staged(staged: str) -> bool:
 
 
 # ── apply: spawn the elevated worker, then the GUI exits ──────────────────────
-def begin_apply(staged: str, install_dir: str, wait_pid: int,
-                relaunch_args: str = "--minimized"):
+def begin_apply(staged: str, install_dir: str, wait_pid: int):
     """Spawn the staged build's exe as a detached, elevated worker that waits for
     this process (wait_pid) to exit, swaps the install folder, and relaunches. The
-    caller must then stop the proxy and exit promptly."""
+    caller must then stop the proxy and exit promptly.
+
+    The relaunch is always `--minimized` (resume-after-update is driven by
+    state.json, not args), so there is no relaunch-args parameter to thread through."""
     exe = os.path.join(staged, "ProxyForce.exe")
     # Relaunch is always "--minimized" (resume-after-update is driven by state.json,
     # not args) — so we don't pass an arg value that itself starts with "--".

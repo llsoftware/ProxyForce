@@ -7,9 +7,11 @@ the same machine share one source of truth:
   * Primary store:  HKEY_LOCAL_MACHINE\\SOFTWARE\\ProxyForce   (registry)
   * Fallback store: C:\\ProgramData\\ProxyForce\\config.json     (JSON file)
 
-Writing HKLM requires administrator rights. The GUI ships with a
-requireAdministrator manifest so it can always write HKLM. If an HKLM write
-fails we fall back to ProgramData JSON (same machine-wide visibility).
+Writing HKLM requires administrator rights. The GUI ships with an asInvoker
+manifest and self-elevates at startup via ShellExecuteW("runas") (see
+main.py:relaunch_as_admin), so the running process is always elevated and can
+write HKLM. If an HKLM write still fails we fall back to ProgramData JSON (same
+machine-wide visibility).
 """
 
 import json
