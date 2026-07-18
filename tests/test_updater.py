@@ -321,5 +321,70 @@ class TestApplyWorkerFreesDir(unittest.TestCase):
         self.assertEqual(self.calls[2], ("swap", r"C:\X\ProxyForce"))
 
 
+class TestLegacyApplyBridge(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pf_legacy_bridge_")
+        self.legacy = os.path.join(self.root, "update")
+        self.secure = os.path.join(self.root, "update-v2")
+        self.target = os.path.join(self.root, "install")
+        self.tag = "v" + updater.APP_VERSION
+        self.ddir = os.path.join(self.legacy, self.tag)
+        self.staged = os.path.join(self.ddir, "staged")
+        os.makedirs(self.staged)
+        os.makedirs(self.target)
+        with open(os.path.join(self.target, "ProxyForce.exe"), "wb") as f:
+            f.write(b"MZ")
+
+        self.info = updater.UpdateInfo(self.tag, True, "", "", "")
+        zip_path = os.path.join(self.ddir, self.info.zip_name)
+        with zipfile.ZipFile(zip_path, "w") as z:
+            z.writestr("ProxyForce.exe", b"MZ")
+            z.writestr("_internal/version.txt", updater.APP_VERSION.encode())
+        digest = updater._sha256(zip_path)
+        sums = f"{digest}  {self.info.zip_name}\n".encode()
+        with open(os.path.join(self.ddir, "SHA256SUMS"), "wb") as f:
+            f.write(sums)
+        self.seed = os.urandom(32)
+        with open(os.path.join(self.ddir, self.info.sig_name), "wb") as f:
+            f.write(_ed25519.sign(self.seed, sums))
+        with open(os.path.join(self.legacy, "state.json"), "w") as f:
+            json.dump({"resume_proxy": True}, f)
+
+        self.orig = (updater._legacy_update_dir, updater.update_dir, updater._harden_acl,
+                     updater.RELEASE_PUBKEY_B64, updater._wait_pid_exit,
+                     updater.selftest_staged, updater.begin_apply)
+        updater._legacy_update_dir = lambda: self.legacy
+        updater.update_dir = lambda: self.secure
+        updater._harden_acl = lambda _p: None
+        updater.RELEASE_PUBKEY_B64 = base64.b64encode(
+            _ed25519.publickey(self.seed)).decode()
+        updater._wait_pid_exit = lambda *_a, **_k: None
+        updater.selftest_staged = lambda _p: True
+        self.launched = []
+        updater.begin_apply = lambda stage, target, pid: self.launched.append(
+            (stage, target, pid))
+
+    def tearDown(self):
+        (updater._legacy_update_dir, updater.update_dir, updater._harden_acl,
+         updater.RELEASE_PUBKEY_B64, updater._wait_pid_exit,
+         updater.selftest_staged, updater.begin_apply) = self.orig
+
+    def test_old_updater_invocation_is_imported_and_relaunched_securely(self):
+        self.assertTrue(updater._bridge_legacy_apply(self.staged, self.target, 42))
+        self.assertEqual(len(self.launched), 1)
+        stage, target, _pid = self.launched[0]
+        self.assertTrue(stage.startswith(self.secure + os.sep))
+        self.assertEqual(target, os.path.abspath(self.target))
+        state = updater.load_state()
+        self.assertEqual(state["staged_tag"], self.tag)
+        self.assertTrue(state["resume_proxy"])
+
+    def test_wrong_version_is_rejected(self):
+        wrong = os.path.join(self.legacy, "v0.0.1", "staged")
+        os.makedirs(wrong)
+        self.assertFalse(updater._bridge_legacy_apply(wrong, self.target, 42))
+        self.assertFalse(self.launched)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -693,6 +693,8 @@ def apply_worker(argv):
     target = opts.get("target")
     wait_pid = int(opts.get("wait-pid") or 0)
     staged = os.path.dirname(os.path.abspath(sys.executable))
+    if not opts.get("apply-token"):
+        return _bridge_legacy_apply(staged, target, wait_pid)
     valid = _validate_apply_transaction(staged, target, opts.get("apply-token"))
     if not valid:
         _applog("apply rejected: protected transaction validation failed")
@@ -703,6 +705,69 @@ def apply_worker(argv):
     _applog(f"install dir freed={freed}")
     time.sleep(1.0)                             # let handles/AV release
     return _apply_swap(staged, target, "--minimized")
+
+
+def _bridge_legacy_apply(staged: str, target: str, wait_pid: int) -> bool:
+    """Bootstrap a pre-v2 updater invocation into a protected v2 transaction.
+
+    v2.1.15 and older launch the downloaded build without an apply token. The new
+    executable is already running at this point, so it must not swap from the legacy,
+    user-writable tree. Instead, copy the signed assets into update-v2, verify them
+    there, freshly extract, and hand off to the normal token-protected worker.
+    """
+    legacy_root = os.path.abspath(_legacy_update_dir())
+    ddir = os.path.dirname(os.path.abspath(staged))
+    tag = os.path.basename(ddir)
+    if (os.path.normcase(os.path.dirname(ddir)) != os.path.normcase(legacy_root)
+            or os.path.basename(staged).casefold() != "staged"
+            or not _TAG_RE.fullmatch(tag)
+            or tag.lstrip("vV") != APP_VERSION
+            or not target
+            or not os.path.isfile(os.path.join(os.path.abspath(target), "ProxyForce.exe"))):
+        _applog("legacy apply rejected: invocation is not a valid updater bootstrap")
+        return False
+
+    info = UpdateInfo(tag, False, "", "", "")
+    _wait_pid_exit(wait_pid, timeout=120)
+    try:
+        root = ensure_secure_update_dir()
+        txid = secrets.token_hex(16)
+        secure_dir = os.path.join(root, txid)
+        os.mkdir(secure_dir)
+        _harden_acl(secure_dir)
+        for name in ("SHA256SUMS", info.sig_name, info.zip_name):
+            src = os.path.join(ddir, name)
+            dst = os.path.join(secure_dir, name)
+            if not os.path.isfile(src):
+                raise ValueError(f"legacy update asset missing: {name}")
+            with open(src, "rb") as inp, open(dst, "xb") as out:
+                shutil.copyfileobj(inp, out, 1 << 20)
+        if not verify(info, secure_dir):
+            raise ValueError("legacy update failed signature verification after import")
+
+        # Preserve only continuity state; never import a path from the legacy file.
+        legacy_state = {}
+        try:
+            with open(os.path.join(legacy_root, "state.json"), "r", encoding="utf-8") as f:
+                legacy_state = json.load(f)
+        except Exception:
+            pass
+        save_state({
+            "staged_tag": tag,
+            "staged_version": info.version,
+            "transaction_id": txid,
+            "resume_proxy": bool(legacy_state.get("resume_proxy")),
+            "last_check_date": legacy_state.get("last_check_date"),
+        })
+        protected_stage = prepare_apply(info, txid, os.path.abspath(target))
+        if not selftest_staged(protected_stage):
+            raise ValueError("protected bootstrap build failed selftest")
+        begin_apply(protected_stage, os.path.abspath(target), os.getpid())
+        _applog(f"legacy apply bridged into protected transaction {txid}")
+        return True
+    except Exception as e:
+        _applog(f"legacy apply bridge FAILED: {e!r}")
+        return False
 
 
 def _validate_apply_transaction(staged: str, target: str, token: str) -> bool:
