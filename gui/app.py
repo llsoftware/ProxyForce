@@ -472,7 +472,7 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._bypass_text.pack(fill="x")
 
         s4 = self._section("APP OPTIONS")
-        self._check(s4, "autostart",       "Launch at logon  (UAC prompt appears at sign-in)")
+        self._check(s4, "autostart",       "Launch & connect at logon  (runs elevated, no prompt)")
         self._check(s4, "start_minimized", "Start minimized to system tray")
         self._lbl(s4, "Engine log level  —  Debug is verbose (larger logs)")
         loglvl_var = tk.StringVar(value=_LOGLEVEL_DISPLAY["info"])
@@ -639,6 +639,10 @@ class ProxyForceApp(ctk.CTk):
         # Auto-update: nightly background check timer + reconnect after an update swap.
         threading.Thread(target=self._update_timer_loop, daemon=True).start()
         self.after(1200, self._maybe_resume_after_update)
+        # Auto-connect on launch when a proxy host is configured (so an unattended
+        # box comes up connected without a Start click). Scheduled AFTER the
+        # update-resume check so it no-ops if that already started the engine.
+        self.after(1500, self._auto_start_if_configured)
 
         if start_minimized:
             self.withdraw()
@@ -956,6 +960,34 @@ class ProxyForceApp(ctk.CTk):
         self._proxy_info_var.set(f"→ {vals['host']}:{vals['port']}{auth_str}")
         self._log("Configuration saved.", "success")
 
+        # Apply changes live: if a proxy-affecting field changed while the engine is
+        # running, restart it so sing-box re-renders config.json with the new rules
+        # (e.g. a freshly added bypass entry). sing-box has no hot-reload, so a
+        # restart is the reliable path — the same brief-disconnect model the updater
+        # uses. Cosmetic-only saves (theme, minimized, update options) don't restart.
+        if (self._last_state in ("running", "waiting", "starting")
+                and self._proxy_settings_changed(vals)):
+            self._log("Applying updated settings — reconnecting…", "info")
+            self._start_engine()
+
+    # Proxy-affecting fields; a change to any of these while connected warrants an
+    # engine restart. Cosmetic/app fields (appearance, start_minimized, autostart,
+    # update_*) are intentionally excluded so they never cause a disconnect.
+    _PROXY_FIELDS = ("host", "port", "auth_type", "username", "password",
+                     "exclude_private", "exclude_loopback", "bypass_list",
+                     "log_level")
+
+    def _proxy_settings_changed(self, vals: dict) -> bool:
+        """True if any proxy-affecting field in `vals` differs from the config the
+        currently-running engine was started with."""
+        eng = self._engine
+        if eng is None:
+            return False
+        new_cfg = make_proxy_config(vals)
+        cur_cfg = eng.config
+        return any(getattr(new_cfg, f) != getattr(cur_cfg, f)
+                   for f in self._PROXY_FIELDS)
+
     # ── Engine control ────────────────────────────────────────────────────────
 
     def _toggle(self):
@@ -1177,6 +1209,17 @@ class ProxyForceApp(ctk.CTk):
                 self._log("Reconnecting after update…", "info")
                 self._start_engine()
             updater.cleanup_staging()
+        except Exception:
+            pass
+
+    def _auto_start_if_configured(self):
+        """Auto-connect on launch when a proxy host is configured. The 'stopped'
+        guard means this no-ops when _maybe_resume_after_update already started the
+        engine (post-update resume), so the two paths never double-start."""
+        try:
+            if self._last_state == "stopped" and load_config().get("host"):
+                self._log("Auto-connecting on launch…", "info")
+                self._start_engine()
         except Exception:
             pass
 

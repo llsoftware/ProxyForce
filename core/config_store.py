@@ -17,6 +17,7 @@ machine-wide visibility).
 import json
 import os
 import base64
+import subprocess
 import winreg
 
 REG_ROOT = winreg.HKEY_LOCAL_MACHINE
@@ -159,24 +160,59 @@ def load_config() -> dict:
     return result
 
 
-def save_autostart(enabled: bool, exe_path: str):
-    """Add/remove a per-user logon entry that launches the GUI.
-    Note: because the exe is requireAdministrator, logon autostart will trigger
-    a UAC prompt at each sign-in."""
+# ── Autostart (Scheduled Task) ─────────────────────────────────────────────────
+# Autostart is a Scheduled Task, NOT an HKCU\...\Run entry. WHY:
+# The GUI ships asInvoker and self-elevates via ShellExecuteW("runas")
+# (main.py:relaunch_as_admin), so a Run-key launch popped a UAC prompt at EVERY
+# sign-in — fatal on an unattended box where nobody clicks it. A task registered
+# with /RL HIGHEST launches the process ALREADY elevated, so is_admin() is true in
+# main.py, the self-elevation (and its UAC prompt) is skipped, and the app comes up
+# silently at logon. /SC ONLOGON runs it in the interactive desktop session (the
+# tray needs one). No /RU is passed on purpose: it would make schtasks demand a
+# password, which this non-interactive call cannot answer — ONLOGON then binds to
+# the logon that creates it, running as the current (elevated) user.
+_TASK_NAME     = "ProxyForce"
+_LEGACY_RUN_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+_NO_WINDOW     = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+def _remove_legacy_run_entry():
+    """Delete the old HKCU\\...\\Run\\ProxyForce value so upgraded installs don't
+    double-launch (Run key + Scheduled Task). Best-effort."""
     try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                             r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run",
-                             0, winreg.KEY_SET_VALUE)
-        try:
-            if enabled:
-                winreg.SetValueEx(key, "ProxyForce", 0, winreg.REG_SZ,
-                                  f'"{exe_path}" --minimized')
-            else:
-                try:
-                    winreg.DeleteValue(key, "ProxyForce")
-                except FileNotFoundError:
-                    pass
-        finally:
-            winreg.CloseKey(key)
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _LEGACY_RUN_KEY, 0,
+                            winreg.KEY_SET_VALUE) as key:
+            try:
+                winreg.DeleteValue(key, _TASK_NAME)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
+
+
+def _delete_autostart_task():
+    try:
+        subprocess.run(["schtasks", "/Delete", "/F", "/TN", _TASK_NAME],
+                       capture_output=True, creationflags=_NO_WINDOW, timeout=15)
     except Exception:
         pass
+
+
+def save_autostart(enabled: bool, exe_path: str):
+    """Register/unregister the logon-autostart Scheduled Task that launches the GUI.
+
+    The task runs at logon with highest privileges, so ProxyForce starts elevated
+    with no UAC prompt (see the note above). Always removes the legacy Run-key entry
+    first. All best-effort: a failure here never crashes Save."""
+    _remove_legacy_run_entry()
+    if enabled:
+        try:
+            subprocess.run(
+                ["schtasks", "/Create", "/F", "/TN", _TASK_NAME,
+                 "/SC", "ONLOGON", "/RL", "HIGHEST",
+                 "/TR", f'"{exe_path}" --minimized'],
+                capture_output=True, creationflags=_NO_WINDOW, timeout=15)
+        except Exception:
+            pass
+    else:
+        _delete_autostart_task()
