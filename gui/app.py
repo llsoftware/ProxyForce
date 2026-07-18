@@ -1081,13 +1081,17 @@ class ProxyForceApp(ctk.CTk):
     # ── Updates ───────────────────────────────────────────────────────────────
 
     def _pending_staged(self):
-        """Return {tag, version, dir} if a verified, newer build is already staged."""
+        """Return a pending protected transaction; never trust a persisted path."""
         st = updater.load_state()
-        tag, ddir = st.get("staged_tag"), st.get("staged_dir")
+        tag, txid = st.get("staged_tag"), st.get("transaction_id")
+        try:
+            ddir = updater.transaction_dir(txid) if txid else None
+        except Exception:
+            ddir = None
         if tag and ddir and os.path.isdir(ddir) \
                 and updater.version_gt(tag, updater.current_version()):
             return {"tag": tag, "version": st.get("staged_version") or tag.lstrip("vV"),
-                    "dir": ddir}
+                    "transaction_id": txid}
         return None
 
     def _check_for_updates(self, manual: bool = False):
@@ -1131,10 +1135,11 @@ class ProxyForceApp(ctk.CTk):
                     self._queue.put(("upd_error",
                         "Verification FAILED (signature/checksum) — update rejected."))
                     return
-                staged = updater.stage(info, ddir)
+                txid = updater.transaction_id(ddir)
                 st = updater.load_state()
                 st.update({"staged_tag": info.tag, "staged_version": info.version,
-                           "staged_dir": staged})
+                           "transaction_id": txid})
+                st.pop("staged_dir", None)
                 st.pop("apply_at_hour", None)
                 updater.save_state(st)
                 self._queue.put(("upd_ready", info.tag, info.version, manual))
@@ -1176,11 +1181,17 @@ class ProxyForceApp(ctk.CTk):
                 "Self-update only runs in the packaged build, not from source.")
             return
         install_dir = os.path.dirname(sys.executable)
-        staged = pend["dir"]
+        txid = pend["transaction_id"]
         self._settings_panel.set_update_status("Validating staged build…", THEME["text"])
         self._log("Validating staged build (selftest)…", "info")
 
         def work():
+            info = updater.UpdateInfo(pend["tag"], False, "", "", "")
+            try:
+                staged = updater.prepare_apply(info, txid, install_dir)
+            except Exception as e:
+                self._queue.put(("upd_error", f"Final update verification failed: {e}"))
+                return
             if not updater.selftest_staged(staged):
                 self._queue.put(("upd_error", "Staged build failed selftest — not installing."))
                 return
@@ -1202,13 +1213,25 @@ class ProxyForceApp(ctk.CTk):
         """On startup after an update swap, reconnect if we were running, and clean
         up old staging folders."""
         try:
+            updater.migrate_legacy_update_state()
             st = updater.load_state()
+            txid = st.get("transaction_id")
+            if txid:
+                try:
+                    updater.mark_update_ready(txid)
+                except FileExistsError:
+                    pass
             if st.get("resume_proxy"):
                 st["resume_proxy"] = False
                 updater.save_state(st)
                 self._log("Reconnecting after update…", "info")
                 self._start_engine()
-            updater.cleanup_staging()
+            staged_tag = st.get("staged_tag")
+            if staged_tag and not updater.version_gt(staged_tag, updater.current_version()):
+                for key in ("staged_tag", "staged_version", "transaction_id", "apply_at_hour"):
+                    st.pop(key, None)
+                updater.save_state(st)
+            updater.cleanup_staging(keep_tag=txid)
         except Exception:
             pass
 
@@ -1240,7 +1263,7 @@ class ProxyForceApp(ctk.CTk):
                     self._queue.put(("upd_check", False))
                 st = updater.load_state()
                 ah = st.get("apply_at_hour")
-                if ah is not None and int(ah) == now.hour and st.get("staged_dir"):
+                if ah is not None and int(ah) == now.hour and st.get("transaction_id"):
                     st.pop("apply_at_hour", None)
                     updater.save_state(st)
                     self._queue.put(("upd_apply",))

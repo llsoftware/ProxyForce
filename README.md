@@ -141,6 +141,17 @@ release is rejected. The staged build must also pass its own `--selftest` before
 swap, and the previous version is kept as a rollback target in case the new one fails
 to start.
 
+Update assets are stored in a randomly named, administrator-only workspace under
+`%ProgramData%`. Downloads are bounded and atomic, unsafe archive paths and links are
+rejected, and the signed archive is verified and freshly extracted again immediately
+before installation. The new build must emit a positive readiness signal or the
+updater rolls back.
+
+ProxyForce remains portable and is not Authenticode-signed. Keep its folder in a
+trusted location: software already running as the same Windows user may otherwise
+replace portable files between launches. In-updater release authenticity is provided
+by the embedded Ed25519 key.
+
 ### Channels — Development vs Stable
 
 Pick a channel in Settings (per machine, default **Stable**):

@@ -8,10 +8,25 @@ import base64
 import hashlib
 import tempfile
 import unittest
+import json
+import zipfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import updater, _ed25519
+
+
+class TestEd25519Vectors(unittest.TestCase):
+    def test_rfc8032_empty_message_vector(self):
+        public_key = bytes.fromhex(
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+        signature = bytes.fromhex(
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155"
+            "5fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+        self.assertTrue(_ed25519.verify(public_key, b"", signature))
+
+    def test_identity_public_key_is_rejected(self):
+        self.assertFalse(_ed25519.verify(b"\x01" + b"\x00" * 31, b"x", b"\x00" * 64))
 
 
 class TestVersionCompare(unittest.TestCase):
@@ -135,6 +150,75 @@ class TestVerify(unittest.TestCase):
         updater.RELEASE_PUBKEY_B64 = ""
         self.assertFalse(updater.verify(self._info, self._dir))
 
+    def test_manifest_filename_must_match_exactly(self):
+        with open(self._sums, "rb") as f:
+            line = f.read().decode().replace(self._info.zip_name, "prefix-" + self._info.zip_name)
+        with open(self._sums, "wb") as f:
+            f.write(line.encode())
+        with open(self._sums, "rb") as f:
+            sig = _ed25519.sign(self._seed, f.read())
+        with open(self._sig, "wb") as f:
+            f.write(sig)
+        self.assertFalse(updater.verify(self._info, self._dir))
+
+    def test_noncanonical_s_is_rejected(self):
+        with open(self._sig, "rb") as f:
+            sig = f.read()
+        s = int.from_bytes(sig[32:], "little") + _ed25519._l
+        if s < 2 ** 256:
+            with open(self._sig, "wb") as f:
+                f.write(sig[:32] + s.to_bytes(32, "little"))
+            self.assertFalse(updater.verify(self._info, self._dir))
+
+
+class TestSafeExtraction(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pf_extract_")
+        self.real_update_dir = updater.update_dir
+        self.real_harden = updater._harden_acl
+        updater.update_dir = lambda: self.root
+        updater._harden_acl = lambda _p: None
+        self.info = updater.UpdateInfo("v9.9.9", True, "", "", "")
+        self.ddir = os.path.join(self.root, "a" * 32)
+        os.mkdir(self.ddir)
+
+    def tearDown(self):
+        updater.update_dir = self.real_update_dir
+        updater._harden_acl = self.real_harden
+
+    def _zip(self, entries):
+        path = os.path.join(self.ddir, self.info.zip_name)
+        with zipfile.ZipFile(path, "w") as z:
+            for name, data in entries:
+                z.writestr(name, data)
+
+    def test_expected_layout_extracts(self):
+        self._zip([("ProxyForce.exe", b"MZ"), ("_internal/version.txt", b"x")])
+        staged = updater.stage(self.info, self.ddir)
+        self.assertTrue(os.path.isfile(os.path.join(staged, "ProxyForce.exe")))
+
+    def test_traversal_is_rejected(self):
+        self._zip([("ProxyForce.exe", b"MZ"), ("_internal/x", b"x"), ("../evil", b"x")])
+        with self.assertRaises(ValueError):
+            updater.stage(self.info, self.ddir)
+
+    def test_case_colliding_names_are_rejected(self):
+        self._zip([("ProxyForce.exe", b"MZ"), ("proxyforce.EXE", b"MZ"),
+                   ("_internal/x", b"x")])
+        with self.assertRaises(ValueError):
+            updater.stage(self.info, self.ddir)
+
+    def test_apply_transaction_token_and_target_are_bound(self):
+        staged = os.path.join(self.ddir, "staged")
+        os.mkdir(staged)
+        token = "b" * 64
+        target = os.path.join(self.root, "install")
+        with open(os.path.join(self.ddir, "transaction.json"), "w") as f:
+            json.dump({"apply_token": token, "target": os.path.abspath(target)}, f)
+        self.assertTrue(updater._validate_apply_transaction(staged, target, token))
+        self.assertFalse(updater._validate_apply_transaction(staged, target, "c" * 64))
+        self.assertFalse(updater._validate_apply_transaction(staged, target + "-other", token))
+
 
 class _FakeProc:
     def __init__(self, alive=True):
@@ -180,6 +264,8 @@ class TestApplySwap(unittest.TestCase):
 
     def test_healthy_swap_commits(self):
         updater._spawn = lambda exe, relaunch: _FakeProc(alive=True)
+        with open(os.path.join(self._root, "ready"), "w") as f:
+            f.write("ok")
         ok = updater._apply_swap(self._staged, self._install, "--minimized")
         self.assertTrue(ok)
         self.assertEqual(self._marker(), b"NEW")                       # new build installed
@@ -208,7 +294,8 @@ class TestApplyWorkerFreesDir(unittest.TestCase):
 
     def setUp(self):
         self._orig = (updater._wait_pid_exit, updater._free_install_dir,
-                      updater._apply_swap, updater._applog, time.sleep)
+                      updater._apply_swap, updater._applog,
+                      updater._validate_apply_transaction, time.sleep)
         self.calls = []
         updater._applog = lambda m: None
         updater._wait_pid_exit = lambda pid, timeout=0: self.calls.append("wait")
@@ -216,15 +303,18 @@ class TestApplyWorkerFreesDir(unittest.TestCase):
             self.calls.append(("free", target)) or True)
         updater._apply_swap = lambda staged, target, relaunch: (
             self.calls.append(("swap", target)) or True)
+        updater._validate_apply_transaction = lambda staged, target, token: True
         time.sleep = lambda *_a, **_k: None
 
     def tearDown(self):
         (updater._wait_pid_exit, updater._free_install_dir,
-         updater._apply_swap, updater._applog, time.sleep) = self._orig
+         updater._apply_swap, updater._applog,
+         updater._validate_apply_transaction, time.sleep) = self._orig
 
     def test_frees_dir_between_wait_and_swap(self):
         updater.apply_worker(
-            ["--apply-update", "--target", r"C:\X\ProxyForce", "--wait-pid", "42"])
+            ["--apply-update", "--target", r"C:\X\ProxyForce", "--wait-pid", "42",
+             "--apply-token", "a" * 64])
         self.assertEqual([c if isinstance(c, str) else c[0] for c in self.calls],
                          ["wait", "free", "swap"])
         self.assertEqual(self.calls[1], ("free", r"C:\X\ProxyForce"))

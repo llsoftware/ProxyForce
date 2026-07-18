@@ -27,7 +27,7 @@ def main():
     if not seed_b64:
         print("WARNING: PROXYFORCE_SIGNING_KEY not set — release will be UNSIGNED "
               "(auto-update will refuse it). Set the secret to enable signing.")
-        sys.exit(0)
+        sys.exit(4)
 
     try:
         seed = base64.b64decode(seed_b64)

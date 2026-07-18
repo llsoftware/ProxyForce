@@ -35,6 +35,8 @@ import shutil
 import subprocess
 import urllib.request
 import urllib.parse
+import secrets
+import stat
 
 from core import _ed25519
 from core._version import __version__ as APP_VERSION
@@ -62,6 +64,18 @@ _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 _HEALTH_CHECKS = 8
 _HEALTH_INTERVAL = 1.0
 
+_MAX_SIDECAR = 64 * 1024
+_MAX_ARCHIVE = 250 * 1024 * 1024
+_MAX_EXTRACTED = 750 * 1024 * 1024
+_MAX_MEMBERS = 5000
+_TAG_RE = re.compile(
+    r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
+    r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
+_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 def _data_dir() -> str:
@@ -70,7 +84,68 @@ def _data_dir() -> str:
 
 
 def update_dir() -> str:
+    return os.path.join(_data_dir(), "update-v2")
+
+
+def _legacy_update_dir() -> str:
     return os.path.join(_data_dir(), "update")
+
+
+def _is_reparse(path: str) -> bool:
+    try:
+        attrs = getattr(os.lstat(path), "st_file_attributes", 0)
+        return bool(attrs & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+    except OSError:
+        return False
+
+
+def _assert_beneath(path: str, root: str):
+    root_abs = os.path.normcase(os.path.abspath(root)).rstrip("\\/")
+    path_abs = os.path.normcase(os.path.abspath(path))
+    if path_abs != root_abs and not path_abs.startswith(root_abs + os.sep):
+        raise ValueError("update path escapes protected root")
+
+
+def _assert_no_reparse(path: str, root: str):
+    _assert_beneath(path, root)
+    cur = os.path.abspath(path)
+    root_abs = os.path.abspath(root)
+    while True:
+        if os.path.lexists(cur) and _is_reparse(cur):
+            raise ValueError(f"reparse point rejected: {cur}")
+        if os.path.normcase(cur) == os.path.normcase(root_abs):
+            break
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            raise ValueError("protected root not reached")
+        cur = parent
+
+
+def _harden_acl(path: str):
+    """Protect an update directory using language-independent Windows SIDs."""
+    if os.name != "nt":
+        return
+    commands = (
+        ["icacls", path, "/inheritance:r"],
+        ["icacls", path, "/grant:r", "*S-1-5-18:(OI)(CI)F",
+         "*S-1-5-32-544:(OI)(CI)F"],
+        ["icacls", path, "/setowner", "*S-1-5-32-544"],
+    )
+    for args in commands:
+        r = subprocess.run(args, capture_output=True, text=True,
+                           creationflags=_CREATE_NO_WINDOW, timeout=20)
+        if r.returncode:
+            raise PermissionError(f"could not protect update workspace: {r.stderr.strip()}")
+
+
+def ensure_secure_update_dir() -> str:
+    root = update_dir()
+    if os.path.lexists(root) and _is_reparse(root):
+        raise PermissionError("update workspace is a reparse point")
+    os.makedirs(root, exist_ok=True)
+    _harden_acl(root)
+    _assert_no_reparse(root, root)
+    return root
 
 
 def _state_path() -> str:
@@ -86,12 +161,19 @@ def load_state() -> dict:
 
 
 def save_state(state: dict):
+    root = ensure_secure_update_dir()
+    tmp = os.path.join(root, f"state.{secrets.token_hex(8)}.tmp")
     try:
-        os.makedirs(update_dir(), exist_ok=True)
-        with open(_state_path(), "w", encoding="utf-8") as f:
+        with open(tmp, "x", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-    except Exception:
-        pass
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, _state_path())
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 # ── version comparison (semver-ish with pre-release precedence) ───────────────
@@ -189,7 +271,7 @@ def _release_to_info(rel):
     if not rel or rel.get("draft"):
         return None
     tag = rel.get("tag_name")
-    if not tag:
+    if not tag or not _TAG_RE.fullmatch(str(tag)):
         return None
     assets = {a["name"]: a.get("browser_download_url") for a in (rel.get("assets") or [])}
     zip_name = f"ProxyForce-{tag}-win64.zip"
@@ -222,34 +304,56 @@ def check_latest(cfg: dict):
 
 
 # ── download ──────────────────────────────────────────────────────────────────
-def _download_file(opener, url, dest, progress_cb=None):
+def _download_file(opener, url, dest, progress_cb=None, max_bytes=_MAX_ARCHIVE):
     req = urllib.request.Request(
         url, headers={"User-Agent": _UA, "Accept": "application/octet-stream"})
     with opener.open(req, timeout=120) as r:
         total = int(r.headers.get("Content-Length") or 0)
+        if total > max_bytes:
+            raise ValueError("update asset exceeds size limit")
         done = 0
-        with open(dest, "wb") as f:
-            while True:
-                chunk = r.read(65536)
-                if not chunk:
-                    break
-                f.write(chunk)
-                done += len(chunk)
-                if progress_cb:
-                    progress_cb(done, total)
+        partial = dest + f".{secrets.token_hex(8)}.partial"
+        try:
+            with open(partial, "x+b") as f:
+                while True:
+                    chunk = r.read(65536)
+                    if not chunk:
+                        break
+                    done += len(chunk)
+                    if done > max_bytes:
+                        raise ValueError("update asset exceeds size limit")
+                    f.write(chunk)
+                    if progress_cb:
+                        progress_cb(done, total)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(partial, dest)
+        finally:
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
     return dest
 
 
 def download(info: UpdateInfo, cfg: dict, progress_cb=None) -> str:
-    """Download the zip + SHA256SUMS + signature into update/<tag>/. progress_cb is
-    called as progress_cb(bytes_done, bytes_total) for the (large) zip download."""
+    """Download assets into a random, administrator-only transaction directory."""
+    if not _TAG_RE.fullmatch(info.tag):
+        raise ValueError("invalid release tag")
     opener = _opener(cfg)
-    ddir = os.path.join(update_dir(), info.tag)
-    os.makedirs(ddir, exist_ok=True)
+    root = ensure_secure_update_dir()
+    transaction_id = secrets.token_hex(16)
+    ddir = os.path.join(root, transaction_id)
+    os.mkdir(ddir)
+    _harden_acl(ddir)
+    _assert_no_reparse(ddir, root)
     # Small sidecars first (cheap, no progress), then the zip with progress.
-    _download_file(opener, info.sums_url, os.path.join(ddir, "SHA256SUMS"))
-    _download_file(opener, info.sig_url, os.path.join(ddir, info.sig_name))
-    _download_file(opener, info.zip_url, os.path.join(ddir, info.zip_name), progress_cb)
+    _download_file(opener, info.sums_url, os.path.join(ddir, "SHA256SUMS"),
+                   max_bytes=_MAX_SIDECAR)
+    _download_file(opener, info.sig_url, os.path.join(ddir, info.sig_name),
+                   max_bytes=_MAX_SIDECAR)
+    _download_file(opener, info.zip_url, os.path.join(ddir, info.zip_name), progress_cb,
+                   max_bytes=_MAX_ARCHIVE)
     return ddir
 
 
@@ -285,23 +389,123 @@ def verify(info: UpdateInfo, ddir: str) -> bool:
     want = _sha256(zip_path).lower()
     for line in sums.decode("utf-8", "replace").splitlines():
         parts = line.split()
-        if len(parts) >= 2 and parts[0].lower() == want \
-                and parts[-1].lstrip("*").endswith(info.zip_name):
+        if len(parts) == 2 and parts[0].lower() == want \
+                and parts[1].lstrip("*") == info.zip_name:
             return True
     return False
 
 
 # ── stage (extract) + selftest gate ──────────────────────────────────────────
+def _safe_member_name(name: str) -> str:
+    if not name or "\x00" in name:
+        raise ValueError("empty or NUL-containing archive member")
+    name = name.replace("\\", "/")
+    if name.startswith(("/", "//")) or re.match(r"^[A-Za-z]:", name):
+        raise ValueError("absolute archive path rejected")
+    parts = [p for p in name.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        raise ValueError("archive traversal rejected")
+    for part in parts:
+        if ":" in part or part.endswith((".", " ")):
+            raise ValueError("unsafe Windows archive name")
+        stem = part.split(".", 1)[0].upper()
+        if stem in _RESERVED_NAMES:
+            raise ValueError("reserved Windows archive name")
+    return os.path.join(*parts)
+
+
+def _remove_tree_no_follow(path: str):
+    if not os.path.lexists(path):
+        return
+    if _is_reparse(path):
+        os.rmdir(path) if os.path.isdir(path) else os.remove(path)
+        return
+    shutil.rmtree(path)
+
+
 def stage(info: UpdateInfo, ddir: str) -> str:
-    """Extract the verified zip to update/<tag>/staged and return that path. The zip
-    contains the onedir layout (ProxyForce.exe + _internal\\) at its root."""
+    """Safely extract a verified archive into its protected transaction."""
+    root = ensure_secure_update_dir()
+    _assert_no_reparse(ddir, root)
     staged = os.path.join(ddir, "staged")
-    if os.path.isdir(staged):
-        shutil.rmtree(staged, ignore_errors=True)
-    os.makedirs(staged, exist_ok=True)
+    _remove_tree_no_follow(staged)
+    os.mkdir(staged)
+    _harden_acl(staged)
+    seen = set()
+    expanded = 0
     with zipfile.ZipFile(os.path.join(ddir, info.zip_name)) as z:
-        z.extractall(staged)
+        members = z.infolist()
+        if len(members) > _MAX_MEMBERS:
+            raise ValueError("archive contains too many members")
+        for zi in members:
+            rel = _safe_member_name(zi.filename)
+            folded = rel.casefold()
+            if folded in seen:
+                raise ValueError("duplicate archive member")
+            seen.add(folded)
+            expanded += zi.file_size
+            if expanded > _MAX_EXTRACTED:
+                raise ValueError("archive expansion exceeds limit")
+            # Unix symlinks are encoded in the high mode bits.
+            if stat.S_ISLNK((zi.external_attr >> 16) & 0xFFFF):
+                raise ValueError("archive link rejected")
+            dest = os.path.join(staged, rel)
+            _assert_beneath(dest, staged)
+            if zi.is_dir():
+                os.makedirs(dest, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with z.open(zi) as src, open(dest, "xb") as out:
+                shutil.copyfileobj(src, out, 1 << 20)
+    if not os.path.isfile(os.path.join(staged, "ProxyForce.exe")) \
+            or not os.path.isdir(os.path.join(staged, "_internal")):
+        raise ValueError("archive does not contain the expected application layout")
     return staged
+
+
+def transaction_id(ddir: str) -> str:
+    root = ensure_secure_update_dir()
+    _assert_no_reparse(ddir, root)
+    if os.path.dirname(os.path.abspath(ddir)) != os.path.abspath(root):
+        raise ValueError("invalid transaction directory")
+    return os.path.basename(ddir)
+
+
+def transaction_dir(txid: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{32}", txid or ""):
+        raise ValueError("invalid update transaction")
+    root = ensure_secure_update_dir()
+    path = os.path.join(root, txid)
+    _assert_no_reparse(path, root)
+    return path
+
+
+def prepare_apply(info: UpdateInfo, txid: str, install_dir: str) -> str:
+    """Reverify and freshly extract immediately before elevated execution."""
+    ddir = transaction_dir(txid)
+    if not verify(info, ddir):
+        raise ValueError("staged update failed final signature verification")
+    staged = stage(info, ddir)
+    meta = {
+        "tag": info.tag,
+        "archive_sha256": _sha256(os.path.join(ddir, info.zip_name)),
+        "target": os.path.abspath(install_dir),
+        "apply_token": secrets.token_hex(32),
+    }
+    meta_path = os.path.join(ddir, "transaction.json")
+    with open(meta_path + ".tmp", "w", encoding="utf-8") as f:
+        json.dump(meta, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(meta_path + ".tmp", meta_path)
+    return staged
+
+
+def mark_update_ready(txid: str):
+    """Positive readiness signal emitted by the freshly launched GUI."""
+    path = os.path.join(transaction_dir(txid), "ready")
+    with open(path, "x", encoding="ascii") as f:
+        f.write(APP_VERSION)
 
 
 def selftest_staged(staged: str) -> bool:
@@ -326,10 +530,24 @@ def begin_apply(staged: str, install_dir: str, wait_pid: int):
 
     The relaunch is always `--minimized` (resume-after-update is driven by
     state.json, not args), so there is no relaunch-args parameter to thread through."""
+    root = ensure_secure_update_dir()
+    txdir = os.path.dirname(os.path.abspath(staged))
+    _assert_no_reparse(staged, root)
+    if os.path.dirname(txdir) != os.path.abspath(root):
+        raise ValueError("staged worker is outside the protected workspace")
     exe = os.path.join(staged, "ProxyForce.exe")
+    meta_path = os.path.join(os.path.dirname(staged), "transaction.json")
+    with open(meta_path, "r", encoding="utf-8") as f:
+        meta = json.load(f)
+    if os.path.normcase(meta.get("target", "")) != os.path.normcase(os.path.abspath(install_dir)):
+        raise ValueError("update target does not match protected transaction")
+    token = meta.get("apply_token")
+    if not re.fullmatch(r"[0-9a-f]{64}", token or ""):
+        raise ValueError("invalid apply token")
     # Relaunch is always "--minimized" (resume-after-update is driven by state.json,
     # not args) — so we don't pass an arg value that itself starts with "--".
-    args = [exe, "--apply-update", "--target", install_dir, "--wait-pid", str(wait_pid)]
+    args = [exe, "--apply-update", "--target", install_dir, "--wait-pid", str(wait_pid),
+            "--apply-token", token]
     flags = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP | _CREATE_BREAKAWAY_FROM_JOB
     try:
         subprocess.Popen(args, cwd=staged, close_fds=True, creationflags=flags)
@@ -475,12 +693,37 @@ def apply_worker(argv):
     target = opts.get("target")
     wait_pid = int(opts.get("wait-pid") or 0)
     staged = os.path.dirname(os.path.abspath(sys.executable))
+    valid = _validate_apply_transaction(staged, target, opts.get("apply-token"))
+    if not valid:
+        _applog("apply rejected: protected transaction validation failed")
+        return False
     _applog(f"apply start: target={target} staged={staged} wait_pid={wait_pid}")
     _wait_pid_exit(wait_pid, timeout=120)
     freed = _free_install_dir(target)
     _applog(f"install dir freed={freed}")
     time.sleep(1.0)                             # let handles/AV release
-    _apply_swap(staged, target, "--minimized")
+    return _apply_swap(staged, target, "--minimized")
+
+
+def _validate_apply_transaction(staged: str, target: str, token: str) -> bool:
+    meta_path = os.path.join(os.path.dirname(staged), "transaction.json")
+    try:
+        root = ensure_secure_update_dir()
+        txdir = os.path.dirname(os.path.abspath(staged))
+        _assert_no_reparse(staged, root)
+        if os.path.dirname(txdir) != os.path.abspath(root):
+            return False
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        return bool(
+            re.fullmatch(r"[0-9a-f]{64}", token or "")
+            and secrets.compare_digest(token, meta.get("apply_token", ""))
+            and os.path.normcase(os.path.abspath(target or ""))
+            == os.path.normcase(meta.get("target", ""))
+            and os.path.normcase(os.path.dirname(meta_path)) == os.path.normcase(txdir)
+        )
+    except Exception:
+        return False
 
 
 def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
@@ -514,14 +757,17 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
         _applog(f"relaunch spawn failed: {e!r} — rolling back")
         proc = None
 
-    # Health check: did the new build stay up?
+    # Health check: the new build must stay alive and emit a positive ready marker.
     healthy = False
+    ready_path = os.path.join(os.path.dirname(staged), "ready")
     if proc is not None:
         for _ in range(_HEALTH_CHECKS):
             if proc.poll() is not None:
                 break
+            if os.path.isfile(ready_path):
+                healthy = True
+                break
             time.sleep(_HEALTH_INTERVAL)
-        healthy = proc.poll() is None
 
     if not healthy:
         _applog("new build did not stay up — rolling back to .old")
@@ -552,4 +798,33 @@ def cleanup_staging(keep_tag: str = None):
             continue
         path = os.path.join(base, name)
         if os.path.isdir(path):
-            shutil.rmtree(path, ignore_errors=True)
+            try:
+                _remove_tree_no_follow(path)
+            except OSError:
+                pass
+
+
+def migrate_legacy_update_state():
+    """Invalidate pre-hardening state and remove legacy staging without following links."""
+    ensure_secure_update_dir()
+    legacy = _legacy_update_dir()
+    if not os.path.lexists(legacy):
+        return
+    # Preserve only benign runtime continuity. Never import legacy paths or pending
+    # update identity from the user-writable v1 workspace.
+    try:
+        with open(os.path.join(legacy, "state.json"), "r", encoding="utf-8") as f:
+            old_state = json.load(f)
+        state = load_state()
+        for key in ("resume_proxy", "last_check_date"):
+            if key in old_state and key not in state:
+                state[key] = old_state[key]
+        if state:
+            save_state(state)
+    except Exception:
+        pass
+    try:
+        _remove_tree_no_follow(legacy)
+    except OSError:
+        # A locked old worker may still be exiting; leaving it is safer than following it.
+        pass

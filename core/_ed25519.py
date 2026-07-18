@@ -120,12 +120,16 @@ def _decodeint(s: bytes) -> int:
 
 def _decodepoint(s: bytes):
     y = int.from_bytes(s, "little") & ((1 << (_b - 1)) - 1)
+    if y >= _q:
+        raise ValueError("non-canonical point encoding")
     x = _xrecover(y)
     if (x & 1) != _bit(s, _b - 1):
         x = _q - x
     P = [x, y]
     if not _isoncurve(P):
         raise ValueError("point is not on curve")
+    if _encodepoint(P) != s:
+        raise ValueError("non-canonical point encoding")
     return P
 
 
@@ -138,6 +142,13 @@ def verify(public_key: bytes, message: bytes, signature: bytes) -> bool:
         R = _decodepoint(signature[:32])
         A = _decodepoint(public_key)
         S = _decodeint(signature[32:])
+        if S >= _l:
+            return False
+        identity = [0, 1]
+        if R == identity or A == identity:
+            return False
+        if _scalarmult(R, _l) != identity or _scalarmult(A, _l) != identity:
+            return False
         h = _Hint(signature[:32] + public_key + message) % _l
         return _scalarmult(_B, S) == _edwards(R, _scalarmult(A, h))
     except Exception:
