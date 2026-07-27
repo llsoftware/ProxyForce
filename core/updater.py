@@ -791,9 +791,22 @@ def _validate_apply_transaction(staged: str, target: str, token: str) -> bool:
         return False
 
 
+def _rollback_to_backup(target: str, backup: str, target_exe: str, relaunch: str):
+    """Discard whatever landed in `target` (even a partial copy) and restore the
+    pre-update `backup`, then relaunch whichever build ends up there."""
+    shutil.rmtree(target, ignore_errors=True)
+    try:
+        os.rename(backup, target)
+    except Exception as e:
+        _applog(f"rollback rename failed: {e!r}")
+    if os.path.isfile(target_exe):
+        _spawn(target_exe, relaunch)
+
+
 def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
     """Back up the install dir, copy the staged build in, relaunch it, and roll back
-    if the new build doesn't stay up. Returns True on a committed, healthy swap."""
+    if the copy is incomplete or the new build doesn't stay up. Returns True on a
+    committed, healthy swap."""
     target_exe = os.path.join(target, "ProxyForce.exe")
     backup = target.rstrip("\\/") + ".old"
 
@@ -803,15 +816,20 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
         _retry(lambda: os.rename(target, backup), tries=20)   # move old aside
         # dirs_exist_ok so a retry after a partial copy doesn't trip FileExistsError.
         _retry(lambda: shutil.copytree(staged, target, dirs_exist_ok=True))  # install new
+        # copytree can raise after copying MOST files (e.g. AV real-time scanning
+        # transiently locks/quarantines the freshly-written sing-box.exe) and still
+        # leave `target` populated with everything else. A missing engine binary is
+        # just as broken as a missing exe, so catch it here — otherwise it slips past
+        # the rollback check below (target DOES exist, just incompletely) and a
+        # half-installed build gets relaunched instead of rolled back.
+        if not os.path.isfile(os.path.join(target, "_internal", "singbox", "sing-box.exe")):
+            raise RuntimeError("copy incomplete: sing-box.exe missing from installed build")
         _applog("swap ok")
     except Exception as e:
         _applog(f"swap FAILED: {e!r} — rolling back")
-        if not os.path.isdir(target) and os.path.isdir(backup):
-            try:
-                os.rename(backup, target)
-            except Exception as e2:
-                _applog(f"rollback rename failed: {e2!r}")
-        if os.path.isfile(target_exe):
+        if os.path.isdir(backup):
+            _rollback_to_backup(target, backup, target_exe, relaunch)
+        elif os.path.isfile(target_exe):
             _spawn(target_exe, relaunch)
         return False
 
@@ -836,13 +854,7 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
 
     if not healthy:
         _applog("new build did not stay up — rolling back to .old")
-        shutil.rmtree(target, ignore_errors=True)
-        try:
-            os.rename(backup, target)
-        except Exception as e:
-            _applog(f"rollback failed: {e!r}")
-        if os.path.isfile(target_exe):
-            _spawn(target_exe, relaunch)
+        _rollback_to_backup(target, backup, target_exe, relaunch)
         return False
 
     # Success: drop the backup. The staged dir (this worker's own folder) is removed

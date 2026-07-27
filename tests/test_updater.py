@@ -236,11 +236,13 @@ class TestApplySwap(unittest.TestCase):
         self._install = os.path.join(self._root, "ProxyForce")
         self._staged = os.path.join(self._root, "staged")
         for d, marker in ((self._install, b"OLD"), (self._staged, b"NEW")):
-            os.makedirs(os.path.join(d, "_internal"))
+            os.makedirs(os.path.join(d, "_internal", "singbox"))
             with open(os.path.join(d, "ProxyForce.exe"), "wb") as f:
                 f.write(b"MZ")
             with open(os.path.join(d, "_internal", "version.txt"), "wb") as f:
                 f.write(marker)
+            with open(os.path.join(d, "_internal", "singbox", "sing-box.exe"), "wb") as f:
+                f.write(b"MZ")
         self._real_spawn = updater._spawn
         self._real_checks = updater._HEALTH_CHECKS
         self._real_interval = updater._HEALTH_INTERVAL
@@ -276,6 +278,33 @@ class TestApplySwap(unittest.TestCase):
         ok = updater._apply_swap(self._staged, self._install, "--minimized")
         self.assertFalse(ok)
         self.assertEqual(self._marker(), b"OLD")                       # rolled back
+
+    def test_partial_copy_missing_singbox_rolls_back(self):
+        """Regression: a copytree that raises AFTER copying most files (e.g. AV
+        real-time scanning locks/quarantines the freshly-written sing-box.exe) must
+        not be mistaken for "nothing to roll back" just because `target` exists —
+        it exists, just incomplete, and must still be discarded in favor of .old."""
+        real_copytree = updater.shutil.copytree
+
+        def flaky_copytree(src, dst, **kwargs):
+            real_copytree(src, dst, **kwargs)
+            os.remove(os.path.join(dst, "_internal", "singbox", "sing-box.exe"))
+            raise PermissionError("simulated AV lock on sing-box.exe")
+
+        updater.shutil.copytree = flaky_copytree
+        updater._spawn = lambda exe, relaunch: _FakeProc(alive=True)
+        real_sleep = time.sleep
+        time.sleep = lambda *_a, **_k: None   # skip _retry's real delay
+        try:
+            ok = updater._apply_swap(self._staged, self._install, "--minimized")
+        finally:
+            updater.shutil.copytree = real_copytree
+            time.sleep = real_sleep
+        self.assertFalse(ok)
+        self.assertEqual(self._marker(), b"OLD")                       # rolled back
+        self.assertTrue(os.path.isfile(
+            os.path.join(self._install, "_internal", "singbox", "sing-box.exe")))
+        self.assertFalse(os.path.isdir(self._install + ".old"))        # backup consumed
 
 
 class TestArgParse(unittest.TestCase):
