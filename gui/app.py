@@ -35,7 +35,7 @@ except ImportError:
     _HAS_PIL = False
     LOGO_BG = (13, 15, 26)
     LOGO_ACCENT = (59, 130, 246)
-    LOGO_R_CIRCLE = 0.47
+    LOGO_R_CIRCLE = 0.42
     LOGO_R_HEX = 0.34
     STATE_COLORS = {
         "running": (52, 211, 153),
@@ -571,14 +571,13 @@ class ProxyForceApp(ctk.CTk):
         s  = int(canvas["width"])
         cx = cy = s / 2
         if _HAS_IMAGETK:
-            frames = self._status_photo_frames(s, self._last_state)
+            frames = self._status_photo_frames(s, self._last_state, transparent=True)
             photo = frames[self._icon_frame % len(frames)]
             canvas.create_image(cx, cy, image=photo)
             return
         # Static vector fallback for an installation missing Pillow's Tk binding.
-        cr = s * LOGO_R_CIRCLE
-        canvas.create_oval(cx - cr, cy - cr, cx + cr, cy + cr,
-                           fill="#%02x%02x%02x" % LOGO_BG, outline="")
+        # No dark backing disc here either — the canvas bg (set above) already
+        # matches the sidebar theme color.
         hr   = s * LOGO_R_HEX
         points = [
             (cx + hr * math.cos(math.radians(60 * i - 90)),
@@ -597,41 +596,51 @@ class ProxyForceApp(ctk.CTk):
         """Initial system-tray image; subsequent frames are state-aware."""
         return self._status_pil_frames(64, self._last_state)[0]
 
-    def _status_pil_frames(self, size: int, state: str):
-        key = (size, state)
+    def _status_pil_frames(self, size: int, state: str, transparent: bool = False):
+        key = (size, state, transparent)
         frames = self._icon_pil_cache.get(key)
         if frames is None:
             count = frame_count(state)
             frames = [
-                render_logo(size, state, i / count, animated=count > 1)
+                render_logo(size, state, i / count, animated=count > 1,
+                            bg_circle=not transparent)
                 for i in range(count)
             ]
             self._icon_pil_cache[key] = frames
         return frames
 
-    def _status_photo_frames(self, size: int, state: str):
-        key = (size, state)
+    def _status_photo_frames(self, size: int, state: str, transparent: bool = False):
+        key = (size, state, transparent)
         frames = self._icon_photo_cache.get(key)
         if frames is None:
             frames = [ImageTk.PhotoImage(img)
-                      for img in self._status_pil_frames(size, state)]
+                      for img in self._status_pil_frames(size, state, transparent)]
             self._icon_photo_cache[key] = frames
         return frames
 
     def _animate_status_icon(self):
-        """Advance the sidebar and tray together at a low-cost 8 fps."""
+        """Advance the sidebar mark at a low-cost 8 fps. The tray icon is NOT
+        touched here — pystray re-serializes the image to a temp .ico file and
+        round-trips it through Win32 LoadImage on every assignment, so doing
+        that 8x/second (even for a static single-frame state) was pegging the
+        main thread and made the whole UI feel laggy. The tray only updates
+        once per actual state change, via _update_tray_icon()."""
         if not self._running:
             return
-        self._draw_icon(self._icon_canvas, "sidebar")
-        tray = getattr(self, "_tray", None)
-        if tray is not None:
-            frames = self._status_pil_frames(64, self._last_state)
-            try:
-                tray.icon = frames[self._icon_frame % len(frames)]
-            except Exception:
-                pass
-        self._icon_frame += 1
+        if _HAS_IMAGETK and frame_count(self._last_state) > 1:
+            self._icon_frame += 1
+            self._draw_icon(self._icon_canvas, "sidebar")
         self.after(125, self._animate_status_icon)
+
+    def _update_tray_icon(self):
+        """Push a single static frame for the current state to the tray."""
+        tray = getattr(self, "_tray", None)
+        if tray is None:
+            return
+        try:
+            tray.icon = self._status_pil_frames(64, self._last_state)[0]
+        except Exception:
+            pass
 
     def _set_window_icon(self):
         """Set the titlebar / taskbar icon to the canonical badge.
@@ -647,14 +656,19 @@ class ProxyForceApp(ctk.CTk):
         bare wm_iconbitmap() call resets the native icon slot so the following
         iconphoto() sticks, and re-binding on <Map> re-applies it every time
         the window is shown again (tray restore, un-minimize), not just once
-        at startup.
+        at startup. The PhotoImage set itself is built once and cached — it's
+        the same six sizes every time, and re-rendering all of them (each a
+        supersampled + Gaussian-blurred draw down to 1024px at the top size)
+        on every <Map> was an avoidable hitch on un-minimize.
         """
         if not _HAS_IMAGETK:
             return
         try:
-            self._win_icons = [ImageTk.PhotoImage(
-                               render_logo(s, state="neutral", animated=False))
-                               for s in (256, 64, 48, 32, 20, 16)]
+            icons = getattr(self, "_win_icons", None)
+            if icons is None:
+                icons = self._win_icons = [ImageTk.PhotoImage(
+                                   render_logo(s, state="neutral", animated=False))
+                                   for s in (256, 64, 48, 32, 20, 16)]
             self.wm_iconbitmap()
             self.iconphoto(True, *self._win_icons)
         except Exception:
@@ -735,7 +749,7 @@ class ProxyForceApp(ctk.CTk):
         logo_f = ctk.CTkFrame(sb, fg_color="transparent")
         logo_f.pack(fill="x", padx=14, pady=(18, 4))
 
-        self._icon_canvas = tk.Canvas(logo_f, width=38, height=38,
+        self._icon_canvas = tk.Canvas(logo_f, width=46, height=46,
                                       bg=cc("sidebar"), highlightthickness=0)
         self._icon_canvas.pack(side="left")
         self._draw_icon(self._icon_canvas, "sidebar")
@@ -1251,7 +1265,8 @@ class ProxyForceApp(ctk.CTk):
         label, color_key, hero_bg = STATE_UI.get(
             state, ("STOPPED", "muted", "card"))
         color = cc(color_key)
-        if state != self._last_state:
+        state_changed = state != self._last_state
+        if state_changed:
             self._icon_frame = 0
 
         self._status_lbl.configure(text=label, text_color=color)
@@ -1277,6 +1292,9 @@ class ProxyForceApp(ctk.CTk):
             self._card_active.update_value("0")
 
         self._last_state = state
+        if state_changed:
+            self._draw_icon(self._icon_canvas, "sidebar")
+            self._update_tray_icon()
 
     def _update_stats(self, st):
         self._card_active.update_value(str(st.active_connections))

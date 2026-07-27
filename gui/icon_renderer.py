@@ -11,7 +11,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 LOGO_BG = (13, 15, 26)
 LOGO_ACCENT = (59, 130, 246)
-LOGO_R_CIRCLE = 0.47
+LOGO_R_CIRCLE = 0.42
 LOGO_R_HEX = 0.34
 LOGO_R_INNER_HEX = 0.72
 
@@ -72,12 +72,18 @@ def render_logo(
     state: str = "neutral",
     phase: float = 0.0,
     animated: bool = False,
+    bg_circle: bool = True,
 ) -> Image.Image:
     """Return a supersampled RGBA ProxyForce badge.
 
     Animated variants keep all energy inside the blue hexagonal shell. The
     static ``neutral`` variant is used for Explorer, title-bar, and taskbar
     identity so connection state never changes the Windows taskbar icon.
+
+    ``bg_circle`` draws the dark disc behind the hexagon — needed for the tray
+    and window icons, which must read against an arbitrary desktop background,
+    but left off (transparent) for the in-app sidebar mark, which sits on a
+    themed panel and looks like a stray dark blob on the light theme otherwise.
     """
     if size < 8:
         raise ValueError("icon size must be at least 8 pixels")
@@ -96,10 +102,11 @@ def render_logo(
 
     image = Image.new("RGBA", (side, side), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
-    draw.ellipse(
-        [center - circle_r, center - circle_r, center + circle_r, center + circle_r],
-        fill=LOGO_BG + (255,),
-    )
+    if bg_circle:
+        draw.ellipse(
+            [center - circle_r, center - circle_r, center + circle_r, center + circle_r],
+            fill=LOGO_BG + (255,),
+        )
     draw.polygon(_hex_points(center, center, hex_r), fill=LOGO_ACCENT + (255,))
     draw.polygon(
         _hex_points(center, center, inner_r),
