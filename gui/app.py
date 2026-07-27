@@ -64,6 +64,7 @@ _APP_VERSION = _PF_VERSION
 DATA_DIR    = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "ProxyForce")
 SINGBOX_LOG = os.path.join(DATA_DIR, "singbox", "singbox.log")
 _ANSI_RE    = re.compile(r"\x1b\[[0-9;]*m")
+ANIM_INTERVAL_MS = 250  # sidebar pulse cadence while a state is animating (~4 fps)
 
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -219,6 +220,8 @@ class StatCard(ctk.CTkFrame):
 # Log panel
 # ─────────────────────────────────────────────────────────────────────────────
 class LogPanel(ctk.CTkFrame):
+    _MAX_LINES = 2000  # keep long sessions from growing the Text widget unbounded
+
     def __init__(self, parent, title: str = "EVENT LOG", **kwargs):
         super().__init__(parent, fg_color=THEME["card"],
                          corner_radius=10, border_width=1,
@@ -266,6 +269,9 @@ class LogPanel(ctk.CTkFrame):
         self._text.configure(state="normal")
         self._text.insert("end", f"[{ts}] ", "ts")
         self._text.insert("end", msg + "\n", level)
+        overflow = int(self._text.index("end-1c").split(".")[0]) - self._MAX_LINES
+        if overflow > 0:
+            self._text.delete("1.0", f"{overflow + 1}.0")
         self._text.see("end")
         self._text.configure(state="disabled")
 
@@ -522,6 +528,7 @@ class ProxyForceApp(ctk.CTk):
         self._last_state = "stopped"
         self._updates_busy = False
         self._icon_frame = 0
+        self._anim_active = False   # True only while the pulse loop is alive
         self._icon_photo_cache = {}
         self._icon_pil_cache = {}
         self._engine: SingBoxController | None = None
@@ -549,7 +556,7 @@ class ProxyForceApp(ctk.CTk):
 
         if _HAS_TRAY:
             self._setup_tray()
-        self.after(125, self._animate_status_icon)
+        self._start_status_animation()
 
         # Auto-update: nightly background check timer + reconnect after an update swap.
         threading.Thread(target=self._update_timer_loop, daemon=True).start()
@@ -619,18 +626,33 @@ class ProxyForceApp(ctk.CTk):
         return frames
 
     def _animate_status_icon(self):
-        """Advance the sidebar mark at a low-cost 8 fps. The tray icon is NOT
-        touched here — pystray re-serializes the image to a temp .ico file and
-        round-trips it through Win32 LoadImage on every assignment, so doing
-        that 8x/second (even for a static single-frame state) was pegging the
-        main thread and made the whole UI feel laggy. The tray only updates
-        once per actual state change, via _update_tray_icon()."""
-        if not self._running:
+        """Advance the sidebar mark at a low-cost ~4 fps, self-terminating the
+        instant the state stops animating instead of looping forever. The tray
+        icon is NOT touched here — pystray re-serializes the image to a temp
+        .ico file and round-trips it through Win32 LoadImage on every
+        assignment, so doing that repeatedly (even for a static single-frame
+        state) was pegging the main thread and made the whole UI feel laggy.
+        The tray only updates once per actual state change, via
+        _update_tray_icon()."""
+        if not (self._running and _HAS_IMAGETK
+                and frame_count(self._last_state) > 1):
+            self._anim_active = False  # nothing to animate — let the loop die
             return
-        if _HAS_IMAGETK and frame_count(self._last_state) > 1:
-            self._icon_frame += 1
-            self._draw_icon(self._icon_canvas, "sidebar")
-        self.after(125, self._animate_status_icon)
+        self._icon_frame += 1
+        self._draw_icon(self._icon_canvas, "sidebar")
+        self.after(ANIM_INTERVAL_MS, self._animate_status_icon)
+
+    def _start_status_animation(self):
+        """Arm the pulse loop, but only if it isn't already running and the
+        current state actually has more than one frame. Idle/static states
+        (stopped, waiting) never start a timer at all — previously the
+        animation loop rescheduled itself forever even at rest, as a
+        perpetual no-op."""
+        if self._anim_active:
+            return
+        if self._running and _HAS_IMAGETK and frame_count(self._last_state) > 1:
+            self._anim_active = True
+            self._animate_status_icon()
 
     def _update_tray_icon(self):
         """Push a single static frame for the current state to the tray."""
@@ -1295,6 +1317,7 @@ class ProxyForceApp(ctk.CTk):
         if state_changed:
             self._draw_icon(self._icon_canvas, "sidebar")
             self._update_tray_icon()
+            self._start_status_animation()
 
     def _update_stats(self, st):
         self._card_active.update_value(str(st.active_connections))
