@@ -25,10 +25,26 @@ from core import updater
 from core._version import __version__ as _PF_VERSION
 
 try:
-    from PIL import Image, ImageDraw
+    from PIL import Image
+    from gui.icon_renderer import (
+        LOGO_ACCENT, LOGO_BG, LOGO_R_CIRCLE, LOGO_R_HEX,
+        STATE_COLORS, frame_count, render_logo,
+    )
     _HAS_PIL = True
 except ImportError:
     _HAS_PIL = False
+    LOGO_BG = (13, 15, 26)
+    LOGO_ACCENT = (59, 130, 246)
+    LOGO_R_CIRCLE = 0.47
+    LOGO_R_HEX = 0.34
+    STATE_COLORS = {
+        "running": (52, 211, 153),
+        "starting": (251, 191, 36),
+        "stopping": (251, 191, 36),
+        "error": (248, 113, 113),
+        "stopped": (100, 116, 139),
+        "waiting": (100, 116, 139),
+    }
 
 try:
     # ImageTk needs Pillow's Tk binding (_imagingtk); used for the canvas + window
@@ -85,52 +101,15 @@ def cc(key: str) -> str:
     return THEME[key][0 if mode == "light" else 1]
 
 
-# ── Logo ────────────────────────────────────────────────────────────────────
-# ONE source of truth for the ProxyForce mark so every place it appears is the
-# identical badge: the in-app sidebar icon, the system-tray icon, the window /
-# taskbar icon, and the Explorer .ico (tools/make_assets.py mirrors these exact
-# numbers). A pointed-top blue hexagon with a white centre dot on a dark circle.
-LOGO_BG       = (13,  15,  26)    # #0D0F1A  dark circle
-LOGO_ACCENT   = (59, 130, 246)    # #3B82F6  hexagon
-LOGO_INNER    = (255, 255, 255)   # white centre dot
-LOGO_R_CIRCLE = 0.47              # dark-circle radius   (× side length)
-LOGO_R_HEX    = 0.32              # hexagon vertex radius (× side length)
-LOGO_R_INNER  = 0.42              # centre-dot radius     (× hexagon radius)
-LOGO_DOT_MIN  = 20                # below this px, omit the dot (renders as noise)
-
-
-def _hex_points(cx, cy, r):
-    """Pointed-top hexagon vertices (the canonical 60·i − 90° formula)."""
-    return [(cx + r * math.cos(math.radians(60 * i - 90)),
-             cy + r * math.sin(math.radians(60 * i - 90)))
-            for i in range(6)]
-
-
-def _render_logo(size: int):
-    """Render the ProxyForce badge to an RGBA Pillow image (4× supersampled)."""
-    ss   = size * 4
-    img  = Image.new("RGBA", (ss, ss), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(img)
-    c    = ss / 2
-    cr   = ss * LOGO_R_CIRCLE
-    draw.ellipse([c - cr, c - cr, c + cr, c + cr], fill=LOGO_BG + (255,))
-    hr = ss * LOGO_R_HEX
-    draw.polygon(_hex_points(c, c, hr), fill=LOGO_ACCENT + (255,))
-    if size >= LOGO_DOT_MIN:
-        ir = hr * LOGO_R_INNER
-        draw.ellipse([c - ir, c - ir, c + ir, c + ir], fill=LOGO_INNER + (255,))
-    return img.resize((size, size), Image.LANCZOS)
-
-
 # ── State → UI mapping ────────────────────────────────────────────────────────
-# (label, color-key, pulse, hero-bg-key)
+# (label, color-key, hero-bg-key)
 STATE_UI = {
-    "running":  ("ACTIVE",    "green",  True,  "hero_run"),
-    "starting": ("STARTING…", "yellow", True,  "hero_warn"),
-    "stopping": ("STOPPING…", "yellow", False, "hero_warn"),
-    "error":    ("ERROR",     "red",    False, "hero_err"),
-    "stopped":  ("STOPPED",   "muted",  False, "card"),
-    "waiting":  ("NO HOST",   "yellow", True,  "hero_warn"),
+    "running":  ("ACTIVE",    "green",  "hero_run"),
+    "starting": ("STARTING…", "yellow", "hero_warn"),
+    "stopping": ("STOPPING…", "yellow", "hero_warn"),
+    "error":    ("ERROR",     "red",    "hero_err"),
+    "stopped":  ("STOPPED",   "muted",  "card"),
+    "waiting":  ("NO HOST",   "muted",  "card"),
 }
 
 LOG_COLOR_KEYS = {
@@ -205,77 +184,6 @@ class _NavBtn:
 
     def repaint(self):
         self.set_active(self._active)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Animated status beacon
-# ─────────────────────────────────────────────────────────────────────────────
-class StatusBeacon(tk.Canvas):
-    def __init__(self, parent, size: int = 48, bg_key: str = "card", **kwargs):
-        super().__init__(parent, width=size, height=size,
-                         bg=cc(bg_key), highlightthickness=0, **kwargs)
-        self._size   = size
-        self._bg_key = bg_key
-        self._color  = cc("muted")
-        self._phase  = 0.0
-        self._anim   = False
-        self._redraw(1.0)
-
-    def _blend(self, fg: str, bg: str, a: float) -> str:
-        def p(h):
-            h = h.lstrip("#")
-            return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
-        fr, fg2, fb = p(fg)
-        br, bg2, bb = p(bg)
-        return "#{:02x}{:02x}{:02x}".format(
-            int(fr * a + br * (1 - a)),
-            int(fg2 * a + bg2 * (1 - a)),
-            int(fb * a + bb * (1 - a)),
-        )
-
-    def _redraw(self, scale: float = 1.0):
-        self.delete("all")
-        bg = self["bg"]
-        s  = self._size
-        cx = cy = s // 2
-        r  = max(3, int(s * 0.36 * scale))
-        gr = r + max(3, s // 8)
-        self.create_oval(cx - gr, cy - gr, cx + gr, cy + gr,
-                         fill=self._blend(self._color, bg, 0.18), outline="")
-        mr = r + max(1, s // 14)
-        self.create_oval(cx - mr, cy - mr, cx + mr, cy + mr,
-                         fill=self._blend(self._color, bg, 0.35), outline="")
-        self.create_oval(cx - r, cy - r, cx + r, cy + r,
-                         fill=self._color, outline="")
-        sp = max(1, r // 3)
-        self.create_oval(cx - sp, cy - r + 2, cx + 1, cy - r // 2 + 2,
-                         fill=self._blend("#ffffff", self._color, 0.5), outline="")
-
-    def _tick(self):
-        if not self._anim:
-            return
-        self._phase += 0.08
-        self._redraw(0.88 + 0.12 * math.sin(self._phase))
-        self.after(80, self._tick)  # ~12 fps — lighter than original 22 fps
-
-    def set_state(self, color_hex: str, pulse: bool):
-        self._color = color_hex
-        if pulse:
-            if not self._anim:
-                self._anim = True
-                self._tick()
-        else:
-            self._anim = False
-            self._redraw(1.0)
-
-    def set_bg(self, bg_key: str):
-        """Update background without touching animation state."""
-        self._bg_key = bg_key
-        self.configure(bg=cc(bg_key))
-
-    def repaint_theme(self):
-        self.configure(bg=cc(self._bg_key))
-        self._redraw(1.0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -609,10 +517,12 @@ class ProxyForceApp(ctk.CTk):
 
         self._queue      = queue.Queue()
         self._last_state = "stopped"
+        self._icon_frame = 0
+        self._icon_photo_cache = {}
+        self._icon_pil_cache = {}
         self._engine: SingBoxController | None = None
         self._running    = True
         self._cur_page   = "dashboard"
-        self._hero_bg    = "card"   # tracks current hero bg key for repaint
 
         try:
             self._sb_log_pos = (os.path.getsize(SINGBOX_LOG)
@@ -635,6 +545,7 @@ class ProxyForceApp(ctk.CTk):
 
         if _HAS_TRAY:
             self._setup_tray()
+        self.after(125, self._animate_status_icon)
 
         # Auto-update: nightly background check timer + reconnect after an update swap.
         threading.Thread(target=self._update_timer_loop, daemon=True).start()
@@ -650,36 +561,73 @@ class ProxyForceApp(ctk.CTk):
     # ── Icon helpers ──────────────────────────────────────────────────────────
 
     def _draw_icon(self, canvas: tk.Canvas, bg_key: str = "sidebar"):
-        """Paint the in-app sidebar mark — pixel-identical to the tray / window
-        icon when Pillow is present (both go through _render_logo)."""
+        """Paint the current state frame into the sidebar."""
         canvas.delete("all")
         canvas.configure(bg=cc(bg_key))
         s  = int(canvas["width"])
         cx = cy = s / 2
         if _HAS_IMAGETK:
-            cache = getattr(self, "_logo_cache", None)
-            if cache is None:
-                cache = self._logo_cache = {}
-            photo = cache.get(s)
-            if photo is None:
-                photo = cache[s] = ImageTk.PhotoImage(_render_logo(s))
+            frames = self._status_photo_frames(s, self._last_state)
+            photo = frames[self._icon_frame % len(frames)]
             canvas.create_image(cx, cy, image=photo)
             return
-        # Vector fallback (Pillow unavailable): same badge from canvas primitives.
+        # Static vector fallback for an installation missing Pillow's Tk binding.
         cr = s * LOGO_R_CIRCLE
         canvas.create_oval(cx - cr, cy - cr, cx + cr, cy + cr,
-                           fill="#0D0F1A", outline="")
+                           fill="#%02x%02x%02x" % LOGO_BG, outline="")
         hr   = s * LOGO_R_HEX
-        flat = [v for p in _hex_points(cx, cy, hr) for v in p]
-        canvas.create_polygon(*flat, fill="#3B82F6", outline="")
-        if s >= LOGO_DOT_MIN:
-            ri = hr * LOGO_R_INNER
-            canvas.create_oval(cx - ri, cy - ri, cx + ri, cy + ri,
-                               fill="white", outline="")
+        points = [
+            (cx + hr * math.cos(math.radians(60 * i - 90)),
+             cy + hr * math.sin(math.radians(60 * i - 90)))
+            for i in range(6)
+        ]
+        flat = [v for point in points for v in point]
+        canvas.create_polygon(*flat, fill="#%02x%02x%02x" % LOGO_ACCENT,
+                              outline="")
+        inner = STATE_COLORS.get(self._last_state, STATE_COLORS["stopped"])
+        ri = hr * 0.26
+        canvas.create_oval(cx - ri, cy - ri, cx + ri, cy + ri,
+                           fill="#%02x%02x%02x" % inner, outline="")
 
     def _make_tray_image(self):
-        """System-tray icon — the canonical badge."""
-        return _render_logo(64)
+        """Initial system-tray image; subsequent frames are state-aware."""
+        return self._status_pil_frames(64, self._last_state)[0]
+
+    def _status_pil_frames(self, size: int, state: str):
+        key = (size, state)
+        frames = self._icon_pil_cache.get(key)
+        if frames is None:
+            count = frame_count(state)
+            frames = [
+                render_logo(size, state, i / count, animated=count > 1)
+                for i in range(count)
+            ]
+            self._icon_pil_cache[key] = frames
+        return frames
+
+    def _status_photo_frames(self, size: int, state: str):
+        key = (size, state)
+        frames = self._icon_photo_cache.get(key)
+        if frames is None:
+            frames = [ImageTk.PhotoImage(img)
+                      for img in self._status_pil_frames(size, state)]
+            self._icon_photo_cache[key] = frames
+        return frames
+
+    def _animate_status_icon(self):
+        """Advance the sidebar and tray together at a low-cost 8 fps."""
+        if not self._running:
+            return
+        self._draw_icon(self._icon_canvas, "sidebar")
+        tray = getattr(self, "_tray", None)
+        if tray is not None:
+            frames = self._status_pil_frames(64, self._last_state)
+            try:
+                tray.icon = frames[self._icon_frame % len(frames)]
+            except Exception:
+                pass
+        self._icon_frame += 1
+        self.after(125, self._animate_status_icon)
 
     def _set_window_icon(self):
         """Set the titlebar / taskbar icon to the canonical badge.
@@ -687,12 +635,13 @@ class ProxyForceApp(ctk.CTk):
         Tkinter does NOT inherit the executable's embedded icon for the window —
         without this the window shows the default Tk feather, which is why the
         taskbar icon never matched the tray and Explorer icons. iconphoto with
-        several sizes (built from the same _render_logo) guarantees they match.
+        several sizes from the canonical renderer guarantees they match.
         """
         if not _HAS_IMAGETK:
             return
         try:
-            self._win_icons = [ImageTk.PhotoImage(_render_logo(s))
+            self._win_icons = [ImageTk.PhotoImage(
+                               render_logo(s, state="neutral", animated=False))
                                for s in (256, 64, 48, 32, 20, 16)]
             self.iconphoto(True, *self._win_icons)
         except Exception:
@@ -744,12 +693,9 @@ class ProxyForceApp(ctk.CTk):
             corner_radius=8, height=32,
         ).pack(side="right")
 
-        # Center-right: status beacon + label
+        # Center-right: textual status; the animated mark lives in the sidebar.
         status_f = ctk.CTkFrame(bar, fg_color="transparent")
         status_f.pack(side="right", padx=28)
-
-        self._hdr_beacon = StatusBeacon(status_f, size=14, bg_key="surface")
-        self._hdr_beacon.pack(side="left")
 
         self._status_lbl = ctk.CTkLabel(
             status_f, text="STOPPED",
@@ -776,7 +722,7 @@ class ProxyForceApp(ctk.CTk):
         logo_f = ctk.CTkFrame(sb, fg_color="transparent")
         logo_f.pack(fill="x", padx=14, pady=(18, 4))
 
-        self._icon_canvas = tk.Canvas(logo_f, width=22, height=22,
+        self._icon_canvas = tk.Canvas(logo_f, width=30, height=30,
                                       bg=cc("sidebar"), highlightthickness=0)
         self._icon_canvas.pack(side="left")
         self._draw_icon(self._icon_canvas, "sidebar")
@@ -849,11 +795,8 @@ class ProxyForceApp(ctk.CTk):
         hero_inner = ctk.CTkFrame(self._hero_card, fg_color="transparent")
         hero_inner.pack(fill="x", padx=24, pady=20)
 
-        self._hero_beacon = StatusBeacon(hero_inner, size=52, bg_key="card")
-        self._hero_beacon.pack(side="left")
-
         info = ctk.CTkFrame(hero_inner, fg_color="transparent")
-        info.pack(side="left", padx=20)
+        info.pack(side="left")
 
         self._hero_lbl = ctk.CTkLabel(
             info, text="STOPPED",
@@ -1280,15 +1223,11 @@ class ProxyForceApp(ctk.CTk):
     # ── State display ─────────────────────────────────────────────────────────
 
     def _apply_state(self, state: str):
-        label, color_key, pulse, hero_bg = STATE_UI.get(
-            state, ("STOPPED", "muted", False, "card"))
+        label, color_key, hero_bg = STATE_UI.get(
+            state, ("STOPPED", "muted", "card"))
         color = cc(color_key)
-        self._hero_bg = hero_bg
-
-        self._hdr_beacon.set_state(color, pulse)
-        self._hero_beacon.set_state(color, pulse)
-        # Update hero beacon bg to match the tinted card
-        self._hero_beacon.set_bg(hero_bg)
+        if state != self._last_state:
+            self._icon_frame = 0
 
         self._status_lbl.configure(text=label, text_color=color)
         self._hero_lbl.configure(text=label, text_color=color)
@@ -1343,12 +1282,6 @@ class ProxyForceApp(ctk.CTk):
         # Nav buttons
         for btn in self._nav_btns.values():
             btn.repaint()
-        # Top-bar beacon (bg=surface)
-        self._hdr_beacon.repaint_theme()
-        # Hero beacon — restore to current state bg
-        self._hero_beacon._bg_key = self._hero_bg
-        self._hero_beacon.configure(bg=cc(self._hero_bg))
-        self._hero_beacon._redraw(1.0)
         # Stat cards
         for card in (self._card_active, self._card_total, self._card_bytes,
                      self._card_uptime):
