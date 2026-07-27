@@ -793,12 +793,39 @@ def _validate_apply_transaction(staged: str, target: str, token: str) -> bool:
 
 def _rollback_to_backup(target: str, backup: str, target_exe: str, relaunch: str):
     """Discard whatever landed in `target` (even a partial copy) and restore the
-    pre-update `backup`, then relaunch whichever build ends up there."""
-    shutil.rmtree(target, ignore_errors=True)
+    pre-update `backup`, then relaunch whichever build ends up there.
+
+    The build we just relaunched into `target` (however broken) may already have
+    auto-started sing-box.exe — or still be mid-exit itself — by the time the
+    health check fails, locking exactly the files this needs to replace. A bare
+    rmtree+rename (the old behaviour) silently swallowed that: rmtree(ignore_errors)
+    left `target` half-deleted, the rename onto a non-empty directory then failed
+    and was only logged, so the box was left with a broken `target` AND an orphaned
+    `backup` (.old) — the worst of both states. Retry the cheap path first, escalate
+    to freeing the dir (same as the forward swap) if that fails, and fall back to a
+    file-level copy if the rename still can't land."""
+    def _clear_target():
+        if os.path.isdir(target):
+            shutil.rmtree(target)
+
     try:
+        _clear_target()
         os.rename(backup, target)
     except Exception as e:
-        _applog(f"rollback rename failed: {e!r}")
+        _applog(f"rollback rmtree/rename failed: {e!r} — freeing install dir and retrying")
+        _free_install_dir(target)
+        try:
+            _retry(_clear_target, tries=10, delay=1.0)
+            _retry(lambda: os.rename(backup, target), tries=10, delay=1.0)
+        except Exception as e2:
+            _applog(f"rollback retry failed: {e2!r} — falling back to file-level restore")
+            try:
+                _retry(lambda: shutil.copytree(backup, target, dirs_exist_ok=True),
+                       tries=5, delay=1.0)
+                shutil.rmtree(backup, ignore_errors=True)
+            except Exception as e3:
+                _applog(f"rollback file-level restore also failed: {e3!r} — target may "
+                        f"still be broken, backup preserved at {backup}")
     if os.path.isfile(target_exe):
         _spawn(target_exe, relaunch)
 
@@ -858,8 +885,16 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
         return False
 
     # Success: drop the backup. The staged dir (this worker's own folder) is removed
-    # by the freshly-launched instance via cleanup_staging() once we exit.
-    shutil.rmtree(backup, ignore_errors=True)
+    # by the freshly-launched instance via cleanup_staging() once we exit. A stray
+    # handle (e.g. AV briefly scanning the .old tree) can make a single rmtree
+    # attempt leave remnants behind — retry before giving up, since a lingering
+    # .old folder after an otherwise-healthy update is just confusing clutter, not
+    # a failure, but should still be cleaned up whenever possible.
+    try:
+        _retry(lambda: shutil.rmtree(backup) if os.path.isdir(backup) else None,
+               tries=5, delay=1.0)
+    except Exception as e:
+        _applog(f"backup cleanup failed (non-fatal, update still succeeded): {e!r}")
     _applog("apply complete")
     return True
 

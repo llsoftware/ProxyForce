@@ -306,6 +306,76 @@ class TestApplySwap(unittest.TestCase):
             os.path.join(self._install, "_internal", "singbox", "sing-box.exe")))
         self.assertFalse(os.path.isdir(self._install + ".old"))        # backup consumed
 
+    def test_rollback_retries_through_transient_lock(self):
+        """Regression: the broken build we just relaunched may still be holding a
+        lock under `target` (e.g. its own auto-started sing-box.exe) by the moment
+        the health check fails and rollback tries to rename .old back into place.
+        A single unretried rename must not be treated as "rollback done" — it has
+        to free the dir and retry, recovering once the lock clears."""
+        updater._spawn = lambda exe, relaunch: _FakeProc(alive=False)  # triggers rollback
+        backup_path = self._install + ".old"
+        real_rename = os.rename
+        attempts = {"n": 0}
+
+        def flaky_rename(src, dst):
+            if (os.path.abspath(src) == os.path.abspath(backup_path)
+                    and os.path.abspath(dst) == os.path.abspath(self._install)):
+                attempts["n"] += 1
+                if attempts["n"] < 3:
+                    raise PermissionError("simulated lock on target during rollback")
+            real_rename(src, dst)
+
+        real_free = updater._free_install_dir
+        updater._free_install_dir = lambda target, timeout=30.0: True  # no real taskkill/powershell
+        os.rename = flaky_rename
+        real_sleep = time.sleep
+        time.sleep = lambda *_a, **_k: None
+        try:
+            ok = updater._apply_swap(self._staged, self._install, "--minimized")
+        finally:
+            os.rename = real_rename
+            time.sleep = real_sleep
+            updater._free_install_dir = real_free
+        self.assertFalse(ok)
+        self.assertGreaterEqual(attempts["n"], 3)
+        self.assertEqual(self._marker(), b"OLD")                       # rolled back
+        self.assertFalse(os.path.isdir(backup_path))                   # backup consumed
+
+    def test_rollback_falls_back_to_file_copy_when_rename_never_succeeds(self):
+        """Regression: if the rename onto `target` never succeeds (a handle that
+        never releases), the rollback must still restore the old build file-by-file
+        rather than silently leaving `target` half-deleted and `backup` orphaned —
+        the exact bug reported in production (missing sing-box/interpreter files in
+        the "current" install plus a leftover .old folder)."""
+        updater._spawn = lambda exe, relaunch: _FakeProc(alive=False)  # triggers rollback
+        backup_path = self._install + ".old"
+        real_rename = os.rename
+
+        def always_fails(src, dst):
+            if (os.path.abspath(src) == os.path.abspath(backup_path)
+                    and os.path.abspath(dst) == os.path.abspath(self._install)):
+                raise PermissionError("simulated permanent lock on target")
+            real_rename(src, dst)
+
+        real_free = updater._free_install_dir
+        updater._free_install_dir = lambda target, timeout=30.0: True  # no real taskkill/powershell
+        os.rename = always_fails
+        real_sleep = time.sleep
+        time.sleep = lambda *_a, **_k: None
+        try:
+            ok = updater._apply_swap(self._staged, self._install, "--minimized")
+        finally:
+            os.rename = real_rename
+            time.sleep = real_sleep
+            updater._free_install_dir = real_free
+        self.assertFalse(ok)
+        # Rename never worked, but the file-level fallback still restored the old
+        # build's contents and cleaned up the now-redundant backup.
+        self.assertEqual(self._marker(), b"OLD")
+        self.assertTrue(os.path.isfile(
+            os.path.join(self._install, "_internal", "singbox", "sing-box.exe")))
+        self.assertFalse(os.path.isdir(backup_path))
+
 
 class TestArgParse(unittest.TestCase):
     def test_apply_kv(self):
