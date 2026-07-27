@@ -17,12 +17,12 @@ LOGO_R_INNER_HEX = 0.72
 
 STATE_COLORS = {
     "neutral": (236, 241, 250),
-    "running": (52, 211, 153),
-    "starting": (251, 191, 36),
-    "stopping": (251, 191, 36),
-    "error": (248, 113, 113),
-    "stopped": (100, 116, 139),
-    "waiting": (100, 116, 139),
+    "running": (93, 240, 180),
+    "starting": (255, 202, 44),
+    "stopping": (255, 202, 44),
+    "error": (255, 86, 86),
+    "stopped": (170, 184, 204),
+    "waiting": (170, 184, 204),
 }
 
 ANIMATION_FRAMES = {
@@ -111,10 +111,10 @@ def render_logo(
     energy = Image.new("RGBA", (side, side), (0, 0, 0, 0))
     energy_draw = ImageDraw.Draw(energy)
 
-    glow_r = inner_r * (0.58 + 0.10 * pulse)
+    glow_r = inner_r * (0.62 + 0.12 * pulse)
     energy_draw.ellipse(
         [center - glow_r, center - glow_r, center + glow_r, center + glow_r],
-        fill=color + (int(175 * pulse),),
+        fill=color + (int(215 * pulse),),
     )
 
     if animated and state == "running":
@@ -160,7 +160,7 @@ def render_logo(
     image.alpha_composite(energy)
 
     # A crisp core keeps the state readable after Windows scales the tray icon.
-    core_r = max(scale, inner_r * (0.19 + 0.035 * pulse))
+    core_r = max(scale, inner_r * (0.27 + 0.045 * pulse))
     draw = ImageDraw.Draw(image)
     draw.ellipse(
         [center - core_r, center - core_r, center + core_r, center + core_r],

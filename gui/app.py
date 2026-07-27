@@ -512,11 +512,15 @@ class ProxyForceApp(ctk.CTk):
         self.configure(fg_color=THEME["bg"])
         self._set_window_icon()
         # Re-apply shortly after startup — CustomTkinter can reset the icon while
-        # it finishes building the window.
+        # it finishes building the window — and again on every <Map> (tray
+        # restore, un-minimize), since CustomTkinter re-arms its own titlebar
+        # icon reset each time the window is shown.
         self.after(400, self._set_window_icon)
+        self.bind("<Map>", lambda _e: self._set_window_icon())
 
         self._queue      = queue.Queue()
         self._last_state = "stopped"
+        self._updates_busy = False
         self._icon_frame = 0
         self._icon_photo_cache = {}
         self._icon_pil_cache = {}
@@ -636,6 +640,14 @@ class ProxyForceApp(ctk.CTk):
         without this the window shows the default Tk feather, which is why the
         taskbar icon never matched the tray and Explorer icons. iconphoto with
         several sizes from the canonical renderer guarantees they match.
+
+        CustomTkinter schedules its own titlebar-icon reset shortly after a
+        window is created or un-hidden (deiconify/restore-from-tray), which
+        silently overwrites iconphoto with CTk's own default (blue) mark — the
+        bare wm_iconbitmap() call resets the native icon slot so the following
+        iconphoto() sticks, and re-binding on <Map> re-applies it every time
+        the window is shown again (tray restore, un-minimize), not just once
+        at startup.
         """
         if not _HAS_IMAGETK:
             return
@@ -643,6 +655,7 @@ class ProxyForceApp(ctk.CTk):
             self._win_icons = [ImageTk.PhotoImage(
                                render_logo(s, state="neutral", animated=False))
                                for s in (256, 64, 48, 32, 20, 16)]
+            self.wm_iconbitmap()
             self.iconphoto(True, *self._win_icons)
         except Exception:
             pass
@@ -722,7 +735,7 @@ class ProxyForceApp(ctk.CTk):
         logo_f = ctk.CTkFrame(sb, fg_color="transparent")
         logo_f.pack(fill="x", padx=14, pady=(18, 4))
 
-        self._icon_canvas = tk.Canvas(logo_f, width=30, height=30,
+        self._icon_canvas = tk.Canvas(logo_f, width=38, height=38,
                                       bg=cc("sidebar"), highlightthickness=0)
         self._icon_canvas.pack(side="left")
         self._draw_icon(self._icon_canvas, "sidebar")
@@ -842,14 +855,15 @@ class ProxyForceApp(ctk.CTk):
         btn_row = ctk.CTkFrame(parent, fg_color="transparent")
         btn_row.pack(fill="x", padx=20, pady=12)
 
-        ctk.CTkButton(btn_row, text="CHECK FOR UPDATES",
+        self._btn_check_updates = ctk.CTkButton(
+                      btn_row, text="CHECK FOR UPDATES",
                       command=lambda: self._check_for_updates(manual=True),
                       fg_color=THEME["card2"], hover_color=THEME["border"],
                       text_color=THEME["text"], border_width=1,
                       border_color=THEME["border"],
                       font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
-                      corner_radius=8, width=180, height=38
-                      ).pack(side="left", padx=4)
+                      corner_radius=8, width=180, height=38)
+        self._btn_check_updates.pack(side="left", padx=4)
 
         ctk.CTkButton(btn_row, text="TEST PROXY",
                       command=self._test_proxy,
@@ -1039,7 +1053,13 @@ class ProxyForceApp(ctk.CTk):
 
     def _check_for_updates(self, manual: bool = False):
         """Check the selected channel, then download+verify+stage in a worker thread.
-        If a verified build is already staged, go straight to the install prompt."""
+        If a verified build is already staged, go straight to the install prompt.
+
+        Guarded by _updates_busy + a disabled button so mashing "CHECK FOR
+        UPDATES" (or the tray menu item firing while a check is already in
+        flight) can't start a second overlapping download/install."""
+        if self._updates_busy:
+            return
         pend = self._pending_staged()
         if pend:
             if manual:
@@ -1050,45 +1070,50 @@ class ProxyForceApp(ctk.CTk):
             if manual:
                 messagebox.showwarning("ProxyForce", "Configure a proxy host in Settings first.")
             return
+        self._updates_busy = True
+        self._btn_check_updates.configure(state="disabled")
         self._settings_panel.set_update_status("Checking for updates…", THEME["text"])
 
         def work():
             try:
-                info = updater.check_latest(cfg)
-            except Exception as e:
-                self._queue.put(("upd_error", f"Update check failed: {e}"))
-                return
-            if not info:
-                chan = "Development" if cfg.get("update_channel") == "dev" else "Stable"
-                self._queue.put(("upd_status",
-                    f"Up to date — v{updater.current_version()} ({chan})", THEME["muted"]))
-                if manual:
-                    self._queue.put(("log", "No updates available.", "info"))
-                return
-            self._queue.put(("log", f"Update {info.version} available — downloading…", "info"))
-            self._queue.put(("upd_status", f"Downloading {info.version}…", THEME["text"]))
-            try:
-                def prog(done, total):
-                    if total:
-                        self._queue.put(("upd_progress", done / total))
-                ddir = updater.download(info, cfg, prog)
-                self._queue.put(("upd_progress", None))
-                self._queue.put(("upd_status", f"Verifying {info.version}…", THEME["text"]))
-                if not updater.verify(info, ddir):
-                    self._queue.put(("upd_error",
-                        "Verification FAILED (signature/checksum) — update rejected."))
+                try:
+                    info = updater.check_latest(cfg)
+                except Exception as e:
+                    self._queue.put(("upd_error", f"Update check failed: {e}"))
                     return
-                txid = updater.transaction_id(ddir)
-                st = updater.load_state()
-                st.update({"staged_tag": info.tag, "staged_version": info.version,
-                           "transaction_id": txid})
-                st.pop("staged_dir", None)
-                st.pop("apply_at_hour", None)
-                updater.save_state(st)
-                self._queue.put(("upd_ready", info.tag, info.version, manual))
-            except Exception as e:
-                self._queue.put(("upd_progress", None))
-                self._queue.put(("upd_error", f"Update download failed: {e}"))
+                if not info:
+                    chan = "Development" if cfg.get("update_channel") == "dev" else "Stable"
+                    self._queue.put(("upd_status",
+                        f"Up to date — v{updater.current_version()} ({chan})", THEME["muted"]))
+                    if manual:
+                        self._queue.put(("log", "No updates available.", "info"))
+                    return
+                self._queue.put(("log", f"Update {info.version} available — downloading…", "info"))
+                self._queue.put(("upd_status", f"Downloading {info.version}…", THEME["text"]))
+                try:
+                    def prog(done, total):
+                        if total:
+                            self._queue.put(("upd_progress", done / total))
+                    ddir = updater.download(info, cfg, prog)
+                    self._queue.put(("upd_progress", None))
+                    self._queue.put(("upd_status", f"Verifying {info.version}…", THEME["text"]))
+                    if not updater.verify(info, ddir):
+                        self._queue.put(("upd_error",
+                            "Verification FAILED (signature/checksum) — update rejected."))
+                        return
+                    txid = updater.transaction_id(ddir)
+                    st = updater.load_state()
+                    st.update({"staged_tag": info.tag, "staged_version": info.version,
+                               "transaction_id": txid})
+                    st.pop("staged_dir", None)
+                    st.pop("apply_at_hour", None)
+                    updater.save_state(st)
+                    self._queue.put(("upd_ready", info.tag, info.version, manual))
+                except Exception as e:
+                    self._queue.put(("upd_progress", None))
+                    self._queue.put(("upd_error", f"Update download failed: {e}"))
+            finally:
+                self._queue.put(("upd_done",))
 
         threading.Thread(target=work, daemon=True).start()
 
@@ -1417,6 +1442,9 @@ class ProxyForceApp(ctk.CTk):
                     else:
                         self._notify_tray("ProxyForce update ready",
                                           f"v{rver} is ready — open ProxyForce to install.")
+                elif tag == "upd_done":
+                    self._updates_busy = False
+                    self._btn_check_updates.configure(state="normal")
                 elif tag == "upd_check":
                     self._check_for_updates(manual=item[1])
                 elif tag == "upd_apply":
