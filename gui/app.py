@@ -518,11 +518,16 @@ class ProxyForceApp(ctk.CTk):
         self.configure(fg_color=THEME["bg"])
         self._set_window_icon()
         # Re-apply shortly after startup — CustomTkinter can reset the icon while
-        # it finishes building the window — and again on every <Map> (tray
-        # restore, un-minimize), since CustomTkinter re-arms its own titlebar
-        # icon reset each time the window is shown.
+        # it finishes building the window. (A blanket <Map> rebind was tried here
+        # previously to also cover tray-restore/un-minimize, but it backfires
+        # badly: _set_window_icon()'s wm_iconbitmap() reset perturbs window state
+        # enough that the next nested update_idletasks() call — CTk widgets like
+        # CTkOptionMenu/CTkScrollbar issue plenty of those while building —
+        # re-delivers <Map> and re-enters _set_window_icon(), cascading into
+        # ~140 synchronous re-entries during __init__ alone (measured), plus
+        # another burst on every later map event. See _tray_show() for the
+        # one-shot alternative that actually covers restore-from-tray.)
         self.after(400, self._set_window_icon)
-        self.bind("<Map>", lambda _e: self._set_window_icon())
 
         self._queue      = queue.Queue()
         self._last_state = "stopped"
@@ -673,15 +678,18 @@ class ProxyForceApp(ctk.CTk):
         several sizes from the canonical renderer guarantees they match.
 
         CustomTkinter schedules its own titlebar-icon reset shortly after a
-        window is created or un-hidden (deiconify/restore-from-tray), which
-        silently overwrites iconphoto with CTk's own default (blue) mark — the
-        bare wm_iconbitmap() call resets the native icon slot so the following
-        iconphoto() sticks, and re-binding on <Map> re-applies it every time
-        the window is shown again (tray restore, un-minimize), not just once
-        at startup. The PhotoImage set itself is built once and cached — it's
-        the same six sizes every time, and re-rendering all of them (each a
-        supersampled + Gaussian-blurred draw down to 1024px at the top size)
-        on every <Map> was an avoidable hitch on un-minimize.
+        window is created, which silently overwrites iconphoto with CTk's own
+        default (blue) mark — the bare wm_iconbitmap() call resets the native
+        icon slot so the following iconphoto() sticks. Called once at startup
+        plus once more 400ms later (CTk's own reset can land in between), and
+        once more on tray-restore via _tray_show(). Deliberately NOT bound to
+        <Map> in general: wm_iconbitmap()'s own state change is enough to get
+        re-delivered through CTk widgets' internal update_idletasks() calls
+        (CTkOptionMenu/CTkScrollbar issue plenty while building), so a <Map>
+        binding here cascades into itself — measured at ~140 synchronous
+        re-entries during __init__ alone, before the window is even shown.
+        The PhotoImage set itself is built once and cached — same six sizes
+        every time.
         """
         if not _HAS_IMAGETK:
             return
@@ -1384,6 +1392,11 @@ class ProxyForceApp(ctk.CTk):
         self.deiconify()
         self.lift()
         self.focus_force()
+        # One-shot icon reapply for the restore-from-tray case (CustomTkinter's
+        # own build-time icon reset doesn't recur here, but this covers it if
+        # ever needed) -- bounded to exactly one call per restore, unlike the
+        # blanket <Map> bind this replaces.
+        self.after(50, self._set_window_icon)
 
     def _tray_start(self, icon=None, item=None):
         self._queue.put(("tray_start",))
