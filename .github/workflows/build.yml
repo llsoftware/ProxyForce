@@ -68,6 +68,39 @@ jobs:
           $tag = "${{ github.ref_name }}"
           Compress-Archive -Path dist\ProxyForce\* -DestinationPath "ProxyForce-$tag-win64.zip"
 
+      # core/updater.py rejects a staged archive outright once it crosses
+      # _MAX_MEMBERS / _MAX_EXTRACTED (a zip-bomb guard) — if the app ever grows
+      # past that ceiling, self-update breaks permanently for every user with no
+      # in-app warning. Fail the build here, with headroom, instead of finding out
+      # from a support report.
+      - name: Verify package is within self-update limits
+        shell: python
+        run: |
+          import sys, zipfile
+          sys.path.insert(0, ".")
+          from core import updater
+
+          tag = "${{ github.ref_name }}"
+          zip_path = f"ProxyForce-{tag}-win64.zip"
+          with zipfile.ZipFile(zip_path) as z:
+              members = z.infolist()
+              expanded = sum(m.file_size for m in members)
+
+          member_limit = updater._MAX_MEMBERS // 2
+          size_limit = updater._MAX_EXTRACTED // 2
+          print(f"members={len(members)} (limit {member_limit}, hard cap {updater._MAX_MEMBERS}); "
+                f"expanded={expanded} bytes (limit {size_limit}, hard cap {updater._MAX_EXTRACTED})")
+          if len(members) > member_limit:
+              raise SystemExit(
+                  f"package has {len(members)} members — over half of the self-update "
+                  f"pipeline's hard cap ({updater._MAX_MEMBERS}); raise _MAX_MEMBERS in "
+                  f"core/updater.py before this silently breaks self-update")
+          if expanded > size_limit:
+              raise SystemExit(
+                  f"package expands to {expanded} bytes — over half of the self-update "
+                  f"pipeline's hard cap ({updater._MAX_EXTRACTED}); raise _MAX_EXTRACTED in "
+                  f"core/updater.py before this silently breaks self-update")
+
       # Integrity manifest consumed by the in-app auto-updater (and humans).
       - name: Generate SHA256SUMS
         run: |

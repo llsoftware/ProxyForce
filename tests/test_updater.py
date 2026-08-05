@@ -7,6 +7,7 @@ import time
 import base64
 import hashlib
 import tempfile
+import threading
 import unittest
 import json
 import zipfile
@@ -246,6 +247,9 @@ class TestApplySwap(unittest.TestCase):
         self._real_spawn = updater._spawn
         self._real_checks = updater._HEALTH_CHECKS
         self._real_interval = updater._HEALTH_INTERVAL
+        self._real_started_timeout = updater._STARTED_TIMEOUT
+        self._real_ready_timeout = updater._READY_TIMEOUT
+        self._real_record = updater._record_apply_result
         # Keep _applog() out of the REAL %ProgramData%\ProxyForce\update\apply.log:
         # _apply_swap logs via update_dir(), so without this the test pollutes live
         # state and its "did not stay up" line looks like a real failed auto-update.
@@ -253,21 +257,38 @@ class TestApplySwap(unittest.TestCase):
         updater.update_dir = lambda: self._root
         updater._HEALTH_CHECKS = 2
         updater._HEALTH_INTERVAL = 0.01
+        updater._STARTED_TIMEOUT = 0.05
+        updater._READY_TIMEOUT = 0.05
+        # _apply_swap itself doesn't call _record_apply_result (only apply_worker
+        # does), so this is inert for these tests unless a test calls it directly.
+        updater._record_apply_result = lambda *_a, **_k: None
 
     def tearDown(self):
         updater._spawn = self._real_spawn
         updater.update_dir = self._real_update_dir
         updater._HEALTH_CHECKS = self._real_checks
         updater._HEALTH_INTERVAL = self._real_interval
+        updater._STARTED_TIMEOUT = self._real_started_timeout
+        updater._READY_TIMEOUT = self._real_ready_timeout
+        updater._record_apply_result = self._real_record
 
     def _marker(self):
         with open(os.path.join(self._install, "_internal", "version.txt"), "rb") as f:
             return f.read()
 
     def test_healthy_swap_commits(self):
-        updater._spawn = lambda exe, relaunch: _FakeProc(alive=True)
-        with open(os.path.join(self._root, "ready"), "w") as f:
-            f.write("ok")
+        # Write "ready" as a side effect of the (fake) relaunch itself, not before
+        # _apply_swap runs — _apply_swap clears stale started/ready markers from
+        # any earlier attempt on the same transaction right before spawning, so a
+        # marker written before that point wouldn't reflect THIS relaunch anyway.
+        ready_path = os.path.join(self._root, "ready")
+
+        def fake_spawn(exe, relaunch):
+            with open(ready_path, "w") as f:
+                f.write("ok")
+            return _FakeProc(alive=True)
+
+        updater._spawn = fake_spawn
         ok = updater._apply_swap(self._staged, self._install, "--minimized")
         self.assertTrue(ok)
         self.assertEqual(self._marker(), b"NEW")                       # new build installed
@@ -278,6 +299,77 @@ class TestApplySwap(unittest.TestCase):
         ok = updater._apply_swap(self._staged, self._install, "--minimized")
         self.assertFalse(ok)
         self.assertEqual(self._marker(), b"OLD")                       # rolled back
+
+    def test_marker_written_late_still_commits(self):
+        """Regression for the reported "installs, then relaunches the OLD build"
+        bug: a new process that is merely SLOW to write "ready" (antivirus
+        first-scan of a freshly-written onedir build, cold CustomTkinter import,
+        icacls calls before hardening was memoized) must not be rolled back just
+        because it missed a fixed few-second window. Only actually dying, or
+        never even proving it started, should roll back."""
+        updater._STARTED_TIMEOUT = 5.0
+        updater._READY_TIMEOUT = 5.0
+        updater._spawn = lambda exe, relaunch: _FakeProc(alive=True)
+        ready_path = os.path.join(self._root, "ready")
+
+        def write_ready_late():
+            time.sleep(0.2)
+            with open(ready_path, "w") as f:
+                f.write("ok")
+
+        threading.Thread(target=write_ready_late, daemon=True).start()
+        ok = updater._apply_swap(self._staged, self._install, "--minimized")
+        self.assertTrue(ok)
+        self.assertEqual(self._marker(), b"NEW")
+
+    def test_wedged_before_started_rolls_back_promptly(self):
+        """A build that's alive but never even proves it reached main() (no
+        "started" marker) is wedged, not just slow — the health check must
+        report that specifically (started_timeout) at the SHORT started
+        deadline, rather than silently waiting out the full ready budget.
+        Exercises _await_new_build_health directly to avoid the real
+        _free_install_dir subprocess calls a full rollback would trigger."""
+        updater._STARTED_TIMEOUT = 0.05
+        updater._READY_TIMEOUT = 5.0
+        reason = updater._await_new_build_health(_FakeProc(alive=True), self._root)
+        self.assertEqual(reason, "started_timeout")
+
+    def test_partial_copy_missing_other_file_rolls_back(self):
+        """Regression: the original completeness check verified exactly ONE file
+        (sing-box.exe). Any other file lost to the same AV-lock/quarantine problem
+        (a .pyd, a DLL) used to sail through as "swap ok". _verify_tree must catch
+        ANY missing/mismatched file, not just that one, even when copytree itself
+        raises no exception."""
+        rel = os.path.join("_internal", "engine_helper.pyd")
+        for d in (self._install, self._staged):
+            with open(os.path.join(d, rel), "wb") as f:
+                f.write(b"PYD-DATA")
+
+        real_copytree = updater.shutil.copytree
+        real_copy2 = updater.shutil.copy2
+
+        def flaky_copytree(src, dst, **kwargs):
+            real_copytree(src, dst, **kwargs)
+            os.remove(os.path.join(dst, rel))          # AV quarantines it post-copy
+
+        def blocked_copy2(src, dst, *a, **k):
+            if os.path.basename(src) == "engine_helper.pyd":
+                raise PermissionError("simulated persistent AV lock")
+            return real_copy2(src, dst, *a, **k)
+
+        updater.shutil.copytree = flaky_copytree
+        updater.shutil.copy2 = blocked_copy2
+        updater._spawn = lambda exe, relaunch: _FakeProc(alive=True)
+        real_sleep = time.sleep
+        time.sleep = lambda *_a, **_k: None
+        try:
+            ok = updater._apply_swap(self._staged, self._install, "--minimized")
+        finally:
+            updater.shutil.copytree = real_copytree
+            updater.shutil.copy2 = real_copy2
+            time.sleep = real_sleep
+        self.assertFalse(ok)
+        self.assertEqual(self._marker(), b"OLD")
 
     def test_partial_copy_missing_singbox_rolls_back(self):
         """Regression: a copytree that raises AFTER copying most files (e.g. AV
@@ -394,21 +486,26 @@ class TestApplyWorkerFreesDir(unittest.TestCase):
     def setUp(self):
         self._orig = (updater._wait_pid_exit, updater._free_install_dir,
                       updater._apply_swap, updater._applog,
-                      updater._validate_apply_transaction, time.sleep)
+                      updater._validate_apply_transaction, updater._record_apply_result,
+                      time.sleep)
         self.calls = []
         updater._applog = lambda m: None
-        updater._wait_pid_exit = lambda pid, timeout=0: self.calls.append("wait")
+        updater._wait_pid_exit = lambda pid, timeout=0: self.calls.append("wait") or True
         updater._free_install_dir = lambda target, timeout=30.0: (
             self.calls.append(("free", target)) or True)
         updater._apply_swap = lambda staged, target, relaunch: (
             self.calls.append(("swap", target)) or True)
         updater._validate_apply_transaction = lambda staged, target, token: True
+        # Real _record_apply_result touches %ProgramData% via save_state(); irrelevant
+        # to what this test is checking (call ordering), so keep it inert.
+        updater._record_apply_result = lambda *_a, **_k: None
         time.sleep = lambda *_a, **_k: None
 
     def tearDown(self):
         (updater._wait_pid_exit, updater._free_install_dir,
          updater._apply_swap, updater._applog,
-         updater._validate_apply_transaction, time.sleep) = self._orig
+         updater._validate_apply_transaction, updater._record_apply_result,
+         time.sleep) = self._orig
 
     def test_frees_dir_between_wait_and_swap(self):
         updater.apply_worker(
@@ -483,6 +580,97 @@ class TestLegacyApplyBridge(unittest.TestCase):
         os.makedirs(wrong)
         self.assertFalse(updater._bridge_legacy_apply(wrong, self.target, 42))
         self.assertFalse(self.launched)
+
+
+class TestCleanupStaging(unittest.TestCase):
+    """Regression: cleanup_staging(keep_txid=None) used to remove EVERY directory
+    under update-v2 unconditionally — including a live transaction a just-relaunched
+    instance still needs (transaction.json, started/ready markers) if state.json
+    hadn't recorded that transaction_id yet. It must only sweep stale (old) dirs."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pf_cleanup_")
+        self.real_update_dir = updater.update_dir
+        updater.update_dir = lambda: self.root
+        self.real_age = updater._STALE_TRANSACTION_AGE
+
+    def tearDown(self):
+        updater.update_dir = self.real_update_dir
+        updater._STALE_TRANSACTION_AGE = self.real_age
+
+    def _mkdir(self, name, age_seconds=0):
+        path = os.path.join(self.root, name)
+        os.mkdir(path)
+        if age_seconds:
+            old = time.time() - age_seconds
+            os.utime(path, (old, old))
+        return path
+
+    def test_none_keep_txid_preserves_fresh_dir(self):
+        fresh = self._mkdir("a" * 32)
+        updater.cleanup_staging(keep_txid=None)
+        self.assertTrue(os.path.isdir(fresh))
+
+    def test_none_keep_txid_removes_stale_dir(self):
+        updater._STALE_TRANSACTION_AGE = 1.0
+        stale = self._mkdir("b" * 32, age_seconds=10)
+        updater.cleanup_staging(keep_txid=None)
+        self.assertFalse(os.path.isdir(stale))
+
+    def test_explicit_keep_txid_is_always_preserved_regardless_of_age(self):
+        updater._STALE_TRANSACTION_AGE = 1.0
+        keep = self._mkdir("c" * 32, age_seconds=10)
+        updater.cleanup_staging(keep_txid="c" * 32)
+        self.assertTrue(os.path.isdir(keep))
+
+
+class TestApplyAttempts(unittest.TestCase):
+    """Regression: a transaction that fails to apply used to be re-offered forever
+    with no attempt counter. _record_apply_result must accumulate apply_attempts
+    across repeated failures of the SAME tag, and reset it on success or on a
+    different tag, so the GUI can stop auto-offering after a few failures."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="pf_attempts_")
+        self.real_update_dir = updater.update_dir
+        self.real_harden = updater._harden_acl
+        updater.update_dir = lambda: self.root
+        updater._harden_acl = lambda _p: None    # save_state() hardens the dir; irrelevant here
+        self.txdir = os.path.join(self.root, "a" * 32)
+        os.mkdir(self.txdir)
+        with open(os.path.join(self.txdir, "transaction.json"), "w") as f:
+            json.dump({"tag": "v9.9.9"}, f)
+
+    def tearDown(self):
+        updater.update_dir = self.real_update_dir
+        updater._harden_acl = self.real_harden
+
+    def test_attempts_accumulate_on_repeated_failure(self):
+        for expected in (1, 2, 3):
+            updater._record_apply_result(False, self.txdir)
+            st = updater.load_state()
+            self.assertEqual(st["apply_attempts"], expected)
+            self.assertEqual(st["apply_attempts_tag"], "v9.9.9")
+            self.assertEqual(st["last_apply_tag"], "v9.9.9")
+
+    def test_success_clears_attempts(self):
+        updater._record_apply_result(False, self.txdir)
+        updater._record_apply_result(True, self.txdir)
+        st = updater.load_state()
+        self.assertNotIn("apply_attempts", st)
+        self.assertNotIn("last_apply_error", st)
+
+    def test_new_tag_resets_counter(self):
+        updater._record_apply_result(False, self.txdir)
+        updater._record_apply_result(False, self.txdir)
+        other_txdir = os.path.join(self.root, "b" * 32)
+        os.mkdir(other_txdir)
+        with open(os.path.join(other_txdir, "transaction.json"), "w") as f:
+            json.dump({"tag": "v9.9.10"}, f)
+        updater._record_apply_result(False, other_txdir)
+        st = updater.load_state()
+        self.assertEqual(st["apply_attempts"], 1)
+        self.assertEqual(st["apply_attempts_tag"], "v9.9.10")
 
 
 if __name__ == "__main__":

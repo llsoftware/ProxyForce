@@ -192,6 +192,19 @@ def main():
 
     logger.info(f"ProxyForce v{APP_VERSION} starting (portable mode).")
 
+    # ── If this launch is the relaunch after a self-update swap, prove as early as
+    # possible that the new build reached here and holds the single-instance mutex.
+    # A waiting apply-update worker uses this "started" marker to tell "slow to boot"
+    # apart from "dead" and extend its health-check budget accordingly — before the
+    # GUI/CustomTkinter construction and icacls-heavy update bookkeeping even begin.
+    try:
+        from core import updater
+        txid = updater.load_state().get("transaction_id")
+        if txid:
+            updater.mark_update_started(txid)
+    except Exception:
+        pass
+
     # ── Launch GUI (which owns and runs the sing-box engine directly) ──
     from gui.app import main as gui_main
     gui_main(start_minimized="--minimized" in sys.argv)

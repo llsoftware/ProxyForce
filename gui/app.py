@@ -1085,6 +1085,11 @@ class ProxyForceApp(ctk.CTk):
         """Return a pending protected transaction; never trust a persisted path."""
         st = updater.load_state()
         tag, txid = st.get("staged_tag"), st.get("transaction_id")
+        # A build that has already failed and been rolled back 3 times is not
+        # going to succeed on a 4th silent retry — stop offering it automatically
+        # rather than looping forever on the same broken transaction.
+        if tag and st.get("apply_attempts_tag") == tag and int(st.get("apply_attempts") or 0) >= 3:
+            return None
         try:
             ddir = updater.transaction_dir(txid) if txid else None
         except Exception:
@@ -1224,15 +1229,23 @@ class ProxyForceApp(ctk.CTk):
     def _maybe_resume_after_update(self):
         """On startup after an update swap, reconnect if we were running, and clean
         up old staging folders."""
+        # Write the readiness marker FIRST, in its own try/except, before anything
+        # else in this method (icacls-heavy legacy migration included) gets a
+        # chance to raise and silently skip it — a missed marker reads to the
+        # waiting worker as "the new build never came up" and it rolls back to
+        # the OLD build with no visible error, which is exactly the reliability
+        # bug this ordering fixes.
+        txid = updater.load_state().get("transaction_id")
+        if txid:
+            try:
+                updater.mark_update_ready(txid)
+            except FileExistsError:
+                pass
+            except Exception:
+                pass
         try:
             updater.migrate_legacy_update_state()
             st = updater.load_state()
-            txid = st.get("transaction_id")
-            if txid:
-                try:
-                    updater.mark_update_ready(txid)
-                except FileExistsError:
-                    pass
             if st.get("resume_proxy"):
                 st["resume_proxy"] = False
                 updater.save_state(st)
@@ -1243,7 +1256,26 @@ class ProxyForceApp(ctk.CTk):
                 for key in ("staged_tag", "staged_version", "transaction_id", "apply_at_hour"):
                     st.pop(key, None)
                 updater.save_state(st)
-            updater.cleanup_staging(keep_tag=txid)
+            last_error = st.get("last_apply_error")
+            if last_error:
+                failed_tag = st.get("last_apply_tag") or "the update"
+                gave_up = (st.get("apply_attempts_tag") == st.get("last_apply_tag")
+                          and int(st.get("apply_attempts") or 0) >= 3)
+                st.pop("last_apply_error", None)
+                st.pop("last_apply_tag", None)
+                st.pop("last_apply_time", None)
+                updater.save_state(st)
+                log_path = os.path.join(updater.update_dir(), "apply.log")
+                suffix = " — no further automatic attempts will be made" if gave_up else ""
+                self._log(f"Update to {failed_tag} failed and was rolled back{suffix} — "
+                          f"see {log_path}", "error")
+                self._settings_panel.set_update_status(
+                    f"Update to {failed_tag} failed — rolled back", THEME["red"])
+                messagebox.showwarning("ProxyForce Update Failed",
+                    f"The update to {failed_tag} could not be installed and was "
+                    f"rolled back to the previous version.{suffix}\n\n"
+                    f"Details: {log_path}")
+            updater.cleanup_staging(keep_txid=txid)
         except Exception:
             pass
 

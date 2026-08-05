@@ -58,16 +58,25 @@ _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
-# Post-relaunch health check: poll the new build this many times at this interval; if
-# it's still up at the end, the swap is committed (else rolled back). Module-level so
-# tests can shrink them.
+# Post-relaunch health check. Being SLOW is not a failure, only being dead or wedged
+# is: poll at _HEALTH_INTERVAL; if the new build exits first, roll back immediately;
+# if it's alive but hasn't written "started" within _STARTED_TIMEOUT, it's wedged
+# during process/interpreter startup (AV first-scan of a freshly-written onedir build
+# routinely takes longer than the old fixed 8s budget ever allowed for); once
+# "started" appears, extend the budget to _READY_TIMEOUT for the GUI to come up and
+# write "ready". Module-level so tests can shrink them.
+_HEALTH_INTERVAL = 0.5
+_STARTED_TIMEOUT = 90.0
+_READY_TIMEOUT = 90.0
+# Back-compat knobs some tests still shrink directly; _HEALTH_CHECKS is no longer
+# consulted by the loop itself (superseded by the two timeouts above) but is kept so
+# `_HEALTH_CHECKS * _HEALTH_INTERVAL` -style overrides in older tests don't AttributeError.
 _HEALTH_CHECKS = 8
-_HEALTH_INTERVAL = 1.0
 
 _MAX_SIDECAR = 64 * 1024
 _MAX_ARCHIVE = 250 * 1024 * 1024
-_MAX_EXTRACTED = 750 * 1024 * 1024
-_MAX_MEMBERS = 5000
+_MAX_EXTRACTED = 1500 * 1024 * 1024
+_MAX_MEMBERS = 20000
 _TAG_RE = re.compile(
     r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)"
     r"(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$")
@@ -121,9 +130,20 @@ def _assert_no_reparse(path: str, root: str):
         cur = parent
 
 
+# Paths already hardened by THIS process — icacls is 3 subprocess spawns per call
+# and ensure_secure_update_dir() is invoked repeatedly (every load_state/save_state/
+# transaction_dir/transaction_id), which is exactly what was blowing the post-update
+# health-check budget (see _STARTED_TIMEOUT above). A path's ACL doesn't change
+# between two calls in the same process, so once hardened, skip re-hardening it.
+_hardened_paths = set()
+
+
 def _harden_acl(path: str):
     """Protect an update directory using language-independent Windows SIDs."""
     if os.name != "nt":
+        return
+    key = os.path.normcase(os.path.abspath(path))
+    if key in _hardened_paths:
         return
     commands = (
         ["icacls", path, "/inheritance:r"],
@@ -136,6 +156,7 @@ def _harden_acl(path: str):
                            creationflags=_CREATE_NO_WINDOW, timeout=20)
         if r.returncode:
             raise PermissionError(f"could not protect update workspace: {r.stderr.strip()}")
+    _hardened_paths.add(key)
 
 
 def ensure_secure_update_dir() -> str:
@@ -501,9 +522,35 @@ def prepare_apply(info: UpdateInfo, txid: str, install_dir: str) -> str:
     return staged
 
 
+def _marker_path(txid: str, name: str) -> str:
+    """Path for a readiness marker inside an already-existing, already-hardened
+    transaction dir. Unlike transaction_dir(), this does NOT call
+    ensure_secure_update_dir() — the transaction dir was hardened when it was
+    created, so writing a marker into it needs no re-hardening. Re-hardening
+    (three icacls subprocess spawns) on this hot post-relaunch path is exactly
+    what was eating into the health-check budget."""
+    if not re.fullmatch(r"[0-9a-f]{32}", txid or ""):
+        raise ValueError("invalid update transaction")
+    root = update_dir()
+    txdir = os.path.join(root, txid)
+    _assert_no_reparse(txdir, root)
+    return os.path.join(txdir, name)
+
+
+def mark_update_started(txid: str):
+    """Positive signal that the new build's process reached main() and holds the
+    single-instance mutex — written as early as possible, before any GUI
+    construction or icacls work. Lets the health check in _apply_swap extend its
+    budget instead of rolling back a build that is merely slow to finish booting
+    (cold DLLs, an antivirus first-scan of the freshly-written tree)."""
+    path = _marker_path(txid, "started")
+    with open(path, "x", encoding="ascii") as f:
+        f.write(str(os.getpid()))
+
+
 def mark_update_ready(txid: str):
     """Positive readiness signal emitted by the freshly launched GUI."""
-    path = os.path.join(transaction_dir(txid), "ready")
+    path = _marker_path(txid, "ready")
     with open(path, "x", encoding="ascii") as f:
         f.write(APP_VERSION)
 
@@ -572,16 +619,21 @@ def _parse_kv(argv):
     return out
 
 
-def _wait_pid_exit(pid: int, timeout: float):
+def _wait_pid_exit(pid: int, timeout: float) -> bool:
+    """Wait for `pid` to exit. Returns True if it exited (or was already gone),
+    False on timeout — a straggler that _free_install_dir will then have to kill,
+    which is worth logging rather than silently falling through."""
     if not pid:
-        return
+        return True
     import ctypes
     SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0x00000000
     h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
     if not h:
-        return                                  # already gone
+        return True                             # already gone
     try:
-        ctypes.windll.kernel32.WaitForSingleObject(h, int(timeout * 1000))
+        rc = ctypes.windll.kernel32.WaitForSingleObject(h, int(timeout * 1000))
+        return rc == WAIT_OBJECT_0
     finally:
         ctypes.windll.kernel32.CloseHandle(h)
 
@@ -604,11 +656,21 @@ def _retry(fn, tries=10, delay=1.0):
         raise last
 
 
+_APPLOG_MAX_BYTES = 1024 * 1024
+
+
 def _applog(msg: str):
     try:
         os.makedirs(update_dir(), exist_ok=True)
-        with open(os.path.join(update_dir(), "apply.log"), "a", encoding="utf-8") as f:
-            f.write(f"{msg}\n")
+        path = os.path.join(update_dir(), "apply.log")
+        try:
+            if os.path.getsize(path) > _APPLOG_MAX_BYTES:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{stamp} pid={os.getpid()} v{APP_VERSION} | {msg}\n")
     except Exception:
         pass
 
@@ -684,6 +746,43 @@ def _free_install_dir(target: str, timeout: float = 30.0) -> bool:
         time.sleep(1.5)
 
 
+def _record_apply_result(success: bool, txdir: str):
+    """Persist the outcome of an apply attempt into state.json so the next GUI
+    launch can surface a failed rollback instead of silently coming back on the
+    old build with no visible indication anything went wrong. The precise reason
+    lives in apply.log; this just remembers WHICH version failed and WHEN.
+
+    `apply_attempts`/`apply_attempts_tag` are separate from the one-shot
+    `last_apply_*` notice fields (which the GUI clears the moment it has shown
+    them): the attempt counter must keep accumulating across repeated failures
+    of the SAME tag even after each individual failure has been acknowledged,
+    otherwise a permanently broken build gets silently re-offered forever."""
+    tag = None
+    try:
+        with open(os.path.join(txdir, "transaction.json"), "r", encoding="utf-8") as f:
+            tag = json.load(f).get("tag")
+    except Exception:
+        pass
+    try:
+        st = load_state()
+        if success:
+            for key in ("last_apply_error", "last_apply_tag", "last_apply_time",
+                        "apply_attempts", "apply_attempts_tag"):
+                st.pop(key, None)
+        else:
+            if st.get("apply_attempts_tag") == tag:
+                st["apply_attempts"] = int(st.get("apply_attempts") or 0) + 1
+            else:
+                st["apply_attempts"] = 1
+                st["apply_attempts_tag"] = tag
+            st["last_apply_error"] = "install failed and was rolled back"
+            st["last_apply_tag"] = tag
+            st["last_apply_time"] = time.time()
+        save_state(st)
+    except Exception:
+        pass
+
+
 def apply_worker(argv):
     """The `--apply-update` worker. Runs from the staged copy with the install dir
     free to overwrite. Waits for the outgoing process to exit, frees the install dir
@@ -700,11 +799,17 @@ def apply_worker(argv):
         _applog("apply rejected: protected transaction validation failed")
         return False
     _applog(f"apply start: target={target} staged={staged} wait_pid={wait_pid}")
-    _wait_pid_exit(wait_pid, timeout=120)
+    exited = _wait_pid_exit(wait_pid, timeout=120)
+    if not exited:
+        _applog(f"outgoing process {wait_pid} did not exit within 120s — "
+                f"forcing the install dir free before swapping")
     freed = _free_install_dir(target)
-    _applog(f"install dir freed={freed}")
+    if not freed:
+        _applog("install dir could not be fully freed — swap will retry through the lock")
     time.sleep(1.0)                             # let handles/AV release
-    return _apply_swap(staged, target, "--minimized")
+    ok = _apply_swap(staged, target, "--minimized")
+    _record_apply_result(ok, os.path.dirname(staged))
+    return ok
 
 
 def _bridge_legacy_apply(staged: str, target: str, wait_pid: int) -> bool:
@@ -791,43 +896,110 @@ def _validate_apply_transaction(staged: str, target: str, token: str) -> bool:
         return False
 
 
+def _verify_tree(src: str, dst: str):
+    """Return every path (relative to `src`) that is missing from `dst` or differs
+    in size. `src` is always a trusted reference here — the signature-verified
+    staged build on the forward path, the pre-update backup on rollback — so this
+    is the completeness gate for a directory copy. Replaces a single hardcoded
+    "does sing-box.exe exist" check that let any OTHER file lost to the same
+    AV-lock/quarantine problem (a .pyd, a DLL) sail through undetected."""
+    bad = []
+    for root, _dirs, files in os.walk(src):
+        rel_root = os.path.relpath(root, src)
+        for name in files:
+            rel = name if rel_root == "." else os.path.join(rel_root, name)
+            try:
+                if os.path.getsize(os.path.join(root, name)) != \
+                        os.path.getsize(os.path.join(dst, rel)):
+                    bad.append(rel)
+            except OSError:
+                bad.append(rel)
+    return bad
+
+
 def _rollback_to_backup(target: str, backup: str, target_exe: str, relaunch: str):
     """Discard whatever landed in `target` (even a partial copy) and restore the
-    pre-update `backup`, then relaunch whichever build ends up there.
+    pre-update `backup`, then relaunch — but ONLY once `target` is verified to
+    actually match `backup`; never relaunch an unverified tree, and never delete
+    `backup` unless the restore it produced verifies clean.
 
     The build we just relaunched into `target` (however broken) may already have
     auto-started sing-box.exe — or still be mid-exit itself — by the time the
-    health check fails, locking exactly the files this needs to replace. A bare
-    rmtree+rename (the old behaviour) silently swallowed that: rmtree(ignore_errors)
-    left `target` half-deleted, the rename onto a non-empty directory then failed
-    and was only logged, so the box was left with a broken `target` AND an orphaned
-    `backup` (.old) — the worst of both states. Retry the cheap path first, escalate
-    to freeing the dir (same as the forward swap) if that fails, and fall back to a
-    file-level copy if the rename still can't land."""
+    health check fails, locking exactly the files this needs to replace, so free
+    the dir FIRST. A bare rmtree+rename (the old behaviour) silently swallowed
+    that: rmtree(ignore_errors) left `target` half-deleted, the rename onto a
+    non-empty directory then failed and was only logged, so the box was left with
+    a broken `target` AND an orphaned `backup` (.old) — the worst of both states.
+    Retry the cheap path first, escalate to freeing the dir if that fails, and
+    fall back to a file-level copy if the rename still can't land — verifying
+    that fallback before trusting it, since it's just as prone to a partial copy
+    as the forward swap was."""
     def _clear_target():
         if os.path.isdir(target):
             shutil.rmtree(target)
 
+    _free_install_dir(target)
+    restored = False
     try:
         _clear_target()
         os.rename(backup, target)
+        restored = True
     except Exception as e:
         _applog(f"rollback rmtree/rename failed: {e!r} — freeing install dir and retrying")
         _free_install_dir(target)
         try:
             _retry(_clear_target, tries=10, delay=1.0)
             _retry(lambda: os.rename(backup, target), tries=10, delay=1.0)
+            restored = True
         except Exception as e2:
             _applog(f"rollback retry failed: {e2!r} — falling back to file-level restore")
             try:
                 _retry(lambda: shutil.copytree(backup, target, dirs_exist_ok=True),
                        tries=5, delay=1.0)
-                shutil.rmtree(backup, ignore_errors=True)
+                missing = _verify_tree(backup, target)
+                if missing:
+                    _applog(f"rollback file-level restore incomplete: {len(missing)} "
+                            f"file(s) differ (e.g. {missing[:5]}) — backup preserved, "
+                            f"NOT deleting it")
+                else:
+                    restored = True
+                    shutil.rmtree(backup, ignore_errors=True)
             except Exception as e3:
                 _applog(f"rollback file-level restore also failed: {e3!r} — target may "
                         f"still be broken, backup preserved at {backup}")
-    if os.path.isfile(target_exe):
+    if restored and os.path.isfile(target_exe):
         _spawn(target_exe, relaunch)
+    elif not restored:
+        _applog("rollback did not produce a verified install — refusing to relaunch "
+                 f"anything; backup preserved at {backup}" if os.path.isdir(backup)
+                 else "rollback did not produce a verified install and no backup remains")
+
+
+def _await_new_build_health(proc, txdir: str) -> str:
+    """Poll the relaunched build until it proves it's ready, proves it merely
+    started, or gives up. Being SLOW is not a failure — only dying or wedging
+    during startup is. Returns "ready", "dead", "started_timeout" (alive but never
+    even proved it reached main()) or "ready_timeout" (proved it started, but
+    never finished booting the GUI)."""
+    started_path = os.path.join(txdir, "started")
+    ready_path = os.path.join(txdir, "ready")
+    started_deadline = time.time() + _STARTED_TIMEOUT
+    saw_started = False
+    ready_deadline = None
+    while True:
+        if proc.poll() is not None:
+            return "dead"
+        if os.path.isfile(ready_path):
+            return "ready"
+        if not saw_started and os.path.isfile(started_path):
+            saw_started = True
+            ready_deadline = time.time() + _READY_TIMEOUT
+        if saw_started:
+            if time.time() >= ready_deadline:
+                return "ready_timeout"
+        elif time.time() >= started_deadline:
+            return "started_timeout"
+        time.sleep(_HEALTH_INTERVAL)
 
 
 def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
@@ -843,14 +1015,24 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
         _retry(lambda: os.rename(target, backup), tries=20)   # move old aside
         # dirs_exist_ok so a retry after a partial copy doesn't trip FileExistsError.
         _retry(lambda: shutil.copytree(staged, target, dirs_exist_ok=True))  # install new
-        # copytree can raise after copying MOST files (e.g. AV real-time scanning
-        # transiently locks/quarantines the freshly-written sing-box.exe) and still
-        # leave `target` populated with everything else. A missing engine binary is
-        # just as broken as a missing exe, so catch it here — otherwise it slips past
-        # the rollback check below (target DOES exist, just incompletely) and a
-        # half-installed build gets relaunched instead of rolled back.
-        if not os.path.isfile(os.path.join(target, "_internal", "singbox", "sing-box.exe")):
-            raise RuntimeError("copy incomplete: sing-box.exe missing from installed build")
+        # copytree can raise — or even return cleanly — after copying MOST files
+        # (e.g. AV real-time scanning transiently locks/quarantines a freshly-written
+        # file) and still leave `target` populated with everything else. Verify the
+        # WHOLE tree against the signature-verified `staged` source, not just one
+        # hardcoded file, and re-copy anything that doesn't match before giving up.
+        def _reheal():
+            bad = _verify_tree(staged, target)
+            if not bad:
+                return
+            for rel in bad:
+                dst = os.path.join(target, rel)
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                shutil.copy2(os.path.join(staged, rel), dst)
+            bad2 = _verify_tree(staged, target)
+            if bad2:
+                raise RuntimeError(f"copy incomplete: {len(bad2)} file(s) differ/missing "
+                                   f"(e.g. {bad2[:5]})")
+        _retry(_reheal, tries=5, delay=1.0)
         _applog("swap ok")
     except Exception as e:
         _applog(f"swap FAILED: {e!r} — rolling back")
@@ -860,6 +1042,17 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
             _spawn(target_exe, relaunch)
         return False
 
+    # A retry of the SAME transaction (e.g. a manual re-install after a prior
+    # failed attempt) can find stale "started"/"ready" markers left by that
+    # earlier attempt still sitting in txdir — clear them so this attempt's
+    # health check can't mistake leftover proof-of-life for its own.
+    txdir = os.path.dirname(staged)
+    for marker in ("started", "ready"):
+        try:
+            os.remove(os.path.join(txdir, marker))
+        except OSError:
+            pass
+
     # Relaunch the new build (elevated child of this elevated worker → no UAC).
     try:
         proc = _spawn(target_exe, relaunch)
@@ -867,20 +1060,14 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
         _applog(f"relaunch spawn failed: {e!r} — rolling back")
         proc = None
 
-    # Health check: the new build must stay alive and emit a positive ready marker.
     healthy = False
-    ready_path = os.path.join(os.path.dirname(staged), "ready")
+    reason = "relaunch failed"
     if proc is not None:
-        for _ in range(_HEALTH_CHECKS):
-            if proc.poll() is not None:
-                break
-            if os.path.isfile(ready_path):
-                healthy = True
-                break
-            time.sleep(_HEALTH_INTERVAL)
+        reason = _await_new_build_health(proc, txdir)
+        healthy = reason == "ready"
 
     if not healthy:
-        _applog("new build did not stay up — rolling back to .old")
+        _applog(f"new build did not become healthy (reason={reason}) — rolling back to .old")
         _rollback_to_backup(target, backup, target_exe, relaunch)
         return False
 
@@ -899,21 +1086,39 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
     return True
 
 
-def cleanup_staging(keep_tag: str = None):
-    """Best-effort removal of update/<tag> folders (called by a freshly-started
-    instance). Skips anything still locked."""
+_STALE_TRANSACTION_AGE = 3600.0
+
+
+def cleanup_staging(keep_txid: str = None):
+    """Best-effort removal of stale transaction folders (called by a freshly-started
+    instance). Skips anything still locked.
+
+    When `keep_txid` is None (no transaction currently recorded in state.json), only
+    remove directories older than _STALE_TRANSACTION_AGE — NOT every directory
+    unconditionally. A live worker's own transaction dir (holding transaction.json,
+    started/ready markers) can still be in use at the moment this runs from a
+    DIFFERENT, just-relaunched instance; state.json not yet reflecting that
+    transaction is not proof it's abandoned."""
     base = update_dir()
     if not os.path.isdir(base):
         return
+    now = time.time()
     for name in os.listdir(base):
-        if name in ("state.json", "apply.log") or name == keep_tag:
+        if name in ("state.json", "apply.log") or name == keep_txid:
             continue
         path = os.path.join(base, name)
-        if os.path.isdir(path):
+        if not os.path.isdir(path):
+            continue
+        if keep_txid is None:
             try:
-                _remove_tree_no_follow(path)
+                if now - os.path.getmtime(path) < _STALE_TRANSACTION_AGE:
+                    continue
             except OSError:
                 pass
+        try:
+            _remove_tree_no_follow(path)
+        except OSError:
+            pass
 
 
 def migrate_legacy_update_state():
