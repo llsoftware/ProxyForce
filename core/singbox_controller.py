@@ -965,6 +965,20 @@ class SingBoxController:
                 parts.append(e)
         return ";".join(parts)
 
+    def _build_no_proxy(self) -> str:
+        """NO_PROXY/no_proxy for the env-var takeover: the same exclusion set as
+        _build_proxy_bypass, rendered in NO_PROXY's syntax — comma-separated,
+        glob-free hosts/domains (unlike WinINET's ';'/'*' ProxyOverride)."""
+        cfg = self.config
+        parts = ["localhost", "127.0.0.1", "::1"]
+        if getattr(cfg, "exclude_private", True):
+            parts += ["10.", "192.168."] + [f"172.{n}." for n in range(16, 32)]
+        for entry in (cfg.bypass_list or []):
+            e = entry.strip()
+            if e and not _looks_like_cidr_or_ip(e):
+                parts.append(e)
+        return ",".join(parts)
+
     # ── local forward-proxy (plaintext-HTTP / port-80 fix) ─────────────────────────
 
     def _start_http_proxy(self) -> bool:
@@ -1034,6 +1048,26 @@ class SingBoxController:
                       f"original restored on stop.")
         except Exception as e:
             self._log(f"Could not take over the Windows system proxy: {e}", "warning")
+        # Also export HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY (both cases, user +
+        # machine environment) — the fix for CLI/dev tools (yt-dlp, curl, git, pip,
+        # node, …) that read the environment instead of WinINET/WinHTTP and can be
+        # thrown off proxy entirely by a single stray *_proxy var elsewhere on the
+        # box (see core/env_proxy for how that happens). Best-effort: HTTPS/registry
+        # capture still works if this fails.
+        try:
+            from core import env_proxy
+            http_url = (f"http://127.0.0.1:{self._http_proxy_port}" if self._http_proxy_port
+                        else f"http://127.0.0.1:{self._local_proxy_port}")
+            https_url = f"http://127.0.0.1:{self._local_proxy_port}"
+            prev = env_proxy.point_at(http_url, https_url, self._build_no_proxy())
+            was = f" (was: {prev})" if prev else ""
+            self._log(f"Proxy environment variables set (HTTP_PROXY={http_url}, "
+                      f"HTTPS_PROXY={https_url}){was} — fixes CLI tools (yt-dlp, curl, "
+                      f"pip, git, …) that read the environment instead of the Windows "
+                      f"proxy setting. Already-open shells must be reopened to pick "
+                      f"this up.")
+        except Exception as e:
+            self._log(f"Could not set proxy environment variables: {e}", "warning")
 
     def _restore_system_proxy(self):
         """Restore the system proxy snapshotted at start. Idempotent (no-op if
@@ -1044,6 +1078,13 @@ class SingBoxController:
                 self._log("Windows system proxy restored to its previous setting.")
         except Exception as e:
             self._log(f"Could not restore the Windows system proxy: {e}", "warning")
+        try:
+            from core import env_proxy
+            if env_proxy.restore():
+                self._log("Proxy environment variables restored to their previous "
+                          "setting.")
+        except Exception as e:
+            self._log(f"Could not restore proxy environment variables: {e}", "warning")
 
     # ── diagnostics (ground-truth capture for the "green but no capture" bug) ──────
 
@@ -1071,7 +1112,7 @@ class SingBoxController:
         """
         # Pre-init so the final GUI echo is safe even if something throws.
         verdict = "diagnostics did not complete"
-        adapter_present = routes_ok = fakeip_ok = competing = False
+        adapter_present = routes_ok = fakeip_ok = unspec_ok = competing = ep_ok = False
         proxy_reachable = True
         problems = []
 
@@ -1202,6 +1243,31 @@ class SingBoxController:
                      else "WARN — AAAA returned real IPv6; Happy Eyeballs may bypass the "
                           "IPv4-only TUN."))
 
+            # ── DNS: getaddrinfo(AF_UNSPEC) — what apps ACTUALLY call, not just A-only.
+            # The A-only probe above can PASS while this fails (observed on a box
+            # reporting yt-dlp "getaddrinfo failed" while browsers worked fine): most
+            # CLI tools (yt-dlp/curl/git/pip/…) call getaddrinfo() with no family hint,
+            # which is AF_UNSPEC on Windows. If that path doesn't return a fakeip, such
+            # a tool gets a REAL IP (or an outright resolution failure if the real
+            # resolver blocks the domain) and bypasses capture entirely — invisible to
+            # every proxy-aware app tested, since none of them call getaddrinfo() ──
+            unspec_ip = self._ps(
+                "([System.Net.Dns]::GetHostAddresses('example.com') | "
+                "Where-Object {$_.AddressFamily -eq 'InterNetwork'}).IPAddressToString -join ','")
+            unspec_ok = "198.18." in unspec_ip or "198.19." in unspec_ip
+            section(fh, "DNS getaddrinfo(AF_UNSPEC) — the path apps actually call",
+                    f"example.com getaddrinfo = {unspec_ip or '(none)'}",
+                    ("PASS — AF_UNSPEC also resolves to a fakeip (matches the A-only probe)"
+                     if unspec_ok else
+                     "FAIL — AF_UNSPEC does NOT resolve to a fakeip even though the A-only "
+                     "probe did; a tool calling getaddrinfo() (yt-dlp, curl, git, pip, …) "
+                     "gets a REAL IP and bypasses capture. This is the 'getaddrinfo failed' "
+                     "failure mode."))
+            step(unspec_ok,
+                 f"getaddrinfo(AF_UNSPEC) hijacked to fakeip (example.com -> {unspec_ip})"
+                 if unspec_ok else
+                 "getaddrinfo(AF_UNSPEC) NOT hijacked to fakeip — CLI tools may bypass capture")
+
             # ── End-to-end capture probe ──
             section(fh, "Capture probe (TCP 443 → example.com)", self._ps(
                 "$r=Test-NetConnection -ComputerName example.com -Port 443 "
@@ -1291,6 +1357,35 @@ class SingBoxController:
                  f"Windows system proxy points at ProxyForce ({ours})" if sp_ok
                  else "Windows system proxy does NOT fully point at ProxyForce (proxy-aware apps may bypass)")
 
+            # ── Proxy environment variables: HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY.
+            # CLI/dev tools (yt-dlp, curl, git, pip, node, …) read these INSTEAD of
+            # WinINET/WinHTTP above — a box can show sp_ok=PASS and still send such a
+            # tool nowhere near the proxy if this is missing or a stray *_proxy var
+            # elsewhere on the box is shadowing it (see core/env_proxy) ──
+            try:
+                from core import env_proxy
+                ep_state = env_proxy.current_state()
+            except Exception as e:
+                ep_state = f"<unavailable: {e}>"
+            expect_http = (f"http://127.0.0.1:{self._http_proxy_port}" if self._http_proxy_port
+                           else f"http://127.0.0.1:{self._local_proxy_port}")
+            expect_https = f"http://127.0.0.1:{self._local_proxy_port}"
+            ep_ok = (expect_http in ep_state) and (expect_https in ep_state)
+            section(fh, "Proxy environment variables (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY)",
+                    ep_state,
+                    (f"PASS — env vars point at ProxyForce ({expect_http} / {expect_https}); "
+                     "CLI/dev tools that read the environment instead of the Windows proxy "
+                     "setting will use the proxy instead of falling back to direct DNS"
+                     if ep_ok else
+                     "WARN — proxy environment variables do not point at ProxyForce. A shell "
+                     "opened BEFORE Start won't see this until reopened — that alone explains "
+                     "a stale failure; if a NEWLY opened shell also misses it, the env "
+                     "takeover itself failed."))
+            step(ep_ok,
+                 f"Proxy environment variables point at ProxyForce ({expect_http} / {expect_https})"
+                 if ep_ok else
+                 "Proxy environment variables do NOT point at ProxyForce (env-reading CLI tools may bypass)")
+
             # ── What sing-box itself saw ──
             conns = self._clash_get("/connections") or {}
             clist = conns.get("connections") or []
@@ -1336,6 +1431,12 @@ class SingBoxController:
             elif not fakeip_ok:
                 verdict = ("DNS HIJACK FAILURE — DNS is not returning a fakeip, so connections go "
                            "CONNECT-by-IP and an inspecting proxy blocks them. Suspect browser/system DoH.")
+            elif not unspec_ok:
+                verdict = ("DNS AF_UNSPEC MISMATCH — the A-only probe resolves to a fakeip but "
+                           "getaddrinfo(AF_UNSPEC) — the call apps actually make — does not; CLI "
+                           "tools (yt-dlp, curl, git, pip, …) get a REAL IP and bypass capture. "
+                           "This is the 'getaddrinfo failed' failure mode; see the DNS "
+                           "getaddrinfo(AF_UNSPEC) section.")
             elif not proxy_reachable:
                 verdict = ("PROXY UNREACHABLE — capture + DNS work, but sing-box cannot reach the "
                            "upstream proxy (dial timeout/refused). Its own connection is looping "
@@ -1344,6 +1445,12 @@ class SingBoxController:
             elif competing:
                 verdict = ("WFP CONTENTION LIKELY — routes/DNS look OK but a competing agent is "
                            "present and may outbid capture. Disable it to confirm.")
+            elif not ep_ok:
+                verdict = ("ENV PROXY MISSING — capture works but the HTTP_PROXY/HTTPS_PROXY "
+                           "environment variables are not set; CLI/dev tools that read the "
+                           "environment instead of the Windows proxy setting (yt-dlp, curl, "
+                           "pip, git, …) may bypass capture. See the Proxy environment "
+                           "variables section.")
             elif problems:
                 verdict = "PARTIAL — engine mostly healthy; see the WARN lines in diagnostics.txt."
             else:
@@ -1358,7 +1465,8 @@ class SingBoxController:
                 pass
 
         bad = (not adapter_present) or (not routes_ok) or (not fakeip_ok) or \
-              (not proxy_reachable) or competing or bool(problems)
+              (not unspec_ok) or (not proxy_reachable) or (not ep_ok) or \
+              competing or bool(problems)
         self._log(f"DIAG: {verdict}  (full report: "
                   r"%ProgramData%\ProxyForce\diagnostics.txt — please paste it back)",
                   "warning" if bad else "info")

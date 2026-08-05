@@ -169,5 +169,62 @@ class DnsHijackFallbackTests(unittest.TestCase):
                                 "DNS hijack must precede the udp-reject rule")
 
 
+class NoProxyBypassConsistencyTests(unittest.TestCase):
+    """_build_no_proxy() (env-var takeover) and _build_proxy_bypass() (WinINET/WinHTTP
+    takeover) must exclude the SAME hosts, just rendered in each mechanism's own
+    syntax — NO_PROXY is comma-separated and glob-free, ProxyOverride is ';'/'*'-
+    globbed. A drift between them would make a CLI tool (env vars) and a browser
+    (registry) disagree on what's direct vs proxied."""
+
+    @staticmethod
+    def _controller(bypass_list=None, exclude_private=True):
+        cfg = ProxyConfig(host="203.0.113.10", port=800,
+                          bypass_list=bypass_list or [], exclude_private=exclude_private)
+        return SingBoxController(cfg)
+
+    def test_no_proxy_is_comma_separated_and_glob_free(self):
+        no_proxy = self._controller()._build_no_proxy()
+        self.assertNotIn(";", no_proxy)
+        self.assertNotIn("*", no_proxy)
+        parts = no_proxy.split(",")
+        self.assertIn("localhost", parts)
+        self.assertIn("127.0.0.1", parts)
+
+    def test_default_private_ranges_match_between_both_builders(self):
+        c = self._controller(exclude_private=True)
+        bypass = c._build_proxy_bypass()
+        no_proxy = c._build_no_proxy()
+        # Every 172.16-31 octet covered by ProxyOverride's globs must have a
+        # corresponding glob-free prefix in NO_PROXY.
+        for n in range(16, 32):
+            self.assertIn(f"172.{n}.*", bypass)
+            self.assertIn(f"172.{n}.", no_proxy.split(","))
+        self.assertIn("10.*", bypass)
+        self.assertIn("10.", no_proxy.split(","))
+        self.assertIn("192.168.*", bypass)
+        self.assertIn("192.168.", no_proxy.split(","))
+
+    def test_exclude_private_false_omits_private_ranges_from_both(self):
+        c = self._controller(exclude_private=False)
+        bypass = c._build_proxy_bypass()
+        no_proxy = c._build_no_proxy()
+        self.assertNotIn("10.*", bypass)
+        self.assertNotIn("10.", no_proxy.split(","))
+
+    def test_bypass_domain_entries_appear_in_both(self):
+        c = self._controller(bypass_list=["intranet.local"])
+        self.assertIn("intranet.local", c._build_proxy_bypass())
+        self.assertIn("intranet.local", c._build_no_proxy().split(","))
+
+    def test_bypass_ip_cidr_entries_are_excluded_from_both(self):
+        """ProxyOverride uses host wildcards, not CIDR — an IP/CIDR bypass entry is
+        handled by the route rules instead, so it must NOT leak into either builder's
+        host list (that already-existing exclusion in _build_proxy_bypass must hold
+        for _build_no_proxy too)."""
+        c = self._controller(bypass_list=["10.55.0.0/16"])
+        self.assertNotIn("10.55.0.0/16", c._build_proxy_bypass())
+        self.assertNotIn("10.55.0.0/16", c._build_no_proxy())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
