@@ -1,0 +1,218 @@
+"""
+Store/UWP loopback-exemption tests (v2.1.27 — the "Microsoft Store won't load" fix).
+
+WHY THIS MODULE EXISTS: ProxyForce's system-proxy takeover points WinINET/WinHTTP
+at 127.0.0.1. Every Store/UWP app runs in an AppContainer, and Windows blocks an
+AppContainer's connections to loopback unless the package holds a loopback
+exemption — so without this module, the Microsoft Store (and every other UWP app)
+fails outright while ProxyForce runs, and the TUN catch-all can't rescue it (the
+app obeys the now-unreachable proxy rather than falling back to direct).
+core.appcontainer grants `CheckNetIsolation LoopbackExempt` for every installed
+package on start and revokes exactly what it added on stop, using the same
+snapshot/backup-file contract as core.env_proxy and core.system_proxy.
+
+Like test_env_proxy.py / test_system_proxy.py, these exercise ONLY the safe,
+side-effect-free paths: output parsing, PowerShell quoting, and the backup-file
+round trip, with `_ps` stubbed out — never the real CheckNetIsolation tool or
+registry.
+
+Run:  python tests/test_appcontainer.py
+"""
+
+import os
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from core import appcontainer
+
+
+class QuotingTests(unittest.TestCase):
+
+    def test_plain_name_is_single_quoted(self):
+        self.assertEqual(
+            appcontainer._ps_quote("Microsoft.WindowsStore_8wekyb3d8bbwe"),
+            "'Microsoft.WindowsStore_8wekyb3d8bbwe'")
+
+    def test_embedded_single_quote_is_doubled(self):
+        """PowerShell's escape for a single quote inside a single-quoted string
+        is to double it — an unescaped one would terminate the string early and
+        corrupt the rest of the generated script."""
+        self.assertEqual(appcontainer._ps_quote("O'Brien.Fake_abc"),
+                         "'O''Brien.Fake_abc'")
+
+
+class ListExemptParsingTests(unittest.TestCase):
+    """_list_exempt() must pull package names from the `Name:` lines of
+    `CheckNetIsolation LoopbackExempt -s` output, not treat every non-blank line
+    as an entry (that would also capture the banner, the "[N] ---" separators,
+    and the SID lines)."""
+
+    _SAMPLE = """
+List Loopback Exempted AppContainers
+
+[1] -----------------------------------------------------------------
+Name: microsoft.windowsstore_8wekyb3d8bbwe
+SID: S-1-15-2-1609473798-1231923017-684268153-4268514328-882773646-2760585773-1760938157
+
+[2] -----------------------------------------------------------------
+Name: microsoft.xboxidentityprovider_8wekyb3d8bbwe
+SID: S-1-15-2-424268864-2020486118-1811575806-1888856205-2769478682-1043813619-3428097430
+
+OK.
+"""
+
+    def setUp(self):
+        self._orig_ps = appcontainer._ps
+
+    def tearDown(self):
+        appcontainer._ps = self._orig_ps
+
+    def test_extracts_names_only(self):
+        appcontainer._ps = lambda *a, **k: self._SAMPLE
+        names = appcontainer._list_exempt()
+        self.assertEqual(names, {
+            "microsoft.windowsstore_8wekyb3d8bbwe",
+            "microsoft.xboxidentityprovider_8wekyb3d8bbwe",
+        })
+
+    def test_empty_list_parses_to_empty_set(self):
+        appcontainer._ps = lambda *a, **k: "\nList Loopback Exempted AppContainers \n\nOK."
+        self.assertEqual(appcontainer._list_exempt(), set())
+
+    def test_is_exempt_is_case_insensitive(self):
+        appcontainer._ps = lambda *a, **k: self._SAMPLE
+        self.assertTrue(appcontainer.is_exempt("Microsoft.WindowsStore_8wekyb3d8bbwe"))
+        self.assertFalse(appcontainer.is_exempt("Microsoft.Not.Installed_abc123"))
+
+
+class BackupRoundTripTests(unittest.TestCase):
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig = appcontainer._data_dir
+        appcontainer._data_dir = lambda: self._tmp   # redirect backup to a temp dir
+
+    def tearDown(self):
+        appcontainer._data_dir = self._orig
+
+    def test_backup_write_read_clear(self):
+        snap = ["microsoft.windowscommunicationsapps_8wekyb3d8bbwe"]
+        self.assertIsNone(appcontainer._read_backup())
+        appcontainer._write_backup(snap)
+        self.assertEqual(appcontainer._read_backup(), snap)
+        appcontainer._clear_backup()
+        self.assertIsNone(appcontainer._read_backup())
+
+
+class ExemptInstalledTests(unittest.TestCase):
+    """exempt_installed() must snapshot BEFORE the first mutation (crash-safe,
+    like env_proxy.point_at), keep an existing backup as the true original on a
+    second call, and report the exit-code-derived count `_ps` returns."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_dir = appcontainer._data_dir
+        self._orig_ps = appcontainer._ps
+        self._orig_installed = appcontainer._installed_package_family_names
+        appcontainer._data_dir = lambda: self._tmp
+        appcontainer._installed_package_family_names = lambda: [
+            "Microsoft.WindowsStore_8wekyb3d8bbwe", "Microsoft.XboxApp_8wekyb3d8bbwe"]
+        self._ps_calls = []
+
+    def tearDown(self):
+        appcontainer._data_dir = self._orig_dir
+        appcontainer._ps = self._orig_ps
+        appcontainer._installed_package_family_names = self._orig_installed
+
+    def _stub_ps(self, list_output="\nOK.", add_result="2"):
+        def fake(command, timeout=30):
+            self._ps_calls.append(command)
+            if "LoopbackExempt -s" in command:
+                return list_output
+            return add_result
+        appcontainer._ps = fake
+
+    def test_writes_backup_and_returns_added_total(self):
+        self._stub_ps()
+        added, total = appcontainer.exempt_installed()
+        self.assertEqual((added, total), (2, 2))
+        self.assertEqual(appcontainer._read_backup(), [])   # nothing exempt beforehand
+
+    def test_no_installed_packages_is_a_noop(self):
+        appcontainer._installed_package_family_names = lambda: []
+        appcontainer.exempt_installed()
+        self.assertIsNone(appcontainer._read_backup())
+
+    def test_existing_backup_is_kept_as_true_original(self):
+        """Second call (e.g. the periodic re-sweep) must NOT re-snapshot over a
+        backup left by a prior crashed/incomplete run."""
+        appcontainer._write_backup(["already.exempt_abc"])
+        self._stub_ps()
+        appcontainer.exempt_installed()
+        self.assertEqual(appcontainer._read_backup(), ["already.exempt_abc"])
+
+    def test_malformed_add_count_degrades_to_zero(self):
+        self._stub_ps(add_result="Access Denied")
+        added, total = appcontainer.exempt_installed()
+        self.assertEqual(added, 0)
+        self.assertEqual(total, 2)
+
+
+class RestoreTests(unittest.TestCase):
+    """restore() must revoke only packages exempt now but absent from the
+    pre-takeover snapshot — never an exemption the user granted themselves — and
+    must be a no-op when no backup exists."""
+
+    def setUp(self):
+        self._tmp = tempfile.mkdtemp()
+        self._orig_dir = appcontainer._data_dir
+        self._orig_ps = appcontainer._ps
+        appcontainer._data_dir = lambda: self._tmp
+        self._ps_calls = []
+
+    def tearDown(self):
+        appcontainer._data_dir = self._orig_dir
+        appcontainer._ps = self._orig_ps
+
+    def test_no_backup_is_a_noop(self):
+        self.assertFalse(appcontainer.restore())
+        self.assertEqual(self._ps_calls, [])
+
+    def test_revokes_only_what_was_added_and_clears_backup(self):
+        appcontainer._write_backup(["preexisting.app_abc"])
+
+        def fake(command, timeout=30):
+            self._ps_calls.append(command)
+            if "LoopbackExempt -s" in command:
+                # current state: the pre-existing entry PLUS the one we added
+                return ("Name: preexisting.app_abc\nName: microsoft.windowsstore_8wekyb3d8bbwe\nOK.")
+            return "OK."
+        appcontainer._ps = fake
+
+        self.assertTrue(appcontainer.restore())
+        delete_calls = [c for c in self._ps_calls if "LoopbackExempt -d" in c]
+        self.assertEqual(len(delete_calls), 1)
+        self.assertIn("microsoft.windowsstore_8wekyb3d8bbwe", delete_calls[0])
+        self.assertNotIn("preexisting.app_abc", delete_calls[0])
+        self.assertIsNone(appcontainer._read_backup())
+
+    def test_nothing_added_skips_delete_but_still_clears_backup(self):
+        appcontainer._write_backup(["preexisting.app_abc"])
+        appcontainer._ps = lambda *a, **k: "Name: preexisting.app_abc\nOK."
+        self.assertTrue(appcontainer.restore())
+        self.assertFalse(any("LoopbackExempt -d" in c for c in self._ps_calls))
+        self.assertIsNone(appcontainer._read_backup())
+
+
+class ReadOnlyReadersTests(unittest.TestCase):
+    """current_state()/is_exempt() only READ — safe to call live."""
+
+    def test_current_state_returns_string(self):
+        self.assertIsInstance(appcontainer.current_state(), str)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

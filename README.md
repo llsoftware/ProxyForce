@@ -47,6 +47,16 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
 - **IPv6 is suppressed** (AAAA answered with NODATA) so dual-stack apps fall back to
   IPv4 → fakeip → proxy. The TUN is IPv4-only by design (avoids a Windows 10 IPv6
   crash); suppressing AAAA is what stops IPv6 from leaking around the proxy.
+- **Microsoft Store / UWP apps get a loopback exemption for as long as ProxyForce
+  runs.** Every Store app runs inside an AppContainer, which Windows blocks from
+  reaching `127.0.0.1` by default — so pointing the system proxy at ProxyForce's
+  local listeners (above) would otherwise leave the Store, Mail, Xbox, and every
+  other UWP app unable to reach it at all (not "bypassing capture" — the OS kills
+  the connection before it leaves the app, so the TUN can't rescue it either).
+  ProxyForce runs `CheckNetIsolation LoopbackExempt -a` for every installed package
+  on start (and re-sweeps periodically for apps installed while it's running), and
+  removes exactly what it added on stop — snapshotted the same way as the system
+  proxy, so a crash doesn't leave the machine permanently loosened.
 - **UDP is rejected** (including QUIC/HTTP3 on UDP/443). Proxy-aware apps don't try
   QUIC at all (a proxy is configured); anything that does falls back to TCP, which is
   captured. DNS is the one exception — it's hijacked to fakeip.
@@ -247,6 +257,23 @@ corporate **Group Policy** can re-push a different proxy/PAC over it. Check the
 proxy overrode it (it no longer points at `127.0.0.1:<port>`). GPO-enforced proxies
 must be cleared by policy (or the app's own proxy setting changed); the TUN still
 captures everything else regardless.
+
+**Microsoft Store (or another Store/UWP app) won't load**
+UWP apps run in an AppContainer, which Windows blocks from reaching loopback
+(`127.0.0.1`) unless exempted — and ProxyForce's system-proxy takeover points there.
+ProxyForce grants the exemption automatically on Start (`CheckNetIsolation
+LoopbackExempt -a`, one per installed package) and removes it on Stop. Check the
+**"Store/UWP loopback exemption"** section of `diagnostics.txt` — a FAIL there (or a
+`DIAG: UWP LOOPBACK BLOCKED` verdict) means the sweep didn't complete or was denied.
+Verify from an elevated prompt:
+```bat
+CheckNetIsolation LoopbackExempt -s
+```
+It should list every installed package (~100+, including
+`microsoft.windowsstore_8wekyb3d8bbwe`) while ProxyForce is running, and be empty
+again after Stop. An empty list while ProxyForce is ACTIVE means the sweep failed —
+most likely ProxyForce lost elevation (see "Redirect won't start" above for the UAC
+check) or ran before it, since `CheckNetIsolation -a` itself requires admin.
 
 **407 Proxy Authentication Required**
 Wrong credentials or auth type. Open Settings and check username/password/auth type.

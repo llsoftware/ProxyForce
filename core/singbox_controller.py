@@ -303,6 +303,8 @@ class SingBoxController:
         # v2.1.10: stream each new connection to the GUI log as sing-box
         # establishes it, so the user can watch traffic being captured/routed.
         self._trace_conns = True
+        self._uwp_thread: Optional[threading.Thread] = None
+        self._uwp_sweep_ticks = 0
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -695,11 +697,25 @@ class SingBoxController:
                           f"{self._tail_log()}", "error")
                 # The engine died — tear down the forward proxy and restore the system
                 # proxy so the machine isn't left with no working proxy path.
+                self._join_uwp_sweep()
                 self._stop_http_proxy()
                 self._restore_system_proxy()
                 self._close_log()
                 return
             self._poll_stats()
+            # Re-sweep UWP loopback exemptions every ~5 minutes (this loop ticks
+            # every 2s) so a package installed WHILE ProxyForce is running (e.g.
+            # a Store app the user just downloaded) also gets exempted, not just
+            # whatever was installed at start. Cheap and idempotent — already-
+            # exempt packages are skipped by CheckNetIsolation — and skipped
+            # entirely while the previous sweep is still running.
+            self._uwp_sweep_ticks += 1
+            if self._uwp_sweep_ticks >= 150:
+                self._uwp_sweep_ticks = 0
+                if self._uwp_thread is None or not self._uwp_thread.is_alive():
+                    self._uwp_thread = threading.Thread(
+                        target=self._exempt_uwp_loopback, daemon=True)
+                    self._uwp_thread.start()
             self._stop_event.wait(2)
 
     # ── TUN adapter lifecycle (Win 10 wintun cleanup) ─────────────────────────
@@ -1068,6 +1084,45 @@ class SingBoxController:
                       f"this up.")
         except Exception as e:
             self._log(f"Could not set proxy environment variables: {e}", "warning")
+        # v2.1.27: Store/UWP apps run in an AppContainer, which Windows blocks from
+        # reaching loopback by default — so pointing the system proxy at 127.0.0.1
+        # above makes the Microsoft Store (and every other UWP app) fail outright
+        # instead of falling back to direct: it obeys the proxy setting, tries to
+        # reach it, and the OS kills the connection before it leaves the app. The
+        # TUN catch-all can't rescue it either, since the app never goes direct.
+        # Grant a loopback exemption to every installed package so they can reach
+        # us like everything else; see core/appcontainer for the snapshot/restore
+        # contract. Runs on a background thread — ~113 packages takes a few
+        # seconds and must not delay the GUI going green. stop() joins this
+        # thread (briefly) before restoring, so a fast start->stop can't race
+        # the sweep and leave an exemption it added un-restored.
+        self._uwp_thread = threading.Thread(target=self._exempt_uwp_loopback, daemon=True)
+        self._uwp_thread.start()
+
+    def _exempt_uwp_loopback(self):
+        try:
+            from core import appcontainer
+            added, total = appcontainer.exempt_installed()
+            if total:
+                self._log(f"Loopback exemptions granted to {added} of {total} "
+                          f"Store/UWP app packages — required because the system "
+                          f"proxy is on 127.0.0.1, which AppContainer apps "
+                          f"(Microsoft Store, Mail, Xbox, …) are blocked from "
+                          f"reaching by default. Removed on stop.")
+        except Exception as e:
+            self._log(f"Could not exempt Store/UWP apps from loopback isolation: {e}",
+                      "warning")
+
+    def _join_uwp_sweep(self, timeout: float = 10):
+        """Wait (briefly) for the UWP-exemption sweep before restore() runs — a
+        fast start->stop, or an engine crash right after start, could otherwise
+        race it: restore()'s snapshot would be taken mid-add, and any exemption
+        the sweep adds AFTER that snapshot never gets cleaned up. Best-effort like
+        every other lane here: if the sweep is still running past the timeout,
+        teardown proceeds anyway rather than blocking shutdown indefinitely."""
+        uwp = self._uwp_thread
+        if uwp is not None and uwp.is_alive() and uwp is not threading.current_thread():
+            uwp.join(timeout=timeout)
 
     def _restore_system_proxy(self):
         """Restore the system proxy snapshotted at start. Idempotent (no-op if
@@ -1085,6 +1140,12 @@ class SingBoxController:
                           "setting.")
         except Exception as e:
             self._log(f"Could not restore proxy environment variables: {e}", "warning")
+        try:
+            from core import appcontainer
+            if appcontainer.restore():
+                self._log("Store/UWP loopback exemptions removed.")
+        except Exception as e:
+            self._log(f"Could not remove Store/UWP loopback exemptions: {e}", "warning")
 
     # ── diagnostics (ground-truth capture for the "green but no capture" bug) ──────
 
@@ -1113,6 +1174,7 @@ class SingBoxController:
         # Pre-init so the final GUI echo is safe even if something throws.
         verdict = "diagnostics did not complete"
         adapter_present = routes_ok = fakeip_ok = unspec_ok = competing = ep_ok = False
+        uwp_ok = False
         proxy_reachable = True
         problems = []
 
@@ -1386,6 +1448,32 @@ class SingBoxController:
                  if ep_ok else
                  "Proxy environment variables do NOT point at ProxyForce (env-reading CLI tools may bypass)")
 
+            # ── Store/UWP loopback exemption: the system proxy above points at
+            # 127.0.0.1, and every UWP app runs in an AppContainer, which Windows
+            # blocks from reaching loopback unless exempted. An app that honours
+            # the proxy setting but ISN'T exempt fails outright — it never falls
+            # back to direct, so the TUN can't rescue it either. Probe the
+            # Microsoft Store specifically since it's the package the user will
+            # notice first (see core/appcontainer) ──
+            try:
+                from core import appcontainer
+                uwp_ok = appcontainer.is_exempt("Microsoft.WindowsStore_8wekyb3d8bbwe")
+                uwp_state = appcontainer.current_state()
+            except Exception as e:
+                uwp_state = f"<unavailable: {e}>"
+            section(fh, "Store/UWP loopback exemption (Microsoft Store probe)", uwp_state,
+                    ("PASS — Microsoft Store is loopback-exempt; it can reach the local proxy"
+                     if uwp_ok else
+                     "FAIL — Microsoft Store is NOT loopback-exempt. Windows blocks AppContainer "
+                     "apps from reaching 127.0.0.1 by default, so the Store (and other UWP apps) "
+                     "cannot reach the local proxy the system-proxy takeover points them at, and "
+                     "will fail to load. See core/appcontainer.exempt_installed()."))
+            step(uwp_ok,
+                 "Store/UWP apps exempted from loopback isolation"
+                 if uwp_ok else
+                 "Store/UWP apps CANNOT reach the local proxy — Microsoft Store and other "
+                 "Store apps will fail to load")
+
             # ── What sing-box itself saw ──
             conns = self._clash_get("/connections") or {}
             clist = conns.get("connections") or []
@@ -1451,6 +1539,14 @@ class SingBoxController:
                            "environment instead of the Windows proxy setting (yt-dlp, curl, "
                            "pip, git, …) may bypass capture. See the Proxy environment "
                            "variables section.")
+            elif not uwp_ok:
+                verdict = ("UWP LOOPBACK BLOCKED — capture, DNS, and the proxy takeover all work, "
+                           "but Store/UWP apps (Microsoft Store, Mail, Xbox, …) are not loopback-"
+                           "exempt, so they cannot reach the local proxy and will fail to load. "
+                           "See the Store/UWP loopback exemption section; core/appcontainer "
+                           "should have granted this automatically — check for an Access Denied "
+                           "error in the log (requires elevation, which ProxyForce should already "
+                           "have).")
             elif problems:
                 verdict = "PARTIAL — engine mostly healthy; see the WARN lines in diagnostics.txt."
             else:
@@ -1466,7 +1562,7 @@ class SingBoxController:
 
         bad = (not adapter_present) or (not routes_ok) or (not fakeip_ok) or \
               (not unspec_ok) or (not proxy_reachable) or (not ep_ok) or \
-              competing or bool(problems)
+              (not uwp_ok) or competing or bool(problems)
         self._log(f"DIAG: {verdict}  (full report: "
                   r"%ProgramData%\ProxyForce\diagnostics.txt — please paste it back)",
                   "warning" if bad else "info")
@@ -1556,6 +1652,7 @@ class SingBoxController:
 
         # Stop the local forward-proxy and put the Windows system proxy back exactly
         # as we found it.
+        self._join_uwp_sweep()
         self._stop_http_proxy()
         self._restore_system_proxy()
 
