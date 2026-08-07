@@ -1109,6 +1109,18 @@ class SingBoxController:
                           f"proxy is on 127.0.0.1, which AppContainer apps "
                           f"(Microsoft Store, Mail, Xbox, …) are blocked from "
                           f"reaching by default. Removed on stop.")
+                # Immediately re-read the exempt count via a FRESH `LoopbackExempt -s`
+                # call, rather than trusting the exit-code-derived `added` count above.
+                # This is the exact discrepancy that made the v2.1.27 fix impossible to
+                # root-cause from the log alone: it reported "122 of 122" granted (every
+                # -a call genuinely exited 0) while a readback ~1 minute later (in
+                # diagnostics) found only "1" exempt — a parser bug in _list_exempt, not
+                # a real add failure, but there was no way to tell from this log line by
+                # itself. Logging the immediate readback next to the grant count means
+                # any future mismatch (parser bug OR something external reverting the
+                # list between checks) is visible right here, side by side, with no
+                # guessing required.
+                self._log(f"Verified immediately after: {appcontainer.current_state()}")
         except Exception as e:
             self._log(f"Could not exempt Store/UWP apps from loopback isolation: {e}",
                       "warning")
@@ -1461,7 +1473,14 @@ class SingBoxController:
                 uwp_state = appcontainer.current_state()
             except Exception as e:
                 uwp_state = f"<unavailable: {e}>"
-            section(fh, "Store/UWP loopback exemption (Microsoft Store probe)", uwp_state,
+            # Raw `-s` text, not just the parsed summary above — the v2.1.27 fix's
+            # failure to root-cause came from having ONLY a summarized count to go on
+            # (a parser bug in core/appcontainer undercounted "122 exempt" as "1" with
+            # no way to see why from the log alone). Whatever CheckNetIsolation actually
+            # printed on THIS box is right here so a future mismatch is visible by eye.
+            raw_list = self._ps("CheckNetIsolation LoopbackExempt -s", timeout=20)
+            uwp_body = f"{uwp_state}\n\nRaw `CheckNetIsolation LoopbackExempt -s`:\n{raw_list}"
+            section(fh, "Store/UWP loopback exemption (Microsoft Store probe)", uwp_body,
                     ("PASS — Microsoft Store is loopback-exempt; it can reach the local proxy"
                      if uwp_ok else
                      "FAIL — Microsoft Store is NOT loopback-exempt. Windows blocks AppContainer "

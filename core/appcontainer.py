@@ -57,7 +57,13 @@ import json
 import subprocess
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-_NAME_LINE_RE = re.compile(r"^\s*Name\s*:\s*(.+?)\s*$", re.IGNORECASE)
+
+# Matches a Package Family Name's stable shape: <name>_<13-char publisher id>, e.g.
+# "microsoft.windowsstore_8wekyb3d8bbwe". The 13-character base32-style suffix is a
+# fixed Windows convention for EVERY package (first- and third-party alike) — unlike
+# the surrounding label text in `CheckNetIsolation LoopbackExempt -s` output, which
+# varies across Windows builds/locales (see _list_exempt below for why this matters).
+_PFN_RE = re.compile(r"\b[A-Za-z0-9][\w.-]*_[A-Za-z0-9]{13}\b")
 
 
 def _ps_quote(s: str) -> str:
@@ -93,20 +99,25 @@ def _ps(command: str, timeout: int = 30) -> str:
 def _list_exempt() -> set:
     """Current loopback-exempt AppContainers, as a set of package family names.
 
-    `CheckNetIsolation LoopbackExempt -s` output is a numbered block per entry:
+    `CheckNetIsolation LoopbackExempt -s` output is a numbered block per entry, e.g.:
         [1] -----------------------------------------------------------------
         Name: microsoft.windowsstore_8wekyb3d8bbwe
         SID: S-1-15-2-...
-    followed by a trailing "OK." — pull out the "Name:" lines rather than
-    treating every non-blank line as an entry (that would also capture the
-    banner, the "[N] ---" separators, and the SID lines)."""
+    followed by a trailing "OK." — but an EARLIER version of this function anchored on
+    that literal "Name:" label, and that turned out to be exactly the wrong thing to
+    depend on: on a real dev machine (Windows 11 build 26200) it caused a silent, severe
+    undercount — `exempt_installed()` reported "122 of 122" granted (every `-a` call
+    genuinely exited 0) while a readback moments later via this function found only "1"
+    exempt, because the label text this function was matching against didn't match what
+    that build's `CheckNetIsolation` actually prints. Never re-anchor on label text again.
+
+    Instead, scan the ENTIRE raw output for the package-family-name SHAPE itself
+    (`_PFN_RE`: `<name>_<13-char publisher id>`) — that suffix format is a fixed Windows
+    convention independent of whatever label/casing/table layout a given build's
+    `CheckNetIsolation` chooses to print, and SID lines can't accidentally match it (they
+    use hyphens, never an underscore)."""
     out = _ps("CheckNetIsolation LoopbackExempt -s")
-    names = set()
-    for line in out.splitlines():
-        m = _NAME_LINE_RE.match(line)
-        if m:
-            names.add(m.group(1))
-    return names
+    return set(_PFN_RE.findall(out))
 
 
 def _installed_package_family_names() -> list:

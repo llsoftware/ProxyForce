@@ -45,12 +45,22 @@ class QuotingTests(unittest.TestCase):
 
 
 class ListExemptParsingTests(unittest.TestCase):
-    """_list_exempt() must pull package names from the `Name:` lines of
-    `CheckNetIsolation LoopbackExempt -s` output, not treat every non-blank line
-    as an entry (that would also capture the banner, the "[N] ---" separators,
-    and the SID lines)."""
+    """_list_exempt() must pull package family names out of `CheckNetIsolation
+    LoopbackExempt -s` output WITHOUT depending on any particular label/layout.
 
-    _SAMPLE = """
+    Regression: an earlier version anchored on a literal "Name:" label. On a real
+    Windows 11 (build 26200) dev machine, exempt_installed() reported "122 of 122"
+    granted (every `-a` call genuinely exited 0 — confirmed separately, a real
+    failure DOES surface as a non-zero exit) while a readback via THIS function
+    moments later found only "1" exempt — because the label text this function was
+    matching against didn't match what that build's CheckNetIsolation actually
+    prints. The fix: match the package-family-name SHAPE itself
+    (`<name>_<13-char publisher id>`, a fixed Windows convention independent of
+    labels), not a label. These tests deliberately exercise several PLAUSIBLE
+    real-world layouts, not just the one sample the original regex was written
+    against, so this exact bug class can't silently recur."""
+
+    _LABELED = """
 List Loopback Exempted AppContainers
 
 [1] -----------------------------------------------------------------
@@ -64,26 +74,61 @@ SID: S-1-15-2-424268864-2020486118-1811575806-1888856205-2769478682-1043813619-3
 OK.
 """
 
+    # A plausible alternate layout: name + SID on ONE line, no "Name:"/"SID:" labels
+    # at all — this is exactly the shape the old label-anchored regex could never
+    # have matched, and the new shape-based one must.
+    _TABLE_LIKE = """
+Loopback Exempted AppContainers
+--------------------------------
+PackageFamilyName                             SID
+Microsoft.WindowsStore_8wekyb3d8bbwe           S-1-15-2-1609473798-1231923017
+Microsoft.XboxIdentityProvider_8wekyb3d8bbwe   S-1-15-2-424268864-2020486118
+OK.
+"""
+
+    _BARE_INDENTED = """
+   microsoft.windowsstore_8wekyb3d8bbwe
+   microsoft.xboxidentityprovider_8wekyb3d8bbwe
+OK.
+"""
+
     def setUp(self):
         self._orig_ps = appcontainer._ps
 
     def tearDown(self):
         appcontainer._ps = self._orig_ps
 
-    def test_extracts_names_only(self):
-        appcontainer._ps = lambda *a, **k: self._SAMPLE
-        names = appcontainer._list_exempt()
-        self.assertEqual(names, {
-            "microsoft.windowsstore_8wekyb3d8bbwe",
-            "microsoft.xboxidentityprovider_8wekyb3d8bbwe",
-        })
+    def _expect_both(self):
+        return {"microsoft.windowsstore_8wekyb3d8bbwe",
+                "microsoft.xboxidentityprovider_8wekyb3d8bbwe"}
+
+    def test_extracts_from_labeled_blocks(self):
+        appcontainer._ps = lambda *a, **k: self._LABELED
+        self.assertEqual(appcontainer._list_exempt(), self._expect_both())
+
+    def test_extracts_from_table_layout_with_no_labels(self):
+        """The exact regression shape: no "Name:"/"SID:" labels at all, mixed case,
+        SID printed on the SAME line right after the PFN."""
+        appcontainer._ps = lambda *a, **k: self._TABLE_LIKE
+        names = {n.lower() for n in appcontainer._list_exempt()}
+        self.assertEqual(names, self._expect_both())
+
+    def test_extracts_from_bare_indented_names(self):
+        appcontainer._ps = lambda *a, **k: self._BARE_INDENTED
+        self.assertEqual(appcontainer._list_exempt(), self._expect_both())
+
+    def test_sid_lines_never_match(self):
+        """SIDs use hyphens, never an underscore — must not be mistaken for a PFN."""
+        appcontainer._ps = lambda *a, **k: (
+            "SID: S-1-15-2-1609473798-1231923017-684268153-4268514328\nOK.")
+        self.assertEqual(appcontainer._list_exempt(), set())
 
     def test_empty_list_parses_to_empty_set(self):
         appcontainer._ps = lambda *a, **k: "\nList Loopback Exempted AppContainers \n\nOK."
         self.assertEqual(appcontainer._list_exempt(), set())
 
     def test_is_exempt_is_case_insensitive(self):
-        appcontainer._ps = lambda *a, **k: self._SAMPLE
+        appcontainer._ps = lambda *a, **k: self._LABELED
         self.assertTrue(appcontainer.is_exempt("Microsoft.WindowsStore_8wekyb3d8bbwe"))
         self.assertFalse(appcontainer.is_exempt("Microsoft.Not.Installed_abc123"))
 
