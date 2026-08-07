@@ -32,7 +32,11 @@ _restore_system_proxy):
        original.
     3. Enumerate installed packages (`Get-AppxPackage`, current user — ProxyForce
        runs elevated as the interactive user, and exemptions are per-user) and add
-       an exemption for each, in a single PowerShell process.
+       an exemption for each — ONE SEPARATE `CheckNetIsolation.exe` PROCESS PER
+       PACKAGE (see _checknetisolation's docstring for why: a single batched
+       PowerShell script with an internal loop over all packages was tried first
+       and reproducibly corrupted the exemption list instead of populating it —
+       confirmed live on two different machines/Windows versions).
     4. On stop, remove only the exemptions THIS run added (packages present now but
        absent from the snapshot), then delete the backup.
 
@@ -49,6 +53,12 @@ NOTES:
   * `CheckNetIsolation` is a legacy console tool but remains the only supported way
     to manage this list on Windows 10/11; there is no WinRT/PowerShell cmdlet
     equivalent as of this writing.
+  * Deliberately one process per package, not one batched script — see
+    _checknetisolation's docstring. Do not "optimize" this back to a loop inside a
+    single PowerShell invocation; that is the exact pattern that silently corrupted
+    the exemption list (verified: every call reported success, but the real list
+    ended up with a single unresolvable entry sharing an IDENTICAL SID across two
+    unrelated machines — proof the corruption wasn't coming from the input at all).
 """
 
 import os
@@ -64,14 +74,6 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # the surrounding label text in `CheckNetIsolation LoopbackExempt -s` output, which
 # varies across Windows builds/locales (see _list_exempt below for why this matters).
 _PFN_RE = re.compile(r"\b[A-Za-z0-9][\w.-]*_[A-Za-z0-9]{13}\b")
-
-
-def _ps_quote(s: str) -> str:
-    """Single-quote a value for embedding in a PowerShell -Command string,
-    doubling any embedded single quote (PowerShell's escape for that form).
-    Package family names never contain one in practice, but this is cheap
-    insurance against a malformed/unusual package name breaking the script."""
-    return "'" + s.replace("'", "''") + "'"
 
 
 def _data_dir() -> str:
@@ -92,6 +94,36 @@ def _ps(command: str, timeout: int = 30) -> str:
         return ((r.stdout or "") + (r.stderr or "")).strip()
     except Exception as e:
         return f"<command failed: {e}>"
+
+
+def _checknetisolation(*args: str, timeout: int = 15) -> "tuple[int, str]":
+    """Run CheckNetIsolation.exe DIRECTLY (no PowerShell in between) with the given
+    arguments; return its real exit code and combined output.
+
+    WHY NOT A POWERSHELL SCRIPT WITH A LOOP (the pattern this replaces): a single,
+    standalone `CheckNetIsolation LoopbackExempt -a -n=<PFN>` call works perfectly —
+    resolved name, correct SID, persists. But `exempt_installed()` used to build ONE
+    PowerShell script with a `foreach` loop calling this ~113 times back-to-back in
+    the SAME process, capturing each call's output with `2>&1`. That pattern is what
+    actually broke: every call still reported exit 0 (a genuine reading — a real
+    failure, e.g. non-elevation, DOES surface as a non-zero exit, confirmed directly),
+    yet the real exempt list ended up containing exactly one unresolvable entry —
+    with the SAME fixed SID reproduced on two different machines (different Windows
+    versions, different hardware, different installed packages). A value that
+    doesn't vary with the real input isn't derived from it — it's an artifact of the
+    rapid-fire loop + merged-stderr-redirection pattern itself. Calling the
+    executable directly, once per invocation, with no PowerShell native-command
+    interop in between, avoids that pattern entirely.
+
+    Passed as an argv list (no shell involved), so package family names never need
+    escaping — dots and underscores are ordinary argument characters."""
+    try:
+        r = subprocess.run(
+            ["CheckNetIsolation.exe", *args],
+            capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=timeout)
+        return (r.returncode, ((r.stdout or "") + (r.stderr or "")).strip())
+    except Exception as e:
+        return (-1, f"<command failed: {e}>")
 
 
 # ── snapshot / list parsing ────────────────────────────────────────────────────
@@ -175,22 +207,15 @@ def exempt_installed() -> "tuple[int, int]":
             return (0, 0)
         if _read_backup() is None:
             _write_backup(sorted(_list_exempt()))
-        # One PowerShell process for the whole sweep rather than one per package —
-        # ~113 packages in ~2-4s instead of ~10s of process-spawn overhead.
-        script = (
-            "$pfns = @(" + ",".join(_ps_quote(p) for p in pfns) + ");"
-            "$added = 0;"
-            "foreach ($p in $pfns) {"
-            "  $r = CheckNetIsolation LoopbackExempt -a -n=$p 2>&1;"
-            "  if ($LASTEXITCODE -eq 0) { $added++ }"
-            "};"
-            "$added"
-        )
-        out = _ps(script, timeout=60)
-        try:
-            added = int(out.strip().splitlines()[-1].strip())
-        except (ValueError, IndexError):
-            added = 0
+        # ONE PROCESS PER PACKAGE, deliberately — see _checknetisolation's docstring
+        # for why a single batched PowerShell script with an internal loop corrupts
+        # the exemption list instead of populating it. Slower (~113 process spawns
+        # instead of one script), but this is the pattern confirmed to actually work.
+        added = 0
+        for p in pfns:
+            code, _ = _checknetisolation("LoopbackExempt", "-a", f"-n={p}")
+            if code == 0:
+                added += 1
         return (added, len(pfns))
     except Exception:
         return (0, 0)
@@ -208,12 +233,10 @@ def restore() -> bool:
         original = set(snap)
         current = _list_exempt()
         added_by_us = current - original
-        if added_by_us:
-            script = (
-                "$pfns = @(" + ",".join(_ps_quote(p) for p in sorted(added_by_us)) + ");"
-                "foreach ($p in $pfns) { CheckNetIsolation LoopbackExempt -d -n=$p 2>&1 | Out-Null }"
-            )
-            _ps(script, timeout=60)
+        # Same one-process-per-package fix as exempt_installed() — a batched script
+        # with an internal -d loop is the same suspect pattern, just in reverse.
+        for p in sorted(added_by_us):
+            _checknetisolation("LoopbackExempt", "-d", f"-n={p}")
     except Exception:
         pass
     _clear_backup()
