@@ -32,6 +32,7 @@ import time
 import base64
 import socket
 import ctypes
+import winreg
 import threading
 import subprocess
 import ipaddress
@@ -162,6 +163,8 @@ class ProxyConfig:
     exclude_loopback: bool = True
     bypass_list: list = None        # extra hosts/CIDRs to send DIRECT
     log_level: str = "info"         # sing-box log verbosity (see _SINGBOX_LOG_LEVELS)
+    ncsi_fallback: bool = True      # last-resort EnableActiveProbing=0 if NCSI still
+                                     # reports no internet after diagnostics (core.ncsi)
 
     def __post_init__(self):
         if self.bypass_list is None:
@@ -246,6 +249,38 @@ def _free_loopback_ports(n: int = 1) -> List[int]:
 def _free_loopback_port() -> int:
     """Grab a single free 127.0.0.1 TCP port for the Clash API."""
     return _free_loopback_ports(1)[0]
+
+
+# NCSI (Network Connectivity Status Indicator) is the service that decides whether
+# Windows believes it has internet access (Get-NetConnectionProfile's
+# IPv4Connectivity). Its DNS probe resolves ActiveDnsProbeHost and requires the
+# answer to be EXACTLY ActiveDnsProbeContent. Under fakeip the answer is a
+# 198.18.x.x address instead, so NCSI reports "no internet" — which silently
+# starves every component gating on connectivity level (Windows Spotlight,
+# Store, Widgets, Teams presence). Diagnosed 2026-08-07.
+_NCSI_KEY = r"SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet"
+_NCSI_DNS_HOST_DEFAULT = "dns.msftncsi.com"
+_NCSI_DNS_CONTENT_DEFAULT = "131.107.255.255"
+
+
+def _ncsi_dns_probe():
+    """Return (probe_host, probe_content) NCSI's DNS probe checks. Read from the
+    registry rather than hardcoded — a corporate image can retarget NCSI's probe —
+    falling back to the stock Windows defaults if the key is missing/unreadable."""
+    host, content = _NCSI_DNS_HOST_DEFAULT, _NCSI_DNS_CONTENT_DEFAULT
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NCSI_KEY) as k:
+            try:
+                host = winreg.QueryValueEx(k, "ActiveDnsProbeHost")[0] or host
+            except FileNotFoundError:
+                pass
+            try:
+                content = winreg.QueryValueEx(k, "ActiveDnsProbeContent")[0] or content
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
+    return host, content
 
 
 def _looks_like_cidr_or_ip(entry: str) -> Optional[str]:
@@ -376,6 +411,7 @@ def make_proxy_config(cfg: dict) -> "ProxyConfig":
         exclude_loopback=cfg.get("exclude_loopback", True),
         bypass_list=cfg.get("bypass_list", []),
         log_level=cfg.get("log_level", _DEFAULT_LOG_LEVEL),
+        ncsi_fallback=cfg.get("ncsi_fallback", True),
     )
 
 
@@ -479,8 +515,18 @@ class SingBoxController:
         # REAL IPv6 (dns.final = local) and Happy Eyeballs connects over IPv6,
         # which bypasses the IPv4-only TUN entirely — the engine runs and captures
         # IPv4-only system traffic (counters move) while the browser leaks direct.
+        ncsi_probe_host, ncsi_probe_content = _ncsi_dns_probe()
         dns_rules = [
             {"query_type": ["AAAA"], "action": "predefined", "rcode": "NOERROR"},
+            # NCSI's DNS probe (see _ncsi_dns_probe) must get EXACTLY this literal
+            # answer or Windows reports "no internet" — a `predefined` answer is
+            # used rather than letting it fall through to fakeip/real resolution
+            # because NCSI compares byte-for-byte against a fixed constant, not
+            # whatever corporate DNS happens to return. Nothing ever connects to
+            # this address, so — unlike the bypass domains below — it never needs
+            # a fakeip reverse-map entry. Must precede the blanket A → fakeip rule.
+            {"domain": [ncsi_probe_host], "query_type": ["A"], "action": "predefined",
+             "answer": [f"{ncsi_probe_host}. IN A {ncsi_probe_content}"]},
             {"query_type": ["A"], "server": "fakeip"},
         ]
 
@@ -498,9 +544,20 @@ class SingBoxController:
         ]
         # Never route traffic destined to the proxy server itself back through the
         # proxy — send it DIRECT (covers raw-IP proxy hosts; prevents any loop).
+        # Also cover the pre-resolved real IP when cfg.host is a hostname (resolved
+        # in start(), BEFORE fakeip hijacks DNS, into _proxy_connect_host) — without
+        # this, a hostname-configured proxy's IP could be caught by the port-80
+        # rule below and the local forward-proxy's own upstream socket would loop
+        # back into itself.
+        proxy_ips = []
         proxy_ip = _looks_like_cidr_or_ip(cfg.host)
         if proxy_ip:
-            route_rules.append({"ip_cidr": [proxy_ip], "action": "route", "outbound": "direct"})
+            proxy_ips.append(proxy_ip)
+        resolved_ip = _looks_like_cidr_or_ip(getattr(self, "_proxy_connect_host", "") or "")
+        if resolved_ip and resolved_ip not in proxy_ips:
+            proxy_ips.append(resolved_ip)
+        if proxy_ips:
+            route_rules.append({"ip_cidr": proxy_ips, "action": "route", "outbound": "direct"})
         if cfg.exclude_loopback:
             route_rules.append({"ip_cidr": ["127.0.0.0/8"],
                                 "action": "route", "outbound": "direct"})
@@ -510,6 +567,28 @@ class SingBoxController:
             route_rules.append({"ip_cidr": bypass_cidrs, "action": "route", "outbound": "direct"})
         if bypass_domains:
             route_rules.append({"domain_suffix": bypass_domains, "action": "route", "outbound": "direct"})
+        # Route TUN-captured plaintext HTTP (port 80) into our OWN local forward-
+        # proxy instead of sing-box's http outbound (CONNECT-only). The corporate
+        # proxy 403s CONNECT on :80 (proven 2026-06-19) but serves the identical
+        # URL as a normal forward-proxy GET — core/local_proxy.py already does
+        # exactly that for proxy-aware apps sent to the http= system-proxy entry;
+        # this extends the same fix to anything captured by the TUN instead, which
+        # is what NCSI's own web probe hits (it ignores the WinINET/WinHTTP proxy
+        # split entirely) and any app that ignores proxy settings (WPAD). Without
+        # this, NCSI's probe 403s, Windows reports IPv4Connectivity=LocalNetwork
+        # ("no internet"), and every component gating on connectivity level goes
+        # dark — diagnosed 2026-08-07 via Windows Spotlight silently not
+        # downloading. Must sit AFTER the direct rules above (loopback/private/
+        # bypass/proxy-IP keep their own path) and BEFORE the UDP reject below.
+        # `self._http_proxy_port` is reserved in start() before the config is ever
+        # rendered (see _free_loopback_ports(3)); the `or 18081` fallback only
+        # matters for a bare _render_config() call outside the normal start path
+        # (e.g. tests), matching the same pattern used for local-in's listen_port.
+        route_rules.append({
+            "network": "tcp", "port": 80, "action": "route", "outbound": "direct",
+            "override_address": "127.0.0.1",
+            "override_port": self._http_proxy_port or 18081,
+        })
         # HTTP CONNECT is TCP-only: reject ALL UDP (incl. QUIC/443) so apps fall
         # back to TCP and nothing leaks unproxied. DNS is already handled above.
         route_rules.append({"network": "udp", "action": "reject"})
@@ -656,7 +735,12 @@ class SingBoxController:
             self._log("sing-box.exe not found in the install folder (vendor/singbox).", "error")
             return
 
-        self._clash_port, self._local_proxy_port = _free_loopback_ports(2)
+        # Reserve the forward-proxy port here too (not just clash/local-proxy):
+        # _render_config's port-80 route rule needs a concrete override_port at
+        # WRITE time, which happens below, well before _start_http_proxy() would
+        # otherwise have assigned one from an ephemeral bind.
+        self._clash_port, self._local_proxy_port, self._http_proxy_port = \
+            _free_loopback_ports(3)
         # Resolve the corporate proxy's REAL IP now — BEFORE sing-box hijacks DNS to
         # fakeip — so the local forward-proxy (started after green) dials the real
         # upstream rather than a fakeip that would loop back into the TUN. For an
@@ -1169,7 +1253,11 @@ class SingBoxController:
         any port-80 download: the corporate proxy returns 403 to CONNECT on :80 (which
         is all sing-box's outbound can do), but happily serves the same URL as a normal
         forward-proxy GET. See core/local_proxy for the full rationale. Best-effort: on
-        failure HTTPS still works via sing-box and only plaintext HTTP stays broken."""
+        failure HTTPS still works via sing-box and only plaintext HTTP stays broken —
+        but the rendered sing-box config's port-80 route rule (override_port) already
+        points at self._http_proxy_port, reserved in start() BEFORE the config was
+        written, so binding that exact port here (not an ephemeral one) is required or
+        TUN-captured port-80 traffic (NCSI, WPAD) gets connection-refused instead."""
         try:
             from core import local_proxy
             basic = self.config.auth_type == "basic"
@@ -1178,11 +1266,12 @@ class SingBoxController:
                 username=(self.config.username if basic else ""),
                 password=(self.config.password if basic else ""),
                 on_log=self.on_log)
-            self._http_proxy_port = prx.start()
+            self._http_proxy_port = prx.start(port=self._http_proxy_port)
             self._http_proxy = prx
             self._log(f"Local HTTP forward-proxy up on 127.0.0.1:{self._http_proxy_port} "
                       f"→ relays plaintext HTTP to the corporate proxy as a forward GET "
-                      f"(fixes port-80 downloads such as the Edge updater).")
+                      f"(fixes port-80 downloads such as the Edge updater, and — via the "
+                      f"sing-box port-80 route rule — NCSI/WPAD traffic captured by the TUN).")
             return True
         except Exception as e:
             self._http_proxy = None
@@ -1324,6 +1413,12 @@ class SingBoxController:
                 self._log("Store/UWP loopback exemptions removed.")
         except Exception as e:
             self._log(f"Could not remove Store/UWP loopback exemptions: {e}", "warning")
+        try:
+            from core import ncsi
+            if ncsi.restore():
+                self._log("NCSI active-probing fallback restored to its previous setting.")
+        except Exception as e:
+            self._log(f"Could not restore the NCSI active-probing setting: {e}", "warning")
 
     # ── diagnostics (ground-truth capture for the "green but no capture" bug) ──────
 
@@ -1353,6 +1448,7 @@ class SingBoxController:
         verdict = "diagnostics did not complete"
         adapter_present = routes_ok = fakeip_ok = unspec_ok = competing = ep_ok = False
         uwp_ok = False
+        ncsi_ok = False
         proxy_reachable = True
         problems = []
 
@@ -1508,6 +1604,105 @@ class SingBoxController:
                  if unspec_ok else
                  "getaddrinfo(AF_UNSPEC) NOT hijacked to fakeip — CLI tools may bypass capture")
 
+            # ── NCSI: does WINDOWS ITSELF believe it has internet? Diagnosed
+            # 2026-08-07: NlaSvc's probes ignore the WinINET/WinHTTP proxy split
+            # entirely (it is a SYSTEM-account service making raw, proxy-less
+            # requests — exactly what the checks below reproduce with .Proxy=$null
+            # so they test the real TUN path, not our own proxy takeover). Every
+            # check above can PASS while this still fails, and the failure is
+            # completely silent: Get-NetConnectionProfile just reports
+            # IPv4Connectivity=LocalNetwork and every component that gates on
+            # connectivity level (Windows Spotlight/ContentDeliveryManager, Store,
+            # Widgets, Teams presence) quietly does nothing — no error, no log,
+            # just content that never refreshes.
+            conn_profile = self._ps(
+                "Get-NetConnectionProfile | Select-Object InterfaceAlias,IPv4Connectivity | "
+                "Format-Table -Auto | Out-String")
+            ncsi_ok = bool(re.search(r"\bInternet\b", conn_profile))
+            ncsi_conf = self._ps(
+                "$k='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NlaSvc\\Parameters\\Internet';"
+                "$p=Get-ItemProperty $k -ErrorAction SilentlyContinue;"
+                "$dh=$p.ActiveDnsProbeHost; $dw=$p.ActiveDnsProbeContent;"
+                "$wh=$p.ActiveWebProbeHost; $wp=$p.ActiveWebProbePath; $ww=$p.ActiveWebProbeContent;"
+                "$dg=(Resolve-DnsName -Name $dh -Type A -ErrorAction SilentlyContinue | "
+                "Select-Object -First 1).IPAddress;"
+                "try {"
+                "  $req=[System.Net.HttpWebRequest]::Create(\"http://$wh/$wp\");"
+                "  $req.Proxy=$null; $req.Timeout=8000;"
+                "  $resp=$req.GetResponse();"
+                "  $sr=New-Object System.IO.StreamReader($resp.GetResponseStream());"
+                "  $wg=$sr.ReadToEnd().Trim(); $resp.Close()"
+                "} catch { $wg=\"<error: $($_.Exception.Message)>\" }"
+                "\"DNSHOST=$dh|DNSWANT=$dw|DNSGOT=$dg|WEBHOST=$wh|WEBWANT=$ww|WEBGOT=$wg\"",
+                timeout=20)
+
+            def _kv(s, key):
+                m = re.search(re.escape(key) + r"=(.*?)(?:\||$)", s)
+                return (m.group(1) if m else "").strip()
+
+            dns_host, dns_want, dns_got = (_kv(ncsi_conf, "DNSHOST"),
+                                            _kv(ncsi_conf, "DNSWANT"), _kv(ncsi_conf, "DNSGOT"))
+            web_host, web_want, web_got = (_kv(ncsi_conf, "WEBHOST"),
+                                            _kv(ncsi_conf, "WEBWANT"), _kv(ncsi_conf, "WEBGOT"))
+            dns_probe_ok = bool(dns_want) and dns_want == dns_got
+            web_probe_ok = bool(web_want) and web_want in web_got
+            section(fh, "NCSI connectivity (Get-NetConnectionProfile)", conn_profile,
+                    ("PASS — Windows reports Internet connectivity"
+                     if ncsi_ok else
+                     "FAIL — Windows does NOT report Internet connectivity "
+                     "(IPv4Connectivity is LocalNetwork/NoTraffic/Subnet). Every component "
+                     "gating on connectivity level — Windows Spotlight, Store, Widgets, Teams "
+                     "presence — will silently stop refreshing. See the two probe checks below."))
+            step(ncsi_ok,
+                 "Windows reports Internet connectivity (NCSI)" if ncsi_ok else
+                 "Windows does NOT report Internet connectivity (NCSI) — Spotlight/Store/"
+                 "Widgets will silently stop refreshing")
+            section(fh, "NCSI DNS probe",
+                    f"{dns_host}: want '{dns_want}', got '{dns_got or '(none)'}'",
+                    ("PASS — matches exactly" if dns_probe_ok else
+                     "FAIL — fakeip answers this instead of the literal constant NCSI expects "
+                     "(see _ncsi_dns_probe's predefined DNS rule in _render_config)."))
+            section(fh, "NCSI web probe",
+                    f"http://{web_host}: want body '{web_want}', got '{web_got or '(none)'}'",
+                    ("PASS — matches" if web_probe_ok else
+                     "FAIL — request bypasses any proxy setting (.Proxy=$null, matching how "
+                     "NlaSvc itself probes) and is captured by the TUN; without the port-80 "
+                     "route rule sending it to the local forward-proxy, sing-box's CONNECT-only "
+                     "outbound gets 403'd by the corporate proxy on :80."))
+
+            # ── NCSI fallback: LAST RESORT, only if the real fix (above) still isn't
+            # enough — e.g. a probe host/path retargeted by policy in a way the port-80
+            # rule and DNS predefined-answer rule don't anticipate, or an NlaSvc quirk
+            # on a specific Windows build. Tells NlaSvc to stop actively probing and
+            # fall back to passive detection (reports Internet once real traffic is
+            # flowing) instead of trying to make the probe itself succeed. Gated on
+            # config so it can be disabled; restored on stop() alongside the other
+            # takeovers. Never runs when the real fix already worked.
+            if not ncsi_ok and getattr(self.config, "ncsi_fallback", True):
+                try:
+                    from core import ncsi
+                    if ncsi.suppress_active_probing():
+                        self._log("NCSI still reports no internet after the real fix; "
+                                  "applying the last-resort fallback (EnableActiveProbing=0) "
+                                  "— restored on stop.", "warning")
+                        time.sleep(2)   # give NlaSvc a moment to re-evaluate passively
+                        conn_profile_2 = self._ps(
+                            "Get-NetConnectionProfile | Select-Object InterfaceAlias,"
+                            "IPv4Connectivity | Format-Table -Auto | Out-String")
+                        ncsi_ok = bool(re.search(r"\bInternet\b", conn_profile_2))
+                        section(fh, "NCSI fallback (EnableActiveProbing=0)", conn_profile_2,
+                                ("PASS — Windows now reports Internet connectivity after the "
+                                 "fallback" if ncsi_ok else
+                                 "WARN — applied the fallback but Windows still does not report "
+                                 "Internet connectivity; NCSI may need more time, or something "
+                                 "else is blocking passive detection."))
+                        step(ncsi_ok,
+                             "NCSI fallback applied — Windows now reports Internet connectivity"
+                             if ncsi_ok else
+                             "NCSI fallback applied but connectivity still not reported")
+                except Exception as e:
+                    self._log(f"Could not apply the NCSI fallback: {e}", "warning")
+
             # ── End-to-end capture probe ──
             section(fh, "Capture probe (TCP 443 → example.com)", self._ps(
                 "$r=Test-NetConnection -ComputerName example.com -Port 443 "
@@ -1586,20 +1781,21 @@ class SingBoxController:
                 m = re.search(r":(\d+)\s+using outbound", ln)
                 if m:
                     denied_ports.add(int(m.group(1)))
-            # Port 80 is EXPECTED to be refused by many corporate proxies — that is
-            # exactly why core/local_proxy.py exists — and traffic on :80 already has
-            # a working path outside sing-box's own CONNECT. A :80 refusal shows up
-            # in the log on every healthy box (e.g. msftconnecttest.com), so it is
-            # excluded here to avoid a false alarm on installs that are working fine.
-            significant_denied = sorted(p for p in denied_ports if p != 80)
+            # Port 80 USED to be excluded here as "expected" — core/local_proxy.py
+            # handled it, but only for proxy-aware apps reading the http= system-
+            # proxy entry. Since the port-80 sing-box route rule (v2.2.1) now sends
+            # ALL TUN-captured :80 traffic direct to that same local forward-proxy
+            # BEFORE it ever reaches this CONNECT-only outbound, a :80 refusal here
+            # can no longer be routine — it means something upstream of proxy-out
+            # (a bypassed host, a manual routing override) is still hitting CONNECT
+            # on :80, which is worth surfacing rather than silently swallowing.
+            significant_denied = sorted(denied_ports)
             connect_denied = bool(significant_denied)
             section(fh, "Proxy CONNECT policy (upstream refusals, distinct from unreachable)",
                     ("Denied ports seen in the recent sing-box log: "
                      + ", ".join(str(p) for p in sorted(denied_ports))
                      if denied_ports else
-                     "No CONNECT refusals seen in the recent log.")
-                    + ("\n(port 80 excluded below — already handled by the local "
-                       "forward-proxy; see core/local_proxy.py)" if 80 in denied_ports else ""),
+                     "No CONNECT refusals seen in the recent log."),
                     ("WARN — the upstream proxy is reachable but refuses CONNECT on "
                      + ", ".join(str(p) for p in significant_denied)
                      + ". Those ports can never be tunnelled through this proxy; add the "
@@ -1777,6 +1973,14 @@ class SingBoxController:
                            "should have granted this automatically — check for an Access Denied "
                            "error in the log (requires elevation, which ProxyForce should already "
                            "have).")
+            elif not ncsi_ok:
+                verdict = ("NO INTERNET (NCSI) — Windows itself believes it has no internet "
+                           "(IPv4Connectivity is not 'Internet'), even though capture/DNS/the proxy "
+                           "takeover all work. Every component that gates on connectivity level — "
+                           "Windows Spotlight/lock-screen images, Microsoft Store, Widgets, Teams "
+                           "presence — silently stops refreshing with no visible error. See the "
+                           "NCSI connectivity / DNS probe / web probe sections for which of NlaSvc's "
+                           "own probes is failing.")
             elif problems:
                 verdict = "PARTIAL — engine mostly healthy; see the WARN lines in diagnostics.txt."
             else:
@@ -1792,7 +1996,7 @@ class SingBoxController:
 
         bad = (not adapter_present) or (not routes_ok) or (not fakeip_ok) or \
               (not unspec_ok) or (not proxy_reachable) or connect_denied or \
-              (not ep_ok) or (not uwp_ok) or competing or bool(problems)
+              (not ep_ok) or (not uwp_ok) or (not ncsi_ok) or competing or bool(problems)
         self._log(f"DIAG: {verdict}  (full report: "
                   r"%ProgramData%\ProxyForce\diagnostics.txt — please paste it back)",
                   "warning" if bad else "info")

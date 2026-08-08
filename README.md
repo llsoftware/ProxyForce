@@ -44,6 +44,15 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
   Loopback/intranet and your bypass list stay direct. The TUN remains the catch-all for
   apps that ignore proxy settings. The original is snapshotted to
   `C:\ProgramData\ProxyForce\proxy_backup.json`, so it's restored even after a crash.
+- **Plaintext HTTP captured by the TUN is also handled**, not just the proxy-aware
+  half above. Anything that ignores Windows' proxy setting entirely — Windows' own
+  connectivity check (NCSI), WPAD auto-discovery, or any app hardcoded to bypass
+  proxy config — has its port-80 traffic redirected into the same local forward-proxy
+  by a sing-box route rule. Without this, NCSI's own probe got **403**'d by the
+  corporate proxy the same way the Edge updater did, and Windows concluded it had
+  **no internet** (`IPv4Connectivity: LocalNetwork`) — silently stopping Windows
+  Spotlight, Microsoft Store, Widgets, and anything else that gates on connectivity
+  level from refreshing. See **Troubleshooting → Windows Spotlight** below.
 - **IPv6 is suppressed** (AAAA answered with NODATA) so dual-stack apps fall back to
   IPv4 → fakeip → proxy. The TUN is IPv4-only by design (avoids a Windows 10 IPv6
   crash); suppressing AAAA is what stops IPv6 from leaking around the proxy.
@@ -274,6 +283,40 @@ It should list every installed package (~100+, including
 again after Stop. An empty list while ProxyForce is ACTIVE means the sweep failed —
 most likely ProxyForce lost elevation (see "Redirect won't start" above for the UAC
 check) or ran before it, since `CheckNetIsolation -a` itself requires admin.
+
+**Windows Spotlight / lock screen images don't update while ProxyForce is running**
+This is a symptom of Windows itself believing it has **no internet**, not a Spotlight
+problem — `ContentDeliveryManager` (and Microsoft Store, Widgets, Teams presence, and
+anything else that checks connectivity level) silently stops refreshing content when
+that happens, with no visible error anywhere.
+
+The cause is Windows' own connectivity check, **NCSI**: it makes two probes — a DNS
+lookup and an HTTP request — that both bypass the Windows system proxy setting
+entirely (NCSI runs as a system service and never honors WinINET/WinHTTP). Before the
+port-80 route rule and the DNS fix below existed, NCSI's DNS probe got a fakeip
+address instead of the literal answer it requires, and its HTTP probe got the same
+**403** the Microsoft Edge updater used to get on plaintext port 80 — so Windows
+concluded `IPv4Connectivity: LocalNetwork` ("no internet") even while everything else
+worked fine.
+
+**Diagnose:**
+```powershell
+Get-NetConnectionProfile | Select-Object InterfaceAlias, IPv4Connectivity
+```
+`Internet` is healthy; `LocalNetwork`/`NoTraffic`/`Subnet` means Windows agrees with
+the symptom. `diagnostics.txt`'s **"NCSI connectivity"** / **"NCSI DNS probe"** /
+**"NCSI web probe"** sections (and a `NO INTERNET (NCSI)` verdict) show exactly which
+probe is failing.
+
+**Fix:** ProxyForce answers NCSI's DNS probe with the exact literal it expects and
+routes its HTTP probe into the same local forward-proxy that already fixes the Edge
+updater, so both probes succeed and Windows reports `Internet` normally — no action
+needed on a current version. If diagnostics still shows `NO INTERNET (NCSI)`
+afterward (an unusual probe host/path retargeted by policy, or an NlaSvc quirk on a
+specific Windows build), ProxyForce falls back to telling NlaSvc to stop actively
+probing (`EnableActiveProbing=0`, restored on Stop) so passive detection reports
+`Internet` once real traffic is flowing instead. Disable that fallback in Settings if
+you'd rather leave NCSI's own probing behavior untouched.
 
 **Outlook (or another mail client) can't connect while ProxyForce is running**
 Many corporate proxies permit HTTP `CONNECT` only to **:443** and refuse every

@@ -379,6 +379,9 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._check(s3, "exclude_private",
                     "Bypass private IP ranges (RFC1918 / ULA / link-local)")
         self._check(s3, "exclude_loopback", "Bypass loopback (127.x / ::1)")
+        self._check(s3, "ncsi_fallback",
+                    "NCSI fallback — last resort if Windows still reports \"no "
+                    "internet\" (breaks Spotlight/Store) after the real fix")
         self._lbl(s3, "Bypass List  —  one entry per line: hostname, *.hostname, "
                       "or CIDR. No scheme, port or path — routed DIRECT for any "
                       "protocol/port, e.g. mail hosts on 993/465/587.")
@@ -1001,7 +1004,7 @@ class ProxyForceApp(ctk.CTk):
     # update_*) are intentionally excluded so they never cause a disconnect.
     _PROXY_FIELDS = ("host", "port", "auth_type", "username", "password",
                      "exclude_private", "exclude_loopback", "bypass_list",
-                     "log_level")
+                     "log_level", "ncsi_fallback")
 
     def _proxy_settings_changed(self, vals: dict) -> bool:
         """True if any proxy-affecting field in `vals` differs from the config the

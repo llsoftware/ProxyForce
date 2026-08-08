@@ -129,6 +129,46 @@ class ForwardGetTests(unittest.TestCase):
         # the upstream response reached the client
         self.assertTrue(body.endswith(b"hi"), body)
 
+    def test_origin_form_request_is_normalized_to_absolute_form(self):
+        """v2.2.1: a TUN-redirected client (NCSI, WPAD) doesn't know it's talking
+        to a proxy, so it sends origin-form (GET /path + Host: header) rather than
+        the absolute-form a proxy-aware client sends. A forward proxy can't relay
+        origin-form upstream as-is — it has no notion of "this socket's original
+        destination" — so it must be rebuilt into absolute-form first."""
+        def responder(conn, head, overflow):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi")
+
+        up = _FakeUpstream(responder)
+        self.addCleanup(up.close)
+        shim = LocalForwardProxy("127.0.0.1", up.port)
+        port = shim.start()
+        self.addCleanup(shim.stop)
+
+        c = _client_to(port)
+        c.sendall(b"GET /connecttest.txt HTTP/1.1\r\n"
+                  b"Host: www.msftconnecttest.com\r\n"
+                  b"Accept: */*\r\n\r\n")
+        body = _recv_all(c)
+        c.close()
+
+        head = up.captured_head.decode("latin1")
+        self.assertTrue(
+            head.startswith("GET http://www.msftconnecttest.com/connecttest.txt HTTP/1.1\r\n"),
+            head)
+        self.assertIn("Host: www.msftconnecttest.com", head)
+        self.assertTrue(body.endswith(b"hi"), body)
+
+    def test_origin_form_without_host_header_returns_400(self):
+        shim = LocalForwardProxy("127.0.0.1", 1)  # never dialed — should reject first
+        port = shim.start()
+        self.addCleanup(shim.stop)
+
+        c = _client_to(port)
+        c.sendall(b"GET /connecttest.txt HTTP/1.0\r\n\r\n")
+        resp = _recv_all(c)
+        c.close()
+        self.assertIn(b"400", resp)
+
     def test_no_auth_when_no_credentials(self):
         def responder(conn, head, overflow):
             conn.sendall(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")

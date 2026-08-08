@@ -25,6 +25,21 @@ HOW IT IS WIRED (see singbox_controller._takeover_system_proxy):
   CONNECT is ALSO handled here (relayed upstream as CONNECT) purely as a safety net,
   in case an app ignores the protocol split and sends everything to the http= entry.
 
+  v2.2.1: a sing-box route rule ALSO redirects TUN-captured port-80 TCP here
+  (override_address/override_port on the `network:tcp, port:80` rule in
+  singbox_controller._render_config) — diagnosed 2026-08-07: NCSI (Windows'
+  connectivity check) and WPAD ignore the WinINET/WinHTTP proxy split entirely, so
+  their port-80 requests were captured by the TUN and sent to sing-box's CONNECT-only
+  outbound instead, which 403'd. That left Windows believing it had no internet
+  (IPv4Connectivity=LocalNetwork), which silently starved Windows Spotlight, Store,
+  Widgets, and anything else gating on connectivity level. A TUN-redirected client
+  was never told it's talking to a proxy, so it sends ORIGIN-form
+  (`GET /path HTTP/1.1` + `Host: header`) rather than the ABSOLUTE-form a proxy-aware
+  client sends (`GET http://host/path HTTP/1.1`) — _do_forward normalizes the former
+  into the latter before relaying upstream. The two shapes are unambiguous (an
+  origin-form target always starts with "/"), so one listener serves both callers
+  with no separate port and no flag.
+
 NOTES:
   * Binds 127.0.0.1 only — never exposed off-box.
   * Its socket to the corporate proxy follows the /32 "direct" route the engine pins
@@ -157,10 +172,30 @@ class LocalForwardProxy:
     # ── plaintext HTTP: relay as a forward-proxy request ─────────────────────────
 
     def _do_forward(self, client: socket.socket, head: bytes, overflow: bytes):
-        """Relay `GET http://host/path …` to the upstream proxy verbatim, but strip
-        the client's hop-by-hop proxy headers and inject OUR Proxy-Authorization."""
+        """Relay a forward-proxy GET to the upstream proxy, but strip the client's
+        hop-by-hop proxy headers and inject OUR Proxy-Authorization. Accepts both
+        ABSOLUTE-form (`GET http://host/path …`, from a proxy-aware client reading
+        the http= system-proxy entry) and ORIGIN-form (`GET /path …` + `Host:`,
+        from a client the TUN's port-80 route rule redirected here without its
+        knowledge — see the module docstring). Origin-form is normalized to
+        absolute-form before anything downstream runs, since a forward proxy has
+        no notion of "this socket's original destination" otherwise."""
         lines = head.split(b"\r\n")
         request_line = lines[0]
+        rl_parts = request_line.split(b" ")
+        if len(rl_parts) >= 3 and rl_parts[1].startswith(b"/"):
+            host_hdr = next((h.split(b":", 1)[1].strip() for h in lines[1:]
+                             if h.lower().startswith(b"host:")), None)
+            if not host_hdr:
+                try:
+                    client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+                except Exception:
+                    pass
+                self._log("local proxy: origin-form request with no Host header "
+                          f"({rl_parts[1]!r}); dropped.", "debug")
+                return
+            rl_parts[1] = b"http://" + host_hdr + rl_parts[1]
+            request_line = b" ".join(rl_parts)
         rebuilt = [request_line]
         for h in lines[1:]:
             if not h:

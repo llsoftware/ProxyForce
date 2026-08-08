@@ -39,6 +39,8 @@ _DEFAULTS = {
     "exclude_private": True,
     "exclude_loopback": True,
     "bypass_list": [],
+    "ncsi_fallback": True,   # last-resort EnableActiveProbing=0 if NCSI still reports
+                             # no internet after the port-80/DNS fixes (core.ncsi)
     "autostart": False,
     "start_minimized": False,
     "log_level": "info",

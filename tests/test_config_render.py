@@ -27,6 +27,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from core import singbox_controller
 from core.singbox_controller import SingBoxController, ProxyConfig, normalize_bypass_entry
 
 
@@ -134,10 +135,11 @@ class IPv6LeakGuardTests(unittest.TestCase):
         self.assertNotIn("answer", r, "must return NODATA — no answer records")
 
     def test_a_still_goes_to_fakeip(self):
-        """The IPv4 path that actually works must remain: A → fakeip."""
-        a = [r for r in _rules() if r.get("query_type") == ["A"]]
+        """The IPv4 path that actually works must remain: A → fakeip. There is a
+        second query_type=["A"] rule now (the NCSI predefined-answer rule, see
+        NcsiFixTests) so this filters specifically for the fakeip server."""
+        a = [r for r in _rules() if r.get("query_type") == ["A"] and r.get("server") == "fakeip"]
         self.assertEqual(len(a), 1)
-        self.assertEqual(a[0].get("server"), "fakeip")
 
     def test_bypass_domains_stay_on_fakeip(self):
         """v2.2.0 (diagnosed 2026-08-07, Outlook IMAPS/SMTPS): bypass domains must
@@ -152,9 +154,76 @@ class IPv6LeakGuardTests(unittest.TestCase):
         rules = _rules(bypass_list=["intranet.local"])
         self.assertFalse(any("domain_suffix" in r for r in rules),
                           "no dns.rules entry may key off bypass domains")
-        self.assertEqual(len(rules), 2,
-                          "exactly the AAAA-NODATA and A-fakeip rules, regardless "
-                          "of the bypass list")
+        self.assertEqual(len(rules), 3,
+                          "exactly the AAAA-NODATA, NCSI predefined-answer, and "
+                          "A-fakeip rules, regardless of the bypass list")
+
+
+class NcsiFixTests(unittest.TestCase):
+    """v2.2.1 (diagnosed 2026-08-07): Windows' NCSI (Network Connectivity Status
+    Indicator) decides whether the OS itself believes it has internet
+    (Get-NetConnectionProfile's IPv4Connectivity). Its DNS probe requires an EXACT
+    literal answer that fakeip can't provide, and its web probe ignores the
+    WinINET/WinHTTP proxy split entirely so it was being captured by the TUN and
+    403'd by sing-box's CONNECT-only outbound. Both failures made Windows report
+    "no internet", which silently starved everything gating on connectivity level
+    (Windows Spotlight, Store, Widgets, Teams presence) with no visible error."""
+
+    def setUp(self):
+        self._orig = singbox_controller._ncsi_dns_probe
+        singbox_controller._ncsi_dns_probe = lambda: ("probe.example", "203.0.113.99")
+
+    def tearDown(self):
+        singbox_controller._ncsi_dns_probe = self._orig
+
+    def test_ncsi_predefined_rule_present_between_aaaa_and_fakeip(self):
+        rules = _rules()
+        aaaa_idx = next(i for i, r in enumerate(rules) if r.get("query_type") == ["AAAA"])
+        fakeip_idx = next(i for i, r in enumerate(rules)
+                          if r.get("query_type") == ["A"] and r.get("server") == "fakeip")
+        ncsi_idx = next(i for i, r in enumerate(rules) if r.get("domain") == ["probe.example"])
+        self.assertLess(aaaa_idx, ncsi_idx)
+        self.assertLess(ncsi_idx, fakeip_idx)
+
+    def test_ncsi_predefined_rule_answers_the_exact_literal(self):
+        rules = _rules()
+        r = next(r for r in rules if r.get("domain") == ["probe.example"])
+        self.assertEqual(r.get("action"), "predefined")
+        self.assertEqual(r.get("answer"), ["probe.example. IN A 203.0.113.99"])
+
+    def test_port80_route_rule_present_and_targets_local_forward_proxy(self):
+        cfg = ProxyConfig(host="203.0.113.10", port=800)
+        c = SingBoxController(cfg)
+        c._http_proxy_port = 55123
+        rules = c._render_config(12345)["route"]["rules"]
+        r = next(r for r in rules if r.get("port") == 80 and r.get("network") == "tcp")
+        self.assertEqual(r.get("action"), "route")
+        self.assertEqual(r.get("outbound"), "direct")
+        self.assertEqual(r.get("override_address"), "127.0.0.1")
+        self.assertEqual(r.get("override_port"), 55123)
+
+    def test_port80_route_rule_precedes_udp_reject_and_follows_direct_rules(self):
+        rules = _route_rules(bypass_list=["intranet.local"])
+        port80_idx = next(i for i, r in enumerate(rules)
+                          if r.get("port") == 80 and r.get("network") == "tcp")
+        udp_reject_idx = next(i for i, r in enumerate(rules)
+                              if r.get("network") == "udp" and r.get("action") == "reject")
+        bypass_domain_idx = next(i for i, r in enumerate(rules)
+                                 if r.get("domain_suffix") == ["intranet.local"])
+        self.assertLess(port80_idx, udp_reject_idx)
+        self.assertLess(bypass_domain_idx, port80_idx)
+
+    def test_proxy_ip_guard_covers_resolved_hostname_ip_too(self):
+        """When cfg.host is a hostname, start() pre-resolves it into
+        _proxy_connect_host before fakeip hijacks DNS. That resolved IP must ALSO
+        be excluded from the port-80 redirect, or the local forward-proxy's own
+        upstream socket to a hostname-configured proxy could loop into itself."""
+        cfg = ProxyConfig(host="proxy.corp.local", port=800)
+        c = SingBoxController(cfg)
+        c._proxy_connect_host = "203.0.113.55"
+        rules = c._render_config(12345)["route"]["rules"]
+        r = next(r for r in rules if r.get("ip_cidr") == ["203.0.113.55/32"])
+        self.assertEqual(r.get("outbound"), "direct")
 
 
 class DnsHijackFallbackTests(unittest.TestCase):
