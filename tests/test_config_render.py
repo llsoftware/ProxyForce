@@ -6,6 +6,14 @@ AAAA queries resolve to real IPv6 addresses leaks all dual-stack traffic around
 the proxy (browsers prefer IPv6 via Happy Eyeballs). The generated DNS rules
 must answer AAAA with NODATA so apps fall back to the A → fakeip → proxy path.
 
+A close second is bypass-domain routing (v2.2.0): a Bypass List hostname must
+route DIRECT deterministically for ANY TCP protocol/port, not just ones sing-box
+can sniff a hostname off of. That means bypass domains stay on fakeip (see
+IPv6LeakGuardTests.test_bypass_domains_stay_on_fakeip) rather than getting real
+DNS, and each entry must be normalized before it reaches sing-box's
+domain_suffix matcher — a raw "*.example.com" or "example.com:993" is valid
+JSON but matches nothing.
+
 The schema itself is validated against the real sing-box binary by main.py's
 --selftest step in CI; these tests guard the *intent* so the rule can't be
 quietly dropped or mis-ordered.
@@ -19,7 +27,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core.singbox_controller import SingBoxController, ProxyConfig
+from core.singbox_controller import SingBoxController, ProxyConfig, normalize_bypass_entry
 
 
 def _rules(bypass_list=None):
@@ -131,17 +139,22 @@ class IPv6LeakGuardTests(unittest.TestCase):
         self.assertEqual(len(a), 1)
         self.assertEqual(a[0].get("server"), "fakeip")
 
-    def test_bypass_domains_keep_real_resolution_before_aaaa_rule(self):
-        """Bypass-domain rule must precede the AAAA rule so those keep real AAAA."""
+    def test_bypass_domains_stay_on_fakeip(self):
+        """v2.2.0 (diagnosed 2026-08-07, Outlook IMAPS/SMTPS): bypass domains must
+        NOT get a real-DNS rule. Real resolution destroys the fakeip -> domain
+        reverse map, leaving the route-side domain_suffix direct rule dependent on
+        sniffing a hostname off the wire — which fails for server-speaks-first
+        protocols (SMTP/587 STARTTLS) and clients that omit SNI, so the exception
+        was silently never taken and the corporate proxy 403'd the CONNECT.
+        Keeping bypass domains on fakeip makes the route rule match
+        deterministically for ANY protocol/port; the `direct` outbound resolves
+        the real IP itself via route.default_domain_resolver."""
         rules = _rules(bypass_list=["intranet.local"])
-        bypass_idx = next(i for i, r in enumerate(rules)
-                          if r.get("domain_suffix") == ["intranet.local"])
-        aaaa_idx = next(i for i, r in enumerate(rules)
-                        if r.get("query_type") == ["AAAA"])
-        self.assertLess(bypass_idx, aaaa_idx,
-                        "bypass domains must match before AAAA is suppressed")
-        # The bypass rule has no query_type filter → matches A and AAAA alike.
-        self.assertNotIn("query_type", rules[bypass_idx])
+        self.assertFalse(any("domain_suffix" in r for r in rules),
+                          "no dns.rules entry may key off bypass domains")
+        self.assertEqual(len(rules), 2,
+                          "exactly the AAAA-NODATA and A-fakeip rules, regardless "
+                          "of the bypass list")
 
 
 class DnsHijackFallbackTests(unittest.TestCase):
@@ -167,6 +180,102 @@ class DnsHijackFallbackTests(unittest.TestCase):
             if r.get("port") == 53 and r.get("action") == "hijack-dns":
                 self.assertLess(i, udp_reject_idx,
                                 "DNS hijack must precede the udp-reject rule")
+
+
+class BypassDomainRoutingTests(unittest.TestCase):
+    """v2.2.0: the route-side half of the Outlook/IMAPS/SMTPS fix — the
+    domain_suffix direct rule for bypass domains must fire for UDP too (not
+    just the sniffable TCP case), and route.default_domain_resolver must pick
+    IPv4 deterministically since dial-time resolution for the `direct` outbound
+    skips dns.rules (so the AAAA-NODATA rule doesn't apply to it)."""
+
+    def test_bypass_domain_route_rule_precedes_udp_reject(self):
+        rules = _route_rules(bypass_list=["intranet.local"])
+        bypass_idx = next(i for i, r in enumerate(rules)
+                          if r.get("domain_suffix") == ["intranet.local"])
+        udp_reject_idx = next(i for i, r in enumerate(rules)
+                              if r.get("network") == "udp" and r.get("action") == "reject")
+        self.assertLess(bypass_idx, udp_reject_idx,
+                        "a bypass domain must be routed direct before UDP is "
+                        "rejected, or UDP to a bypassed host is silently dropped")
+
+    def test_default_domain_resolver_prefers_ipv4(self):
+        route = SingBoxController(
+            ProxyConfig(host="203.0.113.10", port=800)
+        )._render_config(12345)["route"]
+        resolver = route.get("default_domain_resolver", {})
+        self.assertEqual(resolver.get("server"), "local")
+        self.assertEqual(resolver.get("strategy"), "prefer_ipv4",
+                         "dial-time resolution for the direct outbound bypasses "
+                         "dns.rules entirely, so without an explicit strategy an "
+                         "IPv6-capable box costs a Happy-Eyeballs stall per "
+                         "bypassed connection")
+
+
+class BypassEntryNormalizationTests(unittest.TestCase):
+    """v2.2.0: a Bypass List entry is free-form user input rendered into THREE
+    different syntaxes (sing-box domain_suffix, WinINET ProxyOverride, NO_PROXY).
+    Verified empirically against the bundled sing-box 1.13.12's `rule-set match`:
+    domain_suffix is label/dot-boundary aware ("scientology.net" matches its
+    subdomains but never "notscientology.net"), while "*.scientology.net" is
+    valid JSON that matches NOTHING — the exact trap this normalizer exists to
+    catch before it reaches sing-box."""
+
+    def test_wildcard_star_normalizes_to_bare_apex_form(self):
+        base, apex_included, err = normalize_bypass_entry("*.scientology.net")
+        self.assertIsNone(err)
+        self.assertEqual(base, "scientology.net")
+        self.assertTrue(apex_included, "*.host is treated as host + subdomains")
+
+    def test_leading_dot_means_subdomains_only(self):
+        base, apex_included, err = normalize_bypass_entry(".scientology.net")
+        self.assertIsNone(err)
+        self.assertEqual(base, "scientology.net")
+        self.assertFalse(apex_included)
+
+    def test_port_and_scheme_are_stripped(self):
+        for entry in ("imaps.email.scientology.net:993",
+                      "https://imaps.email.scientology.net/"):
+            base, _apex, err = normalize_bypass_entry(entry)
+            self.assertIsNone(err, f"{entry!r} should normalize cleanly")
+            self.assertEqual(base, "imaps.email.scientology.net")
+
+    def test_cidr_and_ip_pass_through_unchanged(self):
+        base, apex_included, err = normalize_bypass_entry("10.0.0.0/8")
+        self.assertIsNone(err)
+        self.assertEqual(base, "10.0.0.0/8")
+        self.assertTrue(apex_included)
+
+    def test_junk_entry_is_rejected_with_a_reason(self):
+        base, _apex, err = normalize_bypass_entry("not a host!!")
+        self.assertIsNone(base)
+        self.assertIsNotNone(err)
+
+    def test_render_config_never_emits_a_dead_wildcard_rule(self):
+        """The trap this whole class exists to catch: "*.host" must never reach
+        sing-box verbatim, since domain_suffix: ["*.host"] is valid JSON that
+        matches nothing."""
+        rules = _route_rules(bypass_list=["*.scientology.net"])
+        bypass_rules = [r for r in rules if "domain_suffix" in r]
+        self.assertEqual(len(bypass_rules), 1)
+        self.assertEqual(bypass_rules[0]["domain_suffix"], ["scientology.net"])
+
+    def test_proxy_override_gets_both_bare_and_wildcard_forms(self):
+        """WinINET ProxyOverride has NO implicit suffix matching — a bare host is
+        exact-match only, so the wildcard form must be added alongside it or
+        subdomains stay silently proxied."""
+        cfg = ProxyConfig(host="203.0.113.10", port=800,
+                          bypass_list=["scientology.net"])
+        bypass = SingBoxController(cfg)._build_proxy_bypass()
+        self.assertIn("scientology.net", bypass.split(";"))
+        self.assertIn("*.scientology.net", bypass.split(";"))
+
+    def test_no_proxy_strips_wildcard_and_keeps_dot_boundary_form(self):
+        cfg = ProxyConfig(host="203.0.113.10", port=800,
+                          bypass_list=["*.scientology.net"])
+        no_proxy = SingBoxController(cfg)._build_no_proxy().split(",")
+        self.assertIn("scientology.net", no_proxy)
+        self.assertNotIn("*.scientology.net", no_proxy)
 
 
 class NoProxyBypassConsistencyTests(unittest.TestCase):

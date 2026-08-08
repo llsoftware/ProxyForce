@@ -20,7 +20,10 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE_DIR, ".."))
 
 from core.config_store import load_config, save_config, save_autostart
-from core.singbox_controller import SingBoxController, SingBoxState, make_proxy_config
+from core.singbox_controller import (
+    SingBoxController, SingBoxState, make_proxy_config, normalize_bypass_entry,
+    probe_connect, _CONNECT_PROBE_PORTS,
+)
 from core import updater
 from core._version import __version__ as _PF_VERSION
 
@@ -376,7 +379,9 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._check(s3, "exclude_private",
                     "Bypass private IP ranges (RFC1918 / ULA / link-local)")
         self._check(s3, "exclude_loopback", "Bypass loopback (127.x / ::1)")
-        self._lbl(s3, "Bypass List  —  one entry per line, CIDR or hostname")
+        self._lbl(s3, "Bypass List  —  one entry per line: hostname, *.hostname, "
+                      "or CIDR. No scheme, port or path — routed DIRECT for any "
+                      "protocol/port, e.g. mail hosts on 993/465/587.")
         self._bypass_frame = tk.Frame(s3, bg=cc("input_bg"))
         self._bypass_frame.pack(fill="x", pady=(0, 4))
         self._bypass_text = tk.Text(
@@ -450,7 +455,25 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         except (ValueError, TypeError):
             d["update_hour"] = 3
         raw = self._bypass_text.get("1.0", "end").strip() if self._bypass_text else ""
-        d["bypass_list"] = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        entries = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        # Normalize each line NOW (same rules the engine applies) so the box
+        # visibly rewrites to what will actually be used, and junk that could
+        # never match (a scheme, a stray :port, "*host" without the dot) is
+        # caught at Save time instead of silently doing nothing at runtime.
+        normalized = []
+        self._bypass_warnings = []
+        for entry in entries:
+            base, apex_included, err = normalize_bypass_entry(entry)
+            if err:
+                self._bypass_warnings.append(err)
+                continue
+            if base is None:
+                continue
+            normalized.append(base if apex_included or "/" in base else f".{base}")
+        if self._bypass_text and normalized != entries:
+            self._bypass_text.delete("1.0", "end")
+            self._bypass_text.insert("1.0", "\n".join(normalized))
+        d["bypass_list"] = normalized
         return d
 
     def set_values(self, d: dict):
@@ -946,6 +969,8 @@ class ProxyForceApp(ctk.CTk):
 
     def _save_config(self):
         vals = self._settings_panel.get_values()
+        for w in getattr(self._settings_panel, "_bypass_warnings", []):
+            self._log(w, "warning")
         vals["appearance"] = _APPEARANCE_MAP.get(self._theme_var.get(), "system")
         if not save_config(vals):
             messagebox.showerror("ProxyForce",
@@ -1066,6 +1091,16 @@ class ProxyForceApp(ctk.CTk):
             return
         self._log(f"Testing {vals['host']}:{vals['port']}…", "info")
 
+        # Probe target: the first Bypass List host if the user has one (so the
+        # CONNECT matrix below tests the exact host they're trying to reach),
+        # else a generic well-known name.
+        probe_target = "example.com"
+        for entry in (vals.get("bypass_list") or []):
+            base, _apex, err = normalize_bypass_entry(entry)
+            if base and "/" not in base:
+                probe_target = base
+                break
+
         def do_test():
             try:
                 s = socket.create_connection(
@@ -1076,6 +1111,30 @@ class ProxyForceApp(ctk.CTk):
                     "success"))
             except Exception as e:
                 self._queue.put(("log", f"✗ Cannot reach proxy: {e}", "error"))
+                return
+
+            # A bare TCP connect above only proves the proxy answers on its own
+            # port — it says nothing about which CONNECT ports its POLICY allows.
+            # Many corporate proxies permit CONNECT only to :443 and 403 every
+            # other port (diagnosed 2026-08-07: this is exactly why Outlook's
+            # IMAPS/SMTPS couldn't connect while ProxyForce ran, and why the old
+            # version of this test could never have caught it).
+            self._queue.put(("log", f"Probing CONNECT policy via {probe_target}…", "info"))
+            for port in _CONNECT_PROBE_PORTS:
+                code, reason = probe_connect(
+                    vals["host"], vals["port"], probe_target, port,
+                    username=(vals.get("username") or "") if vals.get("auth_type") == "basic" else "",
+                    password=vals.get("password") or "")
+                if code == 200:
+                    self._queue.put(("log",
+                        f"✓ CONNECT :{port} → 200 {reason}".rstrip(), "success"))
+                elif code:
+                    self._queue.put(("log",
+                        f"✗ CONNECT :{port} → {code} {reason} — this port cannot be "
+                        f"tunnelled; put the destination host in the Bypass List",
+                        "error"))
+                else:
+                    self._queue.put(("log", f"✗ CONNECT :{port} → {reason}", "error"))
 
         threading.Thread(target=do_test, daemon=True).start()
 

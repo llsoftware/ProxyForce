@@ -275,6 +275,31 @@ again after Stop. An empty list while ProxyForce is ACTIVE means the sweep faile
 most likely ProxyForce lost elevation (see "Redirect won't start" above for the UAC
 check) or ran before it, since `CheckNetIsolation -a` itself requires admin.
 
+**Outlook (or another mail client) can't connect while ProxyForce is running**
+Many corporate proxies permit HTTP `CONNECT` only to **:443** and refuse every
+other port with a **403** — the same restriction documented above for the
+Microsoft Edge updater on plaintext :80, except there is no forward-proxy
+workaround for IMAPS/SMTPS: mail isn't HTTP, so it can't be relayed as a `GET`.
+If your proxy has this policy, ports **993** (IMAPS), **465**/**587** (SMTPS) can
+**never** be tunnelled through it — that host must be routed **DIRECT** instead:
+
+1. Settings ▸ **Bypass List** ▸ add the mail server hostname(s), e.g.
+   `imaps.example.com` and `smtps.example.com` (one per line — CIDRs and
+   `*.example.com` wildcards work too). Save; ProxyForce restarts to apply it.
+2. **Fully exit** the mail client (check Task Manager, not just the window) and
+   relaunch — it must re-resolve and re-connect on the new rules, not reuse a
+   connection it made before the change.
+3. Settings ▸ **Test Proxy** now sends a real `CONNECT` on :443/:80/:993/:465/:587
+   and reports each port's actual status — a `403` there tells you definitively
+   this proxy refuses that port, rather than a bare "reachable" that says nothing
+   about policy. `diagnostics.txt`'s **"Proxy CONNECT policy"** section and a
+   `PROXY CONNECT POLICY` verdict report the same thing after the fact, sourced
+   from sing-box's own log.
+
+If the mail server isn't reachable at all without ProxyForce running either,
+this won't help — bypassing only works for hosts your network can already
+reach directly.
+
 **407 Proxy Authentication Required**
 Wrong credentials or auth type. Open Settings and check username/password/auth type.
 

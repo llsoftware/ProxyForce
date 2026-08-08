@@ -25,9 +25,11 @@ Stats come from sing-box's Clash API (/connections, /traffic) on a loopback port
 """
 
 import os
+import re
 import sys
 import json
 import time
+import base64
 import socket
 import ctypes
 import threading
@@ -259,6 +261,109 @@ def _looks_like_cidr_or_ip(entry: str) -> Optional[str]:
         return None
 
 
+# Bare hostname (or one hostname label with a leading "." stripped) — no scheme,
+# no port, no path, no leading/trailing dot. Validated empirically against
+# sing-box 1.13.12's `domain_suffix` matcher (see tests/test_config_render.py):
+# label/dot-boundary aware, so "scientology.net" never over-matches
+# "notscientology.net".
+_BYPASS_HOST_RE = re.compile(
+    r"^(?!-)[a-z0-9-]{1,63}(?<!-)(\.(?!-)[a-z0-9-]{1,63}(?<!-))*$")
+
+
+def normalize_bypass_entry(entry: str):
+    """Normalize one Bypass List line into (base, apex_included, error).
+
+    `base` is either a CIDR/IP string (unchanged) or a bare lowercase hostname
+    with scheme/port/path/wildcard stripped — the one form every consumer
+    (sing-box `domain_suffix`, WinINET `ProxyOverride`, `NO_PROXY`) renders
+    from, so the three can never drift on syntax.
+
+    `apex_included` is False only for an explicit leading-dot entry
+    (".example.com"), meaning "subdomains only". Every other form — a bare
+    host, or "*.example.com" — is treated as "this domain AND its subdomains":
+    that's what a user adding an exception almost always means, and a strict
+    subdomains-only default would leave the bare apex silently still proxied.
+
+    `error` is a user-facing string for anything that isn't a parseable
+    IP/CIDR/hostname (returned with base=None) so the caller can drop the
+    entry and warn instead of silently emitting a rule that can never match —
+    e.g. "imaps.example.com:993" as a literal `domain_suffix` string, which
+    `sing-box check` accepts but which matches nothing.
+    """
+    raw = (entry or "").strip()
+    if not raw:
+        return None, True, None                      # blank line: silently ignore
+    cidr = _looks_like_cidr_or_ip(raw)                # test the ORIGINAL first,
+    if cidr:                                          # so "10.0.0.0/8" survives untouched
+        return cidr, True, None
+    e = re.sub(r"^[a-z][a-z0-9+.\-]*://", "", raw, flags=re.I)   # scheme, e.g. "https://"
+    e = e.split("/", 1)[0]                                       # path
+    e = e.rsplit("@", 1)[-1]                                     # userinfo
+    e = e.strip().lower()
+    e = re.sub(r":\d+$", "", e)                                  # :993 / :465 / :587
+    apex_included = True
+    if e.startswith("."):
+        apex_included = False
+        e = e[1:]
+    elif e.startswith("*."):
+        e = e[2:]
+    e = e.strip(".")
+    if not e:
+        return None, True, f"bypass entry ignored (empty after normalization): {raw!r}"
+    cidr = _looks_like_cidr_or_ip(e)                  # e.g. "https://10.1.2.3/"
+    if cidr:
+        return cidr, True, None
+    if not _BYPASS_HOST_RE.match(e):
+        return None, True, f"bypass entry ignored (not a hostname/IP/CIDR): {raw!r}"
+    return e, apex_included, None
+
+
+# Ports worth probing by default: :443 (should always work, the sanity check),
+# :80 (the documented Edge-updater CONNECT-refusal case), and the three mail
+# ports a corporate proxy commonly refuses CONNECT to (diagnosed 2026-08-07:
+# Outlook IMAPS/SMTPS through a proxy that only permits CONNECT on :443).
+_CONNECT_PROBE_PORTS = (443, 80, 993, 465, 587)
+
+
+def probe_connect(proxy_host, proxy_port, target_host, target_port,
+                   username="", password="", timeout=6.0):
+    """Send one real HTTP CONNECT to the upstream proxy for target_host:port and
+    return (code, reason) parsed from its status line — (0, "<error text>") if
+    the TCP connection to the proxy itself never comes up. Sends nothing beyond
+    the CONNECT request/headers and closes immediately either way; never
+    relays any actual traffic.
+
+    This is the test a bare TCP connect to the proxy (the old "Test Proxy"
+    behaviour) cannot do: a proxy that 403s every CONNECT still passes a plain
+    TCP handshake. Many corporate proxies permit CONNECT only to :443 and
+    refuse everything else by policy — the only fix for a host that needs a
+    refused port is to route it DIRECT via the Bypass List, not to keep
+    retrying the proxy."""
+    try:
+        with socket.create_connection((proxy_host, int(proxy_port)), timeout=timeout) as s:
+            s.settimeout(timeout)
+            req = (f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+                   f"Host: {target_host}:{target_port}\r\n")
+            if username:
+                token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+                req += f"Proxy-Authorization: Basic {token}\r\n"
+            req += "Proxy-Connection: keep-alive\r\n\r\n"
+            s.sendall(req.encode("ascii", "replace"))
+            buf = b""
+            while b"\r\n" not in buf and len(buf) < 1024:
+                chunk = s.recv(512)
+                if not chunk:
+                    break
+                buf += chunk
+        status_line = buf.split(b"\r\n", 1)[0].decode("latin1", "replace").strip()
+        parts = status_line.split(" ", 2)
+        if len(parts) >= 3 and parts[1].isdigit():
+            return int(parts[1]), parts[2]
+        return 0, status_line or "<no response>"
+    except Exception as e:
+        return 0, str(e)
+
+
 def make_proxy_config(cfg: dict) -> "ProxyConfig":
     """Build a ProxyConfig from a config_store dict. Used by the GUI."""
     return ProxyConfig(
@@ -318,38 +423,66 @@ class SingBoxController:
         if self.on_log:
             self.on_log(msg, level)
 
+    def _normalized_bypass(self):
+        """Normalize cfg.bypass_list ONCE, shared by _render_config,
+        _build_proxy_bypass and _build_no_proxy so the three can't drift on
+        syntax (sing-box `domain_suffix`, WinINET `ProxyOverride`, `NO_PROXY`
+        each have different wildcard/suffix rules — see normalize_bypass_entry).
+
+        Returns (cidrs, domain_suffixes, warnings). A domain that should match
+        subdomains only (the user typed a leading dot) carries that leading dot
+        into `domain_suffixes` — sing-box's domain_suffix honours it the same
+        way; the two consumer builders strip or expand it as their own syntax
+        requires.
+        """
+        cidrs: List[str] = []
+        domains: List[str] = []
+        warnings: List[str] = []
+        for entry in (self.config.bypass_list or []):
+            base, apex_included, err = normalize_bypass_entry(entry)
+            if err:
+                warnings.append(err)
+                continue
+            if base is None:
+                continue
+            if "/" in base:                       # _looks_like_cidr_or_ip always emits a CIDR
+                cidrs.append(base)
+            else:
+                domains.append(base if apex_included else f".{base}")
+        return cidrs, domains, warnings
+
     # ── config rendering ────────────────────────────────────────────────────────
 
     def _render_config(self, clash_port: int) -> dict:
         cfg = self.config
         sbdir = _singbox_dir()
 
-        # Split the bypass list into IP/CIDR entries and domain entries.
-        bypass_cidrs: List[str] = []
-        bypass_domains: List[str] = []
-        for entry in (cfg.bypass_list or []):
-            cidr = _looks_like_cidr_or_ip(entry)
-            if cidr:
-                bypass_cidrs.append(cidr)
-            elif entry.strip():
-                bypass_domains.append(entry.strip().lower())
+        bypass_cidrs, bypass_domains, _bypass_warnings = self._normalized_bypass()
 
-        # ── DNS: fakeip for everything proxied; bypass domains resolved for real ──
-        dns_rules = []
-        if bypass_domains:
-            # Internal/bypass domains resolve to their REAL IP (so the route rules
-            # below can send them DIRECT) instead of getting a fake IP. This rule
-            # has no query_type filter, so bypass domains keep BOTH A and AAAA —
-            # they go direct anyway, so real IPv6 for them is fine.
-            dns_rules.append({"domain_suffix": bypass_domains, "server": "local"})
-        # Force IPv4 for everything else: answer AAAA with NODATA (NOERROR + no
+        # ── DNS: EVERYTHING goes to fakeip, bypass domains included ──
+        # Bypass domains deliberately do NOT get real resolution here. Keeping
+        # them on fakeip preserves the fakeip -> domain reverse map, so at
+        # connect time sing-box knows the exact hostname for ANY TCP protocol on
+        # ANY port — before sniffing and independent of it — and the
+        # domain_suffix route rule below matches deterministically. Giving them
+        # real IPs instead (the old behaviour) destroyed that map and left the
+        # route rule dependent on sniffing a hostname off the wire: that works
+        # for TLS-with-SNI and HTTP Host, but FAILS for server-speaks-first
+        # protocols (SMTP/587 STARTTLS) and clients that omit SNI, so those fell
+        # through to route.final = proxy-out and the corporate proxy 403'd
+        # CONNECT on :993/:465/:587 (diagnosed 2026-08-07, Outlook/IMAPS/SMTPS).
+        # The `direct` outbound resolves the real IP itself via
+        # route.default_domain_resolver below.
+        # Force IPv4 for everything: answer AAAA with NODATA (NOERROR + no
         # records) so dual-stack apps fall back to the A record, which gets a
         # fakeip and is routed through the proxy. WITHOUT this, browsers resolve a
         # REAL IPv6 (dns.final = local) and Happy Eyeballs connects over IPv6,
         # which bypasses the IPv4-only TUN entirely — the engine runs and captures
         # IPv4-only system traffic (counters move) while the browser leaks direct.
-        dns_rules.append({"query_type": ["AAAA"], "action": "predefined", "rcode": "NOERROR"})
-        dns_rules.append({"query_type": ["A"], "server": "fakeip"})
+        dns_rules = [
+            {"query_type": ["AAAA"], "action": "predefined", "rcode": "NOERROR"},
+            {"query_type": ["A"], "server": "fakeip"},
+        ]
 
         # ── route rules ──
         route_rules = [
@@ -478,7 +611,16 @@ class SingBoxController:
             "route": {
                 "rules": route_rules,
                 "final": "proxy-out",
-                "default_domain_resolver": {"server": "local"},
+                # strategy: prefer_ipv4 — dial-time resolution for the `direct`
+                # outbound (bypass domains, now fakeip'd) skips dns.rules entirely,
+                # so the AAAA-NODATA rule above does NOT apply to it; without this
+                # it would return both A and AAAA and cost a Happy-Eyeballs stall
+                # per connection on a box with no working IPv6. prefer_ipv4 (not
+                # ipv4_only) so an IPv6-only bypassed host stays reachable.
+                # Validated: `sing-box check` rejects "prefer_ipv9" by exact field
+                # path (route.default_domain_resolver.strategy), proving this key
+                # is genuinely parsed, not silently ignored.
+                "default_domain_resolver": {"server": "local", "strategy": "prefer_ipv4"},
                 "auto_detect_interface": True,
             },
         }
@@ -529,6 +671,15 @@ class SingBoxController:
             except Exception:
                 pass
         cfg_path = self._write_config(self._clash_port)
+
+        # Surface any Bypass List entries that couldn't be normalized into a
+        # hostname/IP/CIDR — e.g. "imaps.example.com:993" — BEFORE the config is
+        # validated below. sing-box check would pass either way (a dead
+        # domain_suffix string is still valid JSON); without this the entry
+        # just silently never matches anything.
+        _cidrs, _domains, bypass_warnings = self._normalized_bypass()
+        for w in bypass_warnings:
+            self._log(w, "warning")
 
         # Validate the generated config before running — turns a malformed config
         # into a clear log line instead of a crash/restart loop.
@@ -626,7 +777,10 @@ class SingBoxController:
             self._log_fh = subprocess.DEVNULL
         try:
             self._proc = subprocess.Popen(
-                [sb, "run", "-c", cfg_path],
+                # --disable-color: singbox.log otherwise carries raw ANSI escape
+                # codes, which is why _tail_log/_tail_log_lines output looked like
+                # junk in diagnostics.txt. Not a config-file field — CLI flag only.
+                [sb, "run", "--disable-color", "-c", cfg_path],
                 cwd=sbdir,
                 stdout=self._log_fh,
                 stderr=subprocess.STDOUT,
@@ -975,24 +1129,36 @@ class SingBoxController:
         parts = ["<local>", "localhost", "127.*"]
         if getattr(cfg, "exclude_private", True):
             parts += ["10.*", "192.168.*"] + [f"172.{n}.*" for n in range(16, 32)]
-        for entry in (cfg.bypass_list or []):
-            e = entry.strip()
-            if e and not _looks_like_cidr_or_ip(e):   # ProxyOverride uses host wildcards, not CIDR
-                parts.append(e)
+        _cidrs, domains, _warnings = self._normalized_bypass()
+        for d in domains:
+            # ProxyOverride has NO implicit suffix matching — unlike sing-box's
+            # domain_suffix, a bare host here is an EXACT match only, so
+            # subdomains would silently stay proxied unless the "*.host"
+            # wildcard form is added alongside it. A ".host" (subdomains-only)
+            # entry only needs the wildcard form, not the bare one.
+            if d.startswith("."):
+                parts.append(f"*.{d[1:]}")
+            else:
+                parts.append(d)
+                parts.append(f"*.{d}")
         return ";".join(parts)
 
     def _build_no_proxy(self) -> str:
         """NO_PROXY/no_proxy for the env-var takeover: the same exclusion set as
         _build_proxy_bypass, rendered in NO_PROXY's syntax — comma-separated,
-        glob-free hosts/domains (unlike WinINET's ';'/'*' ProxyOverride)."""
+        glob-free hosts/domains (unlike WinINET's ';'/'*' ProxyOverride). NO_PROXY
+        is dot-boundary aware on its own (curl/requests/urllib already treat a
+        bare host as covering its subdomains) and has no glob support, so a
+        "*.host" bypass entry needs its wildcard stripped, and it can't express
+        "subdomains only" — a ".host" (leading-dot) entry widens to include the
+        apex here too. Documented fail-open toward MORE direct, never less."""
         cfg = self.config
         parts = ["localhost", "127.0.0.1", "::1"]
         if getattr(cfg, "exclude_private", True):
             parts += ["10.", "192.168."] + [f"172.{n}." for n in range(16, 32)]
-        for entry in (cfg.bypass_list or []):
-            e = entry.strip()
-            if e and not _looks_like_cidr_or_ip(e):
-                parts.append(e)
+        _cidrs, domains, _warnings = self._normalized_bypass()
+        for d in domains:
+            parts.append(d.lstrip("."))
         return ",".join(parts)
 
     # ── local forward-proxy (plaintext-HTTP / port-80 fix) ─────────────────────────
@@ -1407,6 +1573,44 @@ class SingBoxController:
                  if proxy_reachable else
                  f"upstream proxy NOT reachable ({host}:{port})")
 
+            # ── Proxy CONNECT policy: the proxy answered and REFUSED a port, as
+            # opposed to being unreachable. Diagnosed 2026-08-07: a corporate proxy
+            # that permits CONNECT only to :443 refuses CONNECT on :993/:465/:587
+            # (Outlook IMAPS/SMTPS) with a 403 — the connection is fine, the policy
+            # says no, and no amount of retrying fixes it; the host must be routed
+            # DIRECT via the Bypass List. Sourced from sing-box's own log, since
+            # this happens entirely inside sing-box's proxy-out outbound.
+            reject_lines = self._scan_upstream_rejections(self._tail_log_lines(200))
+            denied_ports = set()
+            for ln in reject_lines:
+                m = re.search(r":(\d+)\s+using outbound", ln)
+                if m:
+                    denied_ports.add(int(m.group(1)))
+            # Port 80 is EXPECTED to be refused by many corporate proxies — that is
+            # exactly why core/local_proxy.py exists — and traffic on :80 already has
+            # a working path outside sing-box's own CONNECT. A :80 refusal shows up
+            # in the log on every healthy box (e.g. msftconnecttest.com), so it is
+            # excluded here to avoid a false alarm on installs that are working fine.
+            significant_denied = sorted(p for p in denied_ports if p != 80)
+            connect_denied = bool(significant_denied)
+            section(fh, "Proxy CONNECT policy (upstream refusals, distinct from unreachable)",
+                    ("Denied ports seen in the recent sing-box log: "
+                     + ", ".join(str(p) for p in sorted(denied_ports))
+                     if denied_ports else
+                     "No CONNECT refusals seen in the recent log.")
+                    + ("\n(port 80 excluded below — already handled by the local "
+                       "forward-proxy; see core/local_proxy.py)" if 80 in denied_ports else ""),
+                    ("WARN — the upstream proxy is reachable but refuses CONNECT on "
+                     + ", ".join(str(p) for p in significant_denied)
+                     + ". Those ports can never be tunnelled through this proxy; add the "
+                       "destination host(s) to the Bypass List so they route DIRECT."
+                     if connect_denied else
+                     "PASS — no non-:80 CONNECT refusals seen in the recent log."))
+            step(not connect_denied,
+                 "no proxy CONNECT refusals seen" if not connect_denied else
+                 f"upstream proxy refuses CONNECT on {', '.join(str(p) for p in significant_denied)} "
+                 f"— route those hosts DIRECT via the Bypass List")
+
             # ── System proxy: must point at OUR local listener (so proxy-aware apps,
             # incl. the Edge updater, route through sing-box over TCP — not QUIC/direct
             # and not some other proxy that would bypass us) ──
@@ -1549,6 +1753,13 @@ class SingBoxController:
                            "upstream proxy (dial timeout/refused). Its own connection is looping "
                            "into the TUN, or the proxy host:port is blocked from this machine. See "
                            "the Proxy reachability section.")
+            elif connect_denied:
+                verdict = ("PROXY CONNECT POLICY — the upstream proxy is reachable but refuses "
+                           f"CONNECT on port(s) {', '.join(str(p) for p in significant_denied)}. "
+                           "Those ports can NEVER be tunnelled through this proxy (Outlook's IMAPS "
+                           "993 / SMTPS 465/587 are common examples) — add the destination host(s) "
+                           "to the Bypass List so they route DIRECT instead of retrying the proxy. "
+                           "See the Proxy CONNECT policy section.")
             elif competing:
                 verdict = ("WFP CONTENTION LIKELY — routes/DNS look OK but a competing agent is "
                            "present and may outbid capture. Disable it to confirm.")
@@ -1580,8 +1791,8 @@ class SingBoxController:
                 pass
 
         bad = (not adapter_present) or (not routes_ok) or (not fakeip_ok) or \
-              (not unspec_ok) or (not proxy_reachable) or (not ep_ok) or \
-              (not uwp_ok) or competing or bool(problems)
+              (not unspec_ok) or (not proxy_reachable) or connect_denied or \
+              (not ep_ok) or (not uwp_ok) or competing or bool(problems)
         self._log(f"DIAG: {verdict}  (full report: "
                   r"%ProgramData%\ProxyForce\diagnostics.txt — please paste it back)",
                   "warning" if bad else "info")
@@ -1636,6 +1847,24 @@ class SingBoxController:
             if "dial" in low and ((host and host in ln) or (port and f":{port}:" in ln)):
                 hits.append(ln)
         return hits
+
+    # Distinct from a dial failure (above): the upstream proxy ANSWERED and
+    # refused the CONNECT — a policy failure, not a reachability one. sing-box
+    # logs this as `unexpected status: 403 Forbidden` (or 407/502/503).
+    _UPSTREAM_REJECT_MARKER = "unexpected status:"
+
+    @classmethod
+    def _scan_upstream_rejections(cls, lines) -> List[str]:
+        """Return log lines where sing-box's proxy-out outbound got a real HTTP
+        response to CONNECT that wasn't 200 — e.g. a corporate proxy that only
+        permits CONNECT to :443 refusing :993/:465/:587/:80 with 403. Kept as a
+        sibling of _scan_upstream_dial_failures rather than folded into
+        _DIAL_FAIL_KEYWORDS (guarded by tests/test_proxy_reachability.py) since
+        the two failure modes need different verdicts and different fixes: a
+        dial failure means the proxy is unreachable; a rejection means it IS
+        reachable and is refusing this port by policy — the fix is a Bypass
+        List entry, not a retry."""
+        return [ln for ln in (lines or []) if cls._UPSTREAM_REJECT_MARKER in ln.lower()]
 
     def _close_log(self):
         try:
