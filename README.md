@@ -134,7 +134,13 @@ No install wizard, no service to register. The folder can live anywhere.
 > over TCP rather than bypassing it or attempting QUIC. This is expected — it's
 > automatically restored to your exact previous setting when you Stop or Quit (and
 > recovered from a backup file
-> even if the app crashes).
+> even if the app crashes). The port is a **fixed default** (18080/18081/18089) that
+> stays the same across an ordinary restart, so an already-open command-line tool
+> (a shell, an editor's agent/CLI, anything reading `HTTP_PROXY`/`HTTPS_PROXY`) keeps
+> working without needing to be reopened — it only needs reopening the very first
+> time, to pick up the value at all. If something else on the machine is already
+> using one of those ports, ProxyForce falls back to an ephemeral one for just that
+> slot (logged in the Log tab) and that one case still needs a reopen.
 
 ---
 
@@ -308,40 +314,58 @@ the symptom. `diagnostics.txt`'s **"NCSI connectivity"** / **"NCSI DNS probe"** 
 **"NCSI web probe"** sections (and a `NO INTERNET (NCSI)` verdict) show exactly which
 probe is failing.
 
-**Fix:** ProxyForce answers NCSI's DNS probe with the exact literal it expects and
-routes its HTTP probe into the same local forward-proxy that already fixes the Edge
-updater, so both probes succeed and Windows reports `Internet` normally — no action
-needed on a current version. If diagnostics still shows `NO INTERNET (NCSI)`
-afterward (an unusual probe host/path retargeted by policy, or an NlaSvc quirk on a
-specific Windows build), ProxyForce falls back to telling NlaSvc to stop actively
-probing (`EnableActiveProbing=0`, restored on Stop) so passive detection reports
-`Internet` once real traffic is flowing instead. Disable that fallback in Settings if
-you'd rather leave NCSI's own probing behavior untouched.
+**Fix:** ProxyForce tells NlaSvc to stop actively probing (`EnableActiveProbing=0`,
+applied on every Start, restored on Stop) so Windows determines connectivity
+**passively** from real traffic instead — no action needed on a current version. This
+is the primary fix, not a fallback: NCSI's active probe needs a tight (~3.5s) round
+trip through the proxy interception layer, and that round trip isn't reliably fast
+under load (observed in testing: ProxyForce's own diagnostics routine was enough to
+occasionally blow the probe's timeout window, flipping Windows back to "no internet"
+a few seconds after the probe had briefly succeeded). Passive detection has no such
+timing sensitivity.
 
-**Outlook (or another mail client) can't connect while ProxyForce is running**
-Many corporate proxies permit HTTP `CONNECT` only to **:443** and refuse every
-other port with a **403** — the same restriction documented above for the
-Microsoft Edge updater on plaintext :80, except there is no forward-proxy
-workaround for IMAPS/SMTPS: mail isn't HTTP, so it can't be relayed as a `GET`.
-If your proxy has this policy, ports **993** (IMAPS), **465**/**587** (SMTPS) can
-**never** be tunnelled through it — that host must be routed **DIRECT** instead:
+ProxyForce *also* answers NCSI's DNS probe with the exact literal it expects and
+routes its HTTP probe into the local forward-proxy that fixes the Edge updater, so
+the probes themselves succeed too — defense in depth if the fallback above is turned
+off in Settings, or if something else re-enables active probing later. If
+diagnostics still shows `NO INTERNET (NCSI)` with the **"NCSI active-probing
+fallback"** section reading anything other than PASS, that section names the actual
+problem (most likely `EnableActiveProbing` didn't get set — check the log for a
+"Could not suppress NCSI active probing" warning).
 
-1. Settings ▸ **Bypass List** ▸ add the mail server hostname(s), e.g.
-   `imaps.example.com` and `smtps.example.com` (one per line — CIDRs and
+**A destination the corporate proxy refuses (Outlook/mail, or anything else)**
+Many corporate proxies permit HTTP `CONNECT` only to **:443** (or otherwise refuse
+specific ports/hosts by policy) and answer with a **403** — the same restriction
+documented above for the Microsoft Edge updater on plaintext :80. Every network's
+policy is different (mail ports are one common case, but ProxyForce has seen
+internal/internal-only hosts refused on arbitrary ports too), so ProxyForce
+**auto-bypasses** any destination the proxy explicitly refuses: it notices the
+refusal, adds the host to the Bypass List itself, and reconnects — no manual step
+needed. Watch the **Log** tab for a line like *"Auto-bypass: added `host` to the
+Bypass List … — reconnecting…"*, and check Settings ▸ **Bypass List** afterward to
+see (and, if you want, remove) what was added automatically. Turn this off via the
+**"Auto-bypass"** checkbox in Settings if you'd rather every exception be manual.
+
+If auto-bypass is off, or you'd rather pre-empt the brief reconnect it causes:
+
+1. Settings ▸ **Bypass List** ▸ add the destination hostname(s), e.g.
+   `imaps.example.com` and `smtps.example.com` for mail (one per line — CIDRs and
    `*.example.com` wildcards work too). Save; ProxyForce restarts to apply it.
-2. **Fully exit** the mail client (check Task Manager, not just the window) and
+2. **Fully exit** the affected app (check Task Manager, not just the window) and
    relaunch — it must re-resolve and re-connect on the new rules, not reuse a
    connection it made before the change.
 3. Settings ▸ **Test Proxy** now sends a real `CONNECT` on :443/:80/:993/:465/:587
    and reports each port's actual status — a `403` there tells you definitively
    this proxy refuses that port, rather than a bare "reachable" that says nothing
-   about policy. `diagnostics.txt`'s **"Proxy CONNECT policy"** section and a
-   `PROXY CONNECT POLICY` verdict report the same thing after the fact, sourced
-   from sing-box's own log.
+   about policy. `diagnostics.txt`'s **"Proxy CONNECT policy"** section reports
+   the same thing after the fact, sourced from sing-box's own log — and now also
+   notes when auto-bypass has already handled it for you.
 
-If the mail server isn't reachable at all without ProxyForce running either,
-this won't help — bypassing only works for hosts your network can already
-reach directly.
+If the destination isn't reachable at all without ProxyForce running either, this
+won't help — bypassing only works for hosts your network can already reach
+directly. Note also that for IMAPS/SMTPS specifically there is no forward-proxy
+workaround the way there is for plaintext HTTP: mail isn't HTTP, so it can't be
+relayed as a `GET` — direct routing (automatic or manual) is the only fix.
 
 **407 Proxy Authentication Required**
 Wrong credentials or auth type. Open Settings and check username/password/auth type.

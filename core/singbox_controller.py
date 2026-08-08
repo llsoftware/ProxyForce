@@ -165,6 +165,9 @@ class ProxyConfig:
     log_level: str = "info"         # sing-box log verbosity (see _SINGBOX_LOG_LEVELS)
     ncsi_fallback: bool = True      # last-resort EnableActiveProbing=0 if NCSI still
                                      # reports no internet after diagnostics (core.ncsi)
+    auto_bypass: bool = True        # auto-add + reconnect when the proxy explicitly
+                                     # refuses a CONNECT, instead of requiring a manual
+                                     # Bypass List edit (core.auto_bypass)
 
     def __post_init__(self):
         if self.bypass_list is None:
@@ -249,6 +252,59 @@ def _free_loopback_ports(n: int = 1) -> List[int]:
 def _free_loopback_port() -> int:
     """Grab a single free 127.0.0.1 TCP port for the Clash API."""
     return _free_loopback_ports(1)[0]
+
+
+# Fixed defaults for (clash_port, local_proxy_port, http_proxy_port) — v2.2.2.
+# 18080/18081 are the pre-existing hardcoded fallback constants already baked
+# into _render_config (used when it's called without going through start(), e.g.
+# tests) for local_proxy_port/http_proxy_port respectively; 18089 is a new pick
+# for clash_port, distinct from both.
+_DEFAULT_PORTS = (18089, 18080, 18081)
+
+
+def _bind_ports_preferring(preferred, log=None) -> List[int]:
+    """Bind each port in `preferred` if free; for any already taken by something
+    else, fall back to an OS-ephemeral port for JUST that one slot. Returns the
+    assigned ports in the same order as `preferred`.
+
+    WHY FIXED PORTS AT ALL (diagnosed 2026-08-08): _free_loopback_ports always
+    picked a fresh OS-ephemeral port, so every ProxyForce restart changed the
+    HTTP_PROXY/HTTPS_PROXY env vars and the WinINET/WinHTTP proxy string to new
+    port numbers. Windows never propagates an env-var change to an
+    already-running process — a process's environment block is fixed at its own
+    creation time — so an already-open shell (Claude Code, PowerShell, anything
+    else reading those vars) silently broke on every ProxyForce restart and
+    needed to be closed and reopened to pick up the new value. Keeping the SAME
+    port numbers across an ordinary restart (the common case — nothing else is
+    squatting on 18080/18081/18089) means the env vars/system-proxy string don't
+    change, so nothing downstream needs to be restarted either.
+
+    Genuine conflicts (rare) still degrade gracefully to an ephemeral port for
+    just that slot, logged clearly — no regression for that case, just no longer
+    the default path.
+
+    All sockets are held open until every slot is resolved, then closed together
+    — same anti-collision technique as _free_loopback_ports (guards against an
+    ephemeral fallback landing on a not-yet-closed slot; in practice Windows'
+    ephemeral range starts well above these fixed numbers, so this is defense in
+    depth rather than an observed real collision)."""
+    socks = []
+    try:
+        for port in preferred:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.bind(("127.0.0.1", port))
+            except OSError:
+                if log:
+                    log(f"Port {port} is in use by another process — using an "
+                        f"ephemeral port for this run instead (env vars/system "
+                        f"proxy will change this time).", "info")
+                s.bind(("127.0.0.1", 0))
+            socks.append(s)
+        return [s.getsockname()[1] for s in socks]
+    finally:
+        for s in socks:
+            s.close()
 
 
 # NCSI (Network Connectivity Status Indicator) is the service that decides whether
@@ -412,6 +468,7 @@ def make_proxy_config(cfg: dict) -> "ProxyConfig":
         bypass_list=cfg.get("bypass_list", []),
         log_level=cfg.get("log_level", _DEFAULT_LOG_LEVEL),
         ncsi_fallback=cfg.get("ncsi_fallback", True),
+        auto_bypass=cfg.get("auto_bypass", True),
     )
 
 
@@ -419,11 +476,21 @@ class SingBoxController:
     """Runs and supervises sing-box; presents the Redirector interface."""
 
     def __init__(self, config: ProxyConfig, on_state_change: Callable = None,
-                 on_stats_update: Callable = None, on_log: Callable = None):
+                 on_stats_update: Callable = None, on_log: Callable = None,
+                 on_auto_bypass: Callable = None):
         self.config = config
         self.on_state_change = on_state_change
         self.on_stats_update = on_stats_update
         self.on_log = on_log
+        # Called with a list of newly-discovered hostnames the moment
+        # _check_auto_bypass finds an explicit proxy CONNECT refusal for them —
+        # never with dial timeouts/unreachable, only real "the proxy answered and
+        # said no" cases. The controller can't safely restart itself from inside
+        # its own steady-state thread; the caller (the GUI) owns swapping in a
+        # fresh SingBoxController, same as it already does for a Settings-save
+        # restart. See _check_auto_bypass and core/auto_bypass for the full
+        # rationale.
+        self.on_auto_bypass = on_auto_bypass
         self.state = SingBoxState.STOPPED
         self.stats = ConnectionStats()
 
@@ -446,6 +513,12 @@ class SingBoxController:
         self._trace_conns = True
         self._uwp_thread: Optional[threading.Thread] = None
         self._uwp_sweep_ticks = 0
+        # Hosts already reported/handed to on_auto_bypass this engine lifetime, so
+        # a rejection that keeps reappearing in the log tail (it will, until enough
+        # newer lines push it out) doesn't re-trigger the callback/restart request
+        # every tick while a restart is still pending.
+        self._auto_bypass_reported = set()
+        self._auto_bypass_ticks = 0
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -738,9 +811,11 @@ class SingBoxController:
         # Reserve the forward-proxy port here too (not just clash/local-proxy):
         # _render_config's port-80 route rule needs a concrete override_port at
         # WRITE time, which happens below, well before _start_http_proxy() would
-        # otherwise have assigned one from an ephemeral bind.
+        # otherwise have assigned one from an ephemeral bind. Prefer the FIXED
+        # defaults (_DEFAULT_PORTS) so an ordinary restart keeps the same port
+        # numbers — see _bind_ports_preferring for why that matters.
         self._clash_port, self._local_proxy_port, self._http_proxy_port = \
-            _free_loopback_ports(3)
+            _bind_ports_preferring(_DEFAULT_PORTS, log=self._log)
         # Resolve the corporate proxy's REAL IP now — BEFORE sing-box hijacks DNS to
         # fakeip — so the local forward-proxy (started after green) dials the real
         # upstream rather than a fakeip that would loop back into the TUN. For an
@@ -954,6 +1029,14 @@ class SingBoxController:
                     self._uwp_thread = threading.Thread(
                         target=self._exempt_uwp_loopback, daemon=True)
                     self._uwp_thread.start()
+            # Check for new proxy CONNECT refusals every ~6s (3 ticks at 2s each) —
+            # short enough to feel immediate, long enough to naturally batch several
+            # refusals discovered close together into one restart instead of one per
+            # host. See _check_auto_bypass / core/auto_bypass.
+            self._auto_bypass_ticks += 1
+            if self._auto_bypass_ticks >= 3:
+                self._auto_bypass_ticks = 0
+                self._check_auto_bypass()
             self._stop_event.wait(2)
 
     # ── TUN adapter lifecycle (Win 10 wintun cleanup) ─────────────────────────
@@ -1290,6 +1373,44 @@ class SingBoxController:
             except Exception:
                 pass
 
+    def _suppress_ncsi_active_probing(self):
+        """Suppress NCSI's ACTIVE probing unconditionally (not as a diagnostics-
+        triggered fallback — see the v2.2.1 postmortem below). NCSI's own DNS/web
+        probes are also fixed at the sing-box config level (predefined DNS answer +
+        the port-80 redirect rule in _render_config), and that fix genuinely works —
+        confirmed via the Microsoft-Windows-NCSI/Operational event log showing
+        ActiveDnsProbeSucceeded / Capability:Internet right after start. But active
+        probing requires a tight (~3.5s, registry WebTimeout) round trip through our
+        interception layer, and that round trip is NOT reliably fast: it was starved
+        by our OWN _run_diagnostics() subprocess-spawning burst in one observed case,
+        and could equally be slowed by corporate-proxy latency or AV scanning the new
+        connection on someone else's network. A single missed window flips NCSI to
+        "no internet" and it does not proactively retry on any schedule useful to a
+        user watching in real time — which is exactly what silently broke Windows
+        Spotlight even though the probes themselves were provably correct.
+
+        Passive detection (does real traffic actually flow?) has no such timing
+        sensitivity, which is why this is now unconditional standard takeover
+        behavior rather than a diagnostics-gated last resort — _run_diagnostics no
+        longer decides whether to apply it, only reports whether it took (see its
+        "NCSI active-probing fallback" section).
+
+        Extracted as its own method (rather than inlined in _takeover_system_proxy)
+        specifically so it can be unit-tested with core.ncsi stubbed out, without
+        touching the real registry/netsh calls the rest of that method makes."""
+        try:
+            if getattr(self.config, "ncsi_fallback", True):
+                from core import ncsi
+                if ncsi.suppress_active_probing():
+                    self._log("NCSI active probing suppressed (EnableActiveProbing=0) — "
+                              "Windows now determines internet connectivity passively "
+                              "from real traffic instead of a probe round-trip through "
+                              "ProxyForce, which is more reliable under load. Restored "
+                              "on stop. Disable via the NCSI fallback setting if you'd "
+                              "rather leave this untouched.")
+        except Exception as e:
+            self._log(f"Could not suppress NCSI active probing: {e}", "warning")
+
     def _takeover_system_proxy(self):
         """Point the Windows system proxy (WinINET + WinHTTP) at ProxyForce while it
         runs, using a PROTOCOL-SPLIT proxy so each scheme takes its working path:
@@ -1335,10 +1456,14 @@ class SingBoxController:
             self._log(f"Proxy environment variables set (HTTP_PROXY={http_url}, "
                       f"HTTPS_PROXY={https_url}){was} — fixes CLI tools (yt-dlp, curl, "
                       f"pip, git, …) that read the environment instead of the Windows "
-                      f"proxy setting. Already-open shells must be reopened to pick "
-                      f"this up.")
+                      f"proxy setting. A shell opened BEFORE this value ever existed "
+                      f"still needs reopening once to pick it up; after that, restarts "
+                      f"normally keep the same port (_bind_ports_preferring) so an "
+                      f"already-open shell keeps working without needing to be reopened "
+                      f"again.")
         except Exception as e:
             self._log(f"Could not set proxy environment variables: {e}", "warning")
+        self._suppress_ncsi_active_probing()
         # v2.1.27: Store/UWP apps run in an AppContainer, which Windows blocks from
         # reaching loopback by default — so pointing the system proxy at 127.0.0.1
         # above makes the Microsoft Store (and every other UWP app) fail outright
@@ -1615,10 +1740,30 @@ class SingBoxController:
             # connectivity level (Windows Spotlight/ContentDeliveryManager, Store,
             # Widgets, Teams presence) quietly does nothing — no error, no log,
             # just content that never refreshes.
+            #
+            # v2.2.2 postmortem: the DNS/web probe fixes below are real and were
+            # PROVEN correct via the Microsoft-Windows-NCSI/Operational event log
+            # (ActiveDnsProbeSucceeded -> Capability:Internet, immediately after
+            # start) — but active probing needs a tight ~3.5s round trip
+            # (registry WebTimeout) through our interception layer, and that one
+            # observed run's OWN _run_diagnostics() subprocess burst (this exact
+            # method!) starved it a second later, flipping the verdict back to
+            # LocalNetwork with nothing left to notice or correct it. That is why
+            # _takeover_system_proxy() now suppresses active probing
+            # UNCONDITIONALLY, before this diagnostics pass ever runs, rather than
+            # this method deciding reactively whether to apply it — see that
+            # method's comment for the full reasoning. This check now reads the
+            # result rather than deciding whether to act on it, and keys off the
+            # ProxyForce interface specifically — Ethernet's own NCSI reading was
+            # the one observed flapping in the event log and isn't the profile the
+            # fixes target.
             conn_profile = self._ps(
                 "Get-NetConnectionProfile | Select-Object InterfaceAlias,IPv4Connectivity | "
                 "Format-Table -Auto | Out-String")
-            ncsi_ok = bool(re.search(r"\bInternet\b", conn_profile))
+            pf_connectivity = self._ps(
+                "(Get-NetConnectionProfile -InterfaceAlias 'ProxyForce' "
+                "-ErrorAction SilentlyContinue).IPv4Connectivity").strip()
+            ncsi_ok = pf_connectivity == "Internet"
             ncsi_conf = self._ps(
                 "$k='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NlaSvc\\Parameters\\Internet';"
                 "$p=Get-ItemProperty $k -ErrorAction SilentlyContinue;"
@@ -1670,38 +1815,33 @@ class SingBoxController:
                      "route rule sending it to the local forward-proxy, sing-box's CONNECT-only "
                      "outbound gets 403'd by the corporate proxy on :80."))
 
-            # ── NCSI fallback: LAST RESORT, only if the real fix (above) still isn't
-            # enough — e.g. a probe host/path retargeted by policy in a way the port-80
-            # rule and DNS predefined-answer rule don't anticipate, or an NlaSvc quirk
-            # on a specific Windows build. Tells NlaSvc to stop actively probing and
-            # fall back to passive detection (reports Internet once real traffic is
-            # flowing) instead of trying to make the probe itself succeed. Gated on
-            # config so it can be disabled; restored on stop() alongside the other
-            # takeovers. Never runs when the real fix already worked.
-            if not ncsi_ok and getattr(self.config, "ncsi_fallback", True):
-                try:
-                    from core import ncsi
-                    if ncsi.suppress_active_probing():
-                        self._log("NCSI still reports no internet after the real fix; "
-                                  "applying the last-resort fallback (EnableActiveProbing=0) "
-                                  "— restored on stop.", "warning")
-                        time.sleep(2)   # give NlaSvc a moment to re-evaluate passively
-                        conn_profile_2 = self._ps(
-                            "Get-NetConnectionProfile | Select-Object InterfaceAlias,"
-                            "IPv4Connectivity | Format-Table -Auto | Out-String")
-                        ncsi_ok = bool(re.search(r"\bInternet\b", conn_profile_2))
-                        section(fh, "NCSI fallback (EnableActiveProbing=0)", conn_profile_2,
-                                ("PASS — Windows now reports Internet connectivity after the "
-                                 "fallback" if ncsi_ok else
-                                 "WARN — applied the fallback but Windows still does not report "
-                                 "Internet connectivity; NCSI may need more time, or something "
-                                 "else is blocking passive detection."))
-                        step(ncsi_ok,
-                             "NCSI fallback applied — Windows now reports Internet connectivity"
-                             if ncsi_ok else
-                             "NCSI fallback applied but connectivity still not reported")
-                except Exception as e:
-                    self._log(f"Could not apply the NCSI fallback: {e}", "warning")
+            # ── NCSI active-probing fallback: report state, don't decide here anymore.
+            # _takeover_system_proxy() already applied this UNCONDITIONALLY (subject to
+            # cfg.ncsi_fallback) before this diagnostics pass started — see that
+            # method's comment for why a reactive, diagnostics-gated apply proved
+            # unreliable. This just confirms it actually took.
+            ncsi_fallback_enabled = getattr(self.config, "ncsi_fallback", True)
+            try:
+                from core import ncsi
+                ncsi_state = ncsi.current_state()
+            except Exception as e:
+                ncsi_state = f"<unavailable: {e}>"
+            probing_suppressed = "EnableActiveProbing=0" in ncsi_state
+            if not ncsi_fallback_enabled:
+                section(fh, "NCSI active-probing fallback", ncsi_state,
+                        "INFO — disabled by config (ncsi_fallback=false); relying solely "
+                        "on the DNS/web probe fixes above.")
+            elif probing_suppressed:
+                section(fh, "NCSI active-probing fallback", ncsi_state,
+                        "PASS — active probing suppressed at takeover; Windows determines "
+                        "connectivity passively from real traffic instead of a timing-"
+                        "sensitive probe round trip.")
+            else:
+                section(fh, "NCSI active-probing fallback", ncsi_state,
+                        "WARN — fallback is enabled but EnableActiveProbing is not 0; "
+                        "suppression may have failed at takeover (check the log for a "
+                        "'Could not suppress NCSI active probing' warning) or something "
+                        "else re-enabled it since.")
 
             # ── End-to-end capture probe ──
             section(fh, "Capture probe (TCP 443 → example.com)", self._ps(
@@ -1770,17 +1910,15 @@ class SingBoxController:
 
             # ── Proxy CONNECT policy: the proxy answered and REFUSED a port, as
             # opposed to being unreachable. Diagnosed 2026-08-07: a corporate proxy
-            # that permits CONNECT only to :443 refuses CONNECT on :993/:465/:587
-            # (Outlook IMAPS/SMTPS) with a 403 — the connection is fine, the policy
-            # says no, and no amount of retrying fixes it; the host must be routed
-            # DIRECT via the Bypass List. Sourced from sing-box's own log, since
-            # this happens entirely inside sing-box's proxy-out outbound.
-            reject_lines = self._scan_upstream_rejections(self._tail_log_lines(200))
-            denied_ports = set()
-            for ln in reject_lines:
-                m = re.search(r":(\d+)\s+using outbound", ln)
-                if m:
-                    denied_ports.add(int(m.group(1)))
+            # that refuses CONNECT on some destination/port — the connection is
+            # fine, the policy says no, and no amount of retrying fixes it. Every
+            # corporate network has its own idea of what gets refused (diagnosed
+            # 2026-08-08: an internal DNS-suffixed hostname refused on an
+            # arbitrary internal port, nothing to do with any one documented
+            # case), so this is intentionally generic rather than naming a
+            # specific scenario. Sourced from sing-box's own log, since this
+            # happens entirely inside sing-box's proxy-out outbound.
+            #
             # Port 80 USED to be excluded here as "expected" — core/local_proxy.py
             # handled it, but only for proxy-aware apps reading the http= system-
             # proxy entry. Since the port-80 sing-box route rule (v2.2.1) now sends
@@ -1789,23 +1927,46 @@ class SingBoxController:
             # can no longer be routine — it means something upstream of proxy-out
             # (a bypassed host, a manual routing override) is still hitting CONNECT
             # on :80, which is worth surfacing rather than silently swallowing.
-            significant_denied = sorted(denied_ports)
-            connect_denied = bool(significant_denied)
+            #
+            # As of v2.2.2 this is no longer purely a "go fix it yourself" WARN:
+            # _check_auto_bypass (running periodically in the steady-state loop)
+            # already handles this automatically when cfg.auto_bypass is enabled,
+            # so by the time a user reads this report the destination has often
+            # already been bypassed and reconnected past. This section reports
+            # what was SEEN, not what the user needs to go do about it.
+            from core import auto_bypass as _auto_bypass_mod
+            reject_lines = self._scan_upstream_rejections(self._tail_log_lines(200))
+            rejections = _auto_bypass_mod.extract_rejections(reject_lines)
+            connect_denied = bool(rejections)
+            denied_desc = ", ".join(f"{h}:{p}" for h, p, _c in rejections)
+            auto_bypass_on = getattr(self.config, "auto_bypass", True)
+            already_bypassed = {normalize_bypass_entry(e)[0]
+                                for e in (self.config.bypass_list or [])}
+            all_handled = connect_denied and all(
+                normalize_bypass_entry(h)[0] in already_bypassed for h, _p, _c in rejections)
             section(fh, "Proxy CONNECT policy (upstream refusals, distinct from unreachable)",
-                    ("Denied ports seen in the recent sing-box log: "
-                     + ", ".join(str(p) for p in sorted(denied_ports))
-                     if denied_ports else
-                     "No CONNECT refusals seen in the recent log."),
-                    ("WARN — the upstream proxy is reachable but refuses CONNECT on "
-                     + ", ".join(str(p) for p in significant_denied)
-                     + ". Those ports can never be tunnelled through this proxy; add the "
-                       "destination host(s) to the Bypass List so they route DIRECT."
+                    (f"Refused in the recent sing-box log: {denied_desc}" if connect_denied
+                     else "No CONNECT refusals seen in the recent log."),
+                    ("PASS — refusal(s) seen but already routed DIRECT via the Bypass List "
+                     f"({denied_desc})" if all_handled else
+                     f"INFO — the proxy refused CONNECT for {denied_desc}; auto-bypass is "
+                     "enabled and will route it DIRECT automatically (a brief reconnect "
+                     "follows if it hasn't already happened by the time you read this)."
+                     if connect_denied and auto_bypass_on else
+                     f"WARN — the proxy refuses CONNECT for {denied_desc} and auto-bypass is "
+                     "disabled; add the destination(s) to the Bypass List manually so they "
+                     "route DIRECT."
                      if connect_denied else
-                     "PASS — no non-:80 CONNECT refusals seen in the recent log."))
-            step(not connect_denied,
+                     "PASS — no CONNECT refusals seen in the recent log."))
+            step(not connect_denied or all_handled,
                  "no proxy CONNECT refusals seen" if not connect_denied else
-                 f"upstream proxy refuses CONNECT on {', '.join(str(p) for p in significant_denied)} "
-                 f"— route those hosts DIRECT via the Bypass List")
+                 (f"refusal(s) already auto-bypassed ({denied_desc})" if all_handled else
+                  f"proxy refuses CONNECT for {denied_desc} — "
+                  + ("auto-bypass will apply shortly" if auto_bypass_on else
+                     "route those hosts DIRECT via the Bypass List")))
+            # connect_denied now only drives the VERDICT when auto-bypass hasn't
+            # (yet, or can't) resolve it — see the verdict block below.
+            connect_denied = connect_denied and not all_handled and not auto_bypass_on
 
             # ── System proxy: must point at OUR local listener (so proxy-aware apps,
             # incl. the Edge updater, route through sing-box over TCP — not QUIC/direct
@@ -1951,11 +2112,10 @@ class SingBoxController:
                            "the Proxy reachability section.")
             elif connect_denied:
                 verdict = ("PROXY CONNECT POLICY — the upstream proxy is reachable but refuses "
-                           f"CONNECT on port(s) {', '.join(str(p) for p in significant_denied)}. "
-                           "Those ports can NEVER be tunnelled through this proxy (Outlook's IMAPS "
-                           "993 / SMTPS 465/587 are common examples) — add the destination host(s) "
-                           "to the Bypass List so they route DIRECT instead of retrying the proxy. "
-                           "See the Proxy CONNECT policy section.")
+                           f"CONNECT for {denied_desc}. Auto-bypass is disabled (Settings), so this "
+                           "won't resolve on its own — add the destination(s) to the Bypass List "
+                           "manually so they route DIRECT instead of retrying the proxy, or "
+                           "re-enable auto-bypass. See the Proxy CONNECT policy section.")
             elif competing:
                 verdict = ("WFP CONTENTION LIKELY — routes/DNS look OK but a competing agent is "
                            "present and may outbid capture. Disable it to confirm.")
@@ -1974,13 +2134,15 @@ class SingBoxController:
                            "error in the log (requires elevation, which ProxyForce should already "
                            "have).")
             elif not ncsi_ok:
-                verdict = ("NO INTERNET (NCSI) — Windows itself believes it has no internet "
-                           "(IPv4Connectivity is not 'Internet'), even though capture/DNS/the proxy "
+                verdict = ("NO INTERNET (NCSI) — Windows' ProxyForce network profile does not yet "
+                           "report 'Internet' connectivity, even though capture/DNS/the proxy "
                            "takeover all work. Every component that gates on connectivity level — "
                            "Windows Spotlight/lock-screen images, Microsoft Store, Widgets, Teams "
-                           "presence — silently stops refreshing with no visible error. See the "
-                           "NCSI connectivity / DNS probe / web probe sections for which of NlaSvc's "
-                           "own probes is failing.")
+                           "presence — silently stops refreshing with no visible error. If the "
+                           "'NCSI active-probing fallback' section above shows PASS, this should "
+                           "self-correct within a short time as passive detection observes real "
+                           "traffic; if it shows WARN, that's the actual problem to chase. See the "
+                           "NCSI connectivity / DNS probe / web probe sections for detail.")
             elif problems:
                 verdict = "PARTIAL — engine mostly healthy; see the WARN lines in diagnostics.txt."
             else:
@@ -1998,7 +2160,7 @@ class SingBoxController:
               (not unspec_ok) or (not proxy_reachable) or connect_denied or \
               (not ep_ok) or (not uwp_ok) or (not ncsi_ok) or competing or bool(problems)
         self._log(f"DIAG: {verdict}  (full report: "
-                  r"%ProgramData%\ProxyForce\diagnostics.txt — please paste it back)",
+                  r"%ProgramData%\ProxyForce\diagnostics.txt)",
                   "warning" if bad else "info")
 
     # ── logs ──────────────────────────────────────────────────────────────────────
@@ -2066,9 +2228,63 @@ class SingBoxController:
         _DIAL_FAIL_KEYWORDS (guarded by tests/test_proxy_reachability.py) since
         the two failure modes need different verdicts and different fixes: a
         dial failure means the proxy is unreachable; a rejection means it IS
-        reachable and is refusing this port by policy — the fix is a Bypass
-        List entry, not a retry."""
+        reachable and is refusing this port by policy — see _check_auto_bypass,
+        which now handles this automatically rather than requiring a manual
+        Bypass List edit."""
         return [ln for ln in (lines or []) if cls._UPSTREAM_REJECT_MARKER in ln.lower()]
+
+    def _check_auto_bypass(self):
+        """Detect NEW proxy CONNECT refusals and, if cfg.auto_bypass allows it, ask
+        to route them DIRECT going forward — no manual Bypass List edit required.
+
+        ProxyForce is used against many different corporate proxy policies, each
+        with its own idea of what gets refused (diagnosed 2026-08-08: an internal
+        DNS-suffixed hostname refused on an arbitrary internal port, nothing to do
+        with any documented case like Outlook's mail ports). The general answer is
+        to try the proxy first and notice when it explicitly says no, rather than
+        hardcode assumptions about any particular network.
+
+        Deliberately narrow: only an EXPLICIT refusal counts (the proxy answered
+        with a real non-2xx status — see core.auto_bypass.extract_rejections,
+        fed from _scan_upstream_rejections). A dial timeout/unreachable condition
+        is a different failure mode (_scan_upstream_dial_failures) and must NOT
+        trigger this — that's evidence of a network problem, not a policy
+        decision, and auto-bypassing on it would silently leak traffic around the
+        proxy for the wrong reason.
+
+        Can't safely restart the engine from inside its own steady-state thread,
+        so this only detects + persists + asks (via on_auto_bypass); the actual
+        restart is the GUI's job, reusing the exact same path a Settings-save
+        restart already uses.
+        """
+        if not getattr(self.config, "auto_bypass", True):
+            return
+        try:
+            from core import auto_bypass
+            reject_lines = self._scan_upstream_rejections(self._tail_log_lines(200))
+            rejections = auto_bypass.extract_rejections(reject_lines)
+        except Exception:
+            return
+        if not rejections:
+            return
+        existing = {normalize_bypass_entry(e)[0] for e in (self.config.bypass_list or [])}
+        new_entries = []
+        for host, port, code in rejections:
+            base, _apex, err = normalize_bypass_entry(host)
+            if err or base is None or base in existing or base in self._auto_bypass_reported:
+                continue
+            self._auto_bypass_reported.add(base)
+            new_entries.append((base, port, code))
+        if not new_entries:
+            return
+        for base, port, code in new_entries:
+            self._log(f"{base} now routes DIRECT — the proxy refused CONNECT on "
+                      f"port {port} (status {code}). Reconnecting to apply…")
+        if self.on_auto_bypass:
+            try:
+                self.on_auto_bypass([base for base, _port, _code in new_entries])
+            except Exception as e:
+                self._log(f"Auto-bypass callback failed: {e}", "warning")
 
     def _close_log(self):
         try:

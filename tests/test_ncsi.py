@@ -17,6 +17,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from core import ncsi
+from core.singbox_controller import SingBoxController, ProxyConfig
 
 
 class BackupRoundTripTests(unittest.TestCase):
@@ -99,6 +100,48 @@ class SuppressAndRestoreTests(unittest.TestCase):
     def test_restore_with_no_backup_is_a_noop(self):
         self.assertFalse(ncsi.restore())
         self.assertEqual(self._write_calls, [])
+
+
+class TakeoverUnconditionalSuppressionTests(unittest.TestCase):
+    """v2.2.2: suppression must be unconditional at takeover time, not a
+    diagnostics-gated fallback applied only after a single connectivity check
+    reads "not Internet". The reactive design let one lucky/transient PASS
+    reading (observed live: Ethernet flickered to "Internet" for a few seconds
+    right as ProxyForce's own diagnostics burst started, then reverted) skip the
+    fallback entirely, leaving Windows stuck reporting no internet with nothing
+    left to correct it. SingBoxController._suppress_ncsi_active_probing is called
+    from _takeover_system_proxy on every start, unconditionally (subject only to
+    cfg.ncsi_fallback) — this exercises just that call site, with core.ncsi
+    stubbed out so no real registry/netsh calls happen (the rest of
+    _takeover_system_proxy is not touched here — see its own module's caution
+    about not calling it directly in a unit test)."""
+
+    def setUp(self):
+        self._orig = ncsi.suppress_active_probing
+        self._calls = []
+        ncsi.suppress_active_probing = lambda: self._calls.append(True) or True
+
+    def tearDown(self):
+        ncsi.suppress_active_probing = self._orig
+
+    def _controller(self, ncsi_fallback=True, on_log=None):
+        cfg = ProxyConfig(host="203.0.113.10", port=800, ncsi_fallback=ncsi_fallback)
+        return SingBoxController(cfg, on_log=on_log)
+
+    def test_suppression_called_unconditionally(self):
+        self._controller()._suppress_ncsi_active_probing()
+        self.assertEqual(len(self._calls), 1)
+
+    def test_disabled_by_config_skips_the_call(self):
+        self._controller(ncsi_fallback=False)._suppress_ncsi_active_probing()
+        self.assertEqual(self._calls, [])
+
+    def test_failure_is_logged_not_raised(self):
+        ncsi.suppress_active_probing = lambda: (_ for _ in ()).throw(OSError("nope"))
+        logs = []
+        self._controller(on_log=lambda msg, level: logs.append((msg, level)))\
+            ._suppress_ncsi_active_probing()   # must not raise
+        self.assertTrue(any("Could not suppress NCSI" in m for m, _ in logs))
 
 
 class ReadOnlyReadersTests(unittest.TestCase):

@@ -382,6 +382,9 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._check(s3, "ncsi_fallback",
                     "NCSI fallback — last resort if Windows still reports \"no "
                     "internet\" (breaks Spotlight/Store) after the real fix")
+        self._check(s3, "auto_bypass",
+                    "Auto-bypass hosts the proxy explicitly refuses (reconnects "
+                    "automatically; entries appear below)")
         self._lbl(s3, "Bypass List  —  one entry per line: hostname, *.hostname, "
                       "or CIDR. No scheme, port or path — routed DIRECT for any "
                       "protocol/port, e.g. mail hosts on 993/465/587.")
@@ -1004,7 +1007,7 @@ class ProxyForceApp(ctk.CTk):
     # update_*) are intentionally excluded so they never cause a disconnect.
     _PROXY_FIELDS = ("host", "port", "auth_type", "username", "password",
                      "exclude_private", "exclude_loopback", "bypass_list",
-                     "log_level", "ncsi_fallback")
+                     "log_level", "ncsi_fallback", "auto_bypass")
 
     def _proxy_settings_changed(self, vals: dict) -> bool:
         """True if any proxy-affecting field in `vals` differs from the config the
@@ -1059,11 +1062,15 @@ class ProxyForceApp(ctk.CTk):
                 def on_log(m, l):
                     self._queue.put(("log", m, l))
 
+                def on_auto_bypass(hosts):
+                    self._queue.put(("auto_bypass", hosts))
+
                 proxy_cfg    = make_proxy_config(vals)
                 engine       = SingBoxController(proxy_cfg,
                                                   on_state_change=on_state,
                                                   on_stats_update=on_stats,
-                                                  on_log=on_log)
+                                                  on_log=on_log,
+                                                  on_auto_bypass=on_auto_bypass)
                 self._engine  = engine
                 engine.start()
             except Exception as e:
@@ -1071,6 +1078,28 @@ class ProxyForceApp(ctk.CTk):
                 self._queue.put(("state", "error"))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def _apply_auto_bypass(self, new_hosts):
+        """Merge auto-discovered bypass hosts (SingBoxController.on_auto_bypass,
+        fired when the proxy explicitly refuses a CONNECT — see
+        core/auto_bypass) into Settings and reconnect. Runs on the main thread
+        (dispatched via _queue like every other engine callback) since it touches
+        the Settings panel's Tkinter widgets — the engine's own background thread
+        can't safely do this or replace itself with a new SingBoxController, which
+        is why this indirection exists at all."""
+        if not new_hosts:
+            return
+        vals = self._settings_panel.get_values()
+        current = list(vals.get("bypass_list") or [])
+        added = [h for h in new_hosts if h not in current]
+        if not added:
+            return
+        self._settings_panel.set_values({"bypass_list": current + added})
+        self._log(f"Auto-bypass: added {', '.join(added)} to the Bypass List "
+                  f"(the proxy explicitly refused a connection) — reconnecting…",
+                  "info")
+        if self._last_state in ("running", "waiting", "starting"):
+            self._start_engine()
 
     def _stop_engine(self):
         self._log("Stopping ProxyForce engine…", "info")
@@ -1611,6 +1640,8 @@ class ProxyForceApp(ctk.CTk):
                 elif tag == "quit":
                     self._do_quit()
                     return
+                elif tag == "auto_bypass":
+                    self._apply_auto_bypass(item[1])
         except queue.Empty:
             pass
         if self._running:
