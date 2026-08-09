@@ -51,13 +51,6 @@ class ProxyChangeDetectionTests(unittest.TestCase):
     def test_host_change_triggers_restart(self):
         self.assertTrue(_changed(BASE, dict(BASE, host="other.corp.local")))
 
-    def test_ncsi_fallback_change_triggers_restart(self):
-        """v2.2.1: ncsi_fallback is read at runtime by _run_diagnostics, so a
-        toggle must restart the engine like any other proxy-affecting field —
-        otherwise a running engine keeps using the stale value indefinitely."""
-        self.assertTrue(_changed(dict(BASE, ncsi_fallback=True),
-                                 dict(BASE, ncsi_fallback=False)))
-
     def test_identical_config_no_restart(self):
         self.assertFalse(_changed(BASE, dict(BASE)))
 

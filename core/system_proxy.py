@@ -280,3 +280,8 @@ def current_state() -> str:
         wh = "<unavailable>"
     return (f"WinINET ProxyEnable={en} ProxyServer='{srv}' AutoConfigURL='{pac}'"
             f"  ||  WinHTTP: {wh}")
+
+
+def refresh():
+    """Re-announce the current proxy configuration without changing it."""
+    _broadcast()

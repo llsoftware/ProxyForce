@@ -379,9 +379,6 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._check(s3, "exclude_private",
                     "Bypass private IP ranges (RFC1918 / ULA / link-local)")
         self._check(s3, "exclude_loopback", "Bypass loopback (127.x / ::1)")
-        self._check(s3, "ncsi_fallback",
-                    "NCSI fallback — last resort if Windows still reports \"no "
-                    "internet\" (breaks Spotlight/Store) after the real fix")
         self._check(s3, "auto_bypass",
                     "Auto-bypass hosts the proxy explicitly refuses (reconnects "
                     "automatically; entries appear below)")
@@ -1007,7 +1004,7 @@ class ProxyForceApp(ctk.CTk):
     # update_*) are intentionally excluded so they never cause a disconnect.
     _PROXY_FIELDS = ("host", "port", "auth_type", "username", "password",
                      "exclude_private", "exclude_loopback", "bypass_list",
-                     "log_level", "ncsi_fallback", "auto_bypass")
+                     "log_level", "auto_bypass")
 
     def _proxy_settings_changed(self, vals: dict) -> bool:
         """True if any proxy-affecting field in `vals` differs from the config the

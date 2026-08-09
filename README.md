@@ -314,24 +314,19 @@ the symptom. `diagnostics.txt`'s **"NCSI connectivity"** / **"NCSI DNS probe"** 
 **"NCSI web probe"** sections (and a `NO INTERNET (NCSI)` verdict) show exactly which
 probe is failing.
 
-**Fix:** ProxyForce tells NlaSvc to stop actively probing (`EnableActiveProbing=0`,
-applied on every Start, restored on Stop) so Windows determines connectivity
-**passively** from real traffic instead — no action needed on a current version. This
-is the primary fix, not a fallback: NCSI's active probe needs a tight (~3.5s) round
-trip through the proxy interception layer, and that round trip isn't reliably fast
-under load (observed in testing: ProxyForce's own diagnostics routine was enough to
-occasionally blow the probe's timeout window, flipping Windows back to "no internet"
-a few seconds after the probe had briefly succeeded). Passive detection has no such
-timing sensitivity.
+**Fix:** ProxyForce keeps NCSI active probing enabled, answers its DNS probe with the
+exact literal it expects, and routes its HTTP probe through the local forward-proxy
+that fixes plaintext port 80. Startup diagnostics wait for a quiet NCSI probe window
+instead of launching a burst of subprocesses at the same time. If the ProxyForce
+profile is still not `Internet`, ProxyForce re-announces the proxy configuration once
+and allows a second quiet window before producing diagnostics.
 
-ProxyForce *also* answers NCSI's DNS probe with the exact literal it expects and
-routes its HTTP probe into the local forward-proxy that fixes the Edge updater, so
-the probes themselves succeed too — defense in depth if the fallback above is turned
-off in Settings, or if something else re-enables active probing later. If
-diagnostics still shows `NO INTERNET (NCSI)` with the **"NCSI active-probing
-fallback"** section reading anything other than PASS, that section names the actual
-problem (most likely `EnableActiveProbing` didn't get set — check the log for a
-"Could not suppress NCSI active probing" warning).
+The report checks the **ProxyForce** profile specifically and includes the latest
+matching NCSI Operational event (`ActiveHttpProbeFailedButDnsSucceeded`,
+`SuspectDnsProbeFailed`, and similar reasons), rather than treating another adapter's
+`Internet` state as success. ProxyForce no longer disables `EnableActiveProbing`;
+Microsoft advises that passive polling alone cannot determine every connectivity
+state.
 
 **A destination the corporate proxy refuses (Outlook/mail, or anything else)**
 Many corporate proxies permit HTTP `CONNECT` only to **:443** (or otherwise refuse

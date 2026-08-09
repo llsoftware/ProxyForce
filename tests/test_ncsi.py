@@ -1,156 +1,90 @@
-"""
-NCSI active-probing fallback tests (v2.2.1).
-
-Mirrors tests/test_system_proxy.py's approach: exercise the crash-safe snapshot /
-backup / restore contract with the actual registry mutation (_set_disabled /
-_write_entry) STUBBED OUT, so these tests never touch the real machine's NlaSvc
-setting. The read-only snapshot/state readers are safe to call live.
-
-Run:  python tests/test_ncsi.py
-"""
+"""Regression tests for the Windows Spotlight/NCSI startup path."""
 
 import os
 import sys
-import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from core import ncsi
-from core.singbox_controller import SingBoxController, ProxyConfig
+from core import ncsi, system_proxy
+from core import singbox_controller as controller_mod
+from core.singbox_controller import (
+    ProxyConfig, SingBoxController, _ncsi_event_reason,
+)
 
 
-class BackupRoundTripTests(unittest.TestCase):
+class EventReasonTests(unittest.TestCase):
+    def test_known_reasons(self):
+        for reason in ("ActiveHttpProbeFailedButDnsSucceeded",
+                       "SuspectDnsProbeFailed", "ActiveDnsProbeSucceeded"):
+            self.assertEqual(_ncsi_event_reason(
+                f"Capability: Local ChangeReason: {reason}"), reason)
 
+    def test_missing_reason(self):
+        self.assertEqual(_ncsi_event_reason("unrelated event"), "")
+
+
+class ActiveProbeStartupTests(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        self._orig_dir = ncsi._data_dir
-        ncsi._data_dir = lambda: self._tmp   # redirect backup to a temp dir
+        self.cfg = ProxyConfig(host="203.0.113.10", port=800)
+        self.c = SingBoxController(self.cfg)
+        self.orig_wait = self.c._stop_event.wait
+        self.orig_refresh = system_proxy.refresh
+        self.orig_diag = self.c._run_diagnostics
+        self.orig_settle = controller_mod._NCSI_SETTLE_SECONDS
+        self.orig_retry = controller_mod._NCSI_REFRESH_SECONDS
+        controller_mod._NCSI_SETTLE_SECONDS = 0
+        controller_mod._NCSI_REFRESH_SECONDS = 0
+        self.waits = []
+        self.refreshes = []
+        self.diags = []
+        self.c._stop_event.wait = lambda seconds: self.waits.append(seconds) or False
+        system_proxy.refresh = lambda: self.refreshes.append(True)
+        self.c._run_diagnostics = lambda: self.diags.append(True)
 
     def tearDown(self):
-        ncsi._data_dir = self._orig_dir
+        self.c._stop_event.wait = self.orig_wait
+        system_proxy.refresh = self.orig_refresh
+        self.c._run_diagnostics = self.orig_diag
+        controller_mod._NCSI_SETTLE_SECONDS = self.orig_settle
+        controller_mod._NCSI_REFRESH_SECONDS = self.orig_retry
 
-    def test_backup_write_read_clear(self):
-        snap = {"value": [1, 4]}
-        self.assertIsNone(ncsi._read_backup())
-        ncsi._write_backup(snap)
-        self.assertEqual(ncsi._read_backup(), snap)
-        ncsi._clear_backup()
-        self.assertIsNone(ncsi._read_backup())
+    def test_internet_after_quiet_window_runs_diagnostics_without_refresh(self):
+        self.c._proxyforce_connectivity = lambda: "Internet"
+        self.c._run_diagnostics_after_ncsi_settle()
+        self.assertEqual(self.waits, [0])
+        self.assertEqual(self.refreshes, [])
+        self.assertEqual(self.diags, [True])
 
-    def test_value_none_round_trips(self):
-        """The value never having existed is itself meaningful state (Windows
-        treats absence as enabled=1) — must round-trip as None, not 0/absent-key
-        confusion."""
-        snap = {"value": None}
-        ncsi._write_backup(snap)
-        self.assertEqual(ncsi._read_backup(), snap)
+    def test_local_profile_gets_one_refresh_and_second_quiet_window(self):
+        self.c._proxyforce_connectivity = lambda: "LocalNetwork"
+        self.c._run_diagnostics_after_ncsi_settle()
+        self.assertEqual(self.waits, [0, 0])
+        self.assertEqual(self.refreshes, [True])
+        self.assertEqual(self.diags, [True])
 
+    def test_stop_during_first_window_skips_everything(self):
+        self.c._stop_event.wait = lambda seconds: True
+        self.c._run_diagnostics_after_ncsi_settle()
+        self.assertEqual(self.refreshes, [])
+        self.assertEqual(self.diags, [])
 
-class SuppressAndRestoreTests(unittest.TestCase):
-    """suppress_active_probing()/restore() must snapshot before the first mutation
-    and preserve a true original across a crash (existing backup kept). The actual
-    registry write (_set_disabled/_write_entry) is stubbed so no real mutation
-    happens."""
-
-    def setUp(self):
-        self._tmp = tempfile.mkdtemp()
-        self._orig_dir = ncsi._data_dir
-        self._orig_set = ncsi._set_disabled
-        self._orig_write = ncsi._write_entry
-        self._orig_snapshot = ncsi._snapshot
-        ncsi._data_dir = lambda: self._tmp
-        self._set_calls = []
-        self._write_calls = []
-        ncsi._set_disabled = lambda: self._set_calls.append(True)
-        ncsi._write_entry = lambda entry: self._write_calls.append(entry)
-        ncsi._snapshot = lambda: {"value": [1, 4]}   # pretend probing was enabled
-
-    def tearDown(self):
-        ncsi._data_dir = self._orig_dir
-        ncsi._set_disabled = self._orig_set
-        ncsi._write_entry = self._orig_write
-        ncsi._snapshot = self._orig_snapshot
-
-    def test_suppress_writes_backup_before_mutating(self):
-        self.assertTrue(ncsi.suppress_active_probing())
-        self.assertEqual(ncsi._read_backup(), {"value": [1, 4]})
-        self.assertEqual(len(self._set_calls), 1)
-
-    def test_crash_safe_keeps_first_backup(self):
-        ncsi.suppress_active_probing()
-        first = ncsi._read_backup()
-        ncsi._snapshot = lambda: {"value": [0, 4]}   # a second run would see it already off
-        ncsi.suppress_active_probing()               # mid-takeover from a previous run
-        self.assertEqual(ncsi._read_backup(), first)  # true original preserved, not re-snapshot
-        self.assertEqual(len(self._set_calls), 2)      # but still re-asserts the mutation
-
-    def test_restore_writes_back_the_snapshotted_value_and_clears_backup(self):
-        ncsi.suppress_active_probing()
-        self.assertTrue(ncsi.restore())
-        self.assertEqual(self._write_calls[-1], [1, 4])
-        self.assertIsNone(ncsi._read_backup())
-
-    def test_restore_deletes_the_value_if_it_never_existed(self):
-        ncsi._snapshot = lambda: {"value": None}
-        ncsi.suppress_active_probing()
-        ncsi.restore()
-        self.assertIsNone(self._write_calls[-1])
-
-    def test_restore_with_no_backup_is_a_noop(self):
-        self.assertFalse(ncsi.restore())
-        self.assertEqual(self._write_calls, [])
+    def test_legacy_config_key_is_ignored(self):
+        from core.singbox_controller import make_proxy_config
+        cfg = make_proxy_config({"host": "proxy", "port": 8080,
+                                 "ncsi_fallback": False})
+        self.assertFalse(hasattr(cfg, "ncsi_fallback"))
 
 
-class TakeoverUnconditionalSuppressionTests(unittest.TestCase):
-    """v2.2.2: suppression must be unconditional at takeover time, not a
-    diagnostics-gated fallback applied only after a single connectivity check
-    reads "not Internet". The reactive design let one lucky/transient PASS
-    reading (observed live: Ethernet flickered to "Internet" for a few seconds
-    right as ProxyForce's own diagnostics burst started, then reverted) skip the
-    fallback entirely, leaving Windows stuck reporting no internet with nothing
-    left to correct it. SingBoxController._suppress_ncsi_active_probing is called
-    from _takeover_system_proxy on every start, unconditionally (subject only to
-    cfg.ncsi_fallback) — this exercises just that call site, with core.ncsi
-    stubbed out so no real registry/netsh calls happen (the rest of
-    _takeover_system_proxy is not touched here — see its own module's caution
-    about not calling it directly in a unit test)."""
-
-    def setUp(self):
-        self._orig = ncsi.suppress_active_probing
-        self._calls = []
-        ncsi.suppress_active_probing = lambda: self._calls.append(True) or True
-
-    def tearDown(self):
-        ncsi.suppress_active_probing = self._orig
-
-    def _controller(self, ncsi_fallback=True, on_log=None):
-        cfg = ProxyConfig(host="203.0.113.10", port=800, ncsi_fallback=ncsi_fallback)
-        return SingBoxController(cfg, on_log=on_log)
-
-    def test_suppression_called_unconditionally(self):
-        self._controller()._suppress_ncsi_active_probing()
-        self.assertEqual(len(self._calls), 1)
-
-    def test_disabled_by_config_skips_the_call(self):
-        self._controller(ncsi_fallback=False)._suppress_ncsi_active_probing()
-        self.assertEqual(self._calls, [])
-
-    def test_failure_is_logged_not_raised(self):
-        ncsi.suppress_active_probing = lambda: (_ for _ in ()).throw(OSError("nope"))
-        logs = []
-        self._controller(on_log=lambda msg, level: logs.append((msg, level)))\
-            ._suppress_ncsi_active_probing()   # must not raise
-        self.assertTrue(any("Could not suppress NCSI" in m for m, _ in logs))
+class LegacyRecoveryTests(unittest.TestCase):
+    def test_takeover_path_contains_restore_but_not_suppression(self):
+        import inspect
+        source = inspect.getsource(SingBoxController._takeover_system_proxy)
+        self.assertIn("ncsi.restore()", source)
+        self.assertNotIn("suppress_active_probing", source)
 
 
 class ReadOnlyReadersTests(unittest.TestCase):
-    """Snapshot + current_state only READ the registry — safe to call live."""
-
-    def test_snapshot_shape(self):
-        snap = ncsi._snapshot()
-        self.assertIn("value", snap)
-
     def test_current_state_returns_string(self):
         self.assertIsInstance(ncsi.current_state(), str)
 

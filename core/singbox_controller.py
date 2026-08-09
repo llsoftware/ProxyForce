@@ -143,6 +143,9 @@ _ADAPTER_SETTLE  = 3.0     # extra settle so CreateAdapter doesn't race teardown
 _SINGBOX_LOG_LEVELS = {"debug", "info", "warn"}
 _DEFAULT_LOG_LEVEL  = "info"
 
+_NCSI_SETTLE_SECONDS = 10
+_NCSI_REFRESH_SECONDS = 8
+
 
 class SingBoxState(Enum):
     STOPPED = "stopped"
@@ -163,8 +166,6 @@ class ProxyConfig:
     exclude_loopback: bool = True
     bypass_list: list = None        # extra hosts/CIDRs to send DIRECT
     log_level: str = "info"         # sing-box log verbosity (see _SINGBOX_LOG_LEVELS)
-    ncsi_fallback: bool = True      # last-resort EnableActiveProbing=0 if NCSI still
-                                     # reports no internet after diagnostics (core.ncsi)
     auto_bypass: bool = True        # auto-add + reconnect when the proxy explicitly
                                      # refuses a CONNECT, instead of requiring a manual
                                      # Bypass List edit (core.auto_bypass)
@@ -339,6 +340,12 @@ def _ncsi_dns_probe():
     return host, content
 
 
+def _ncsi_event_reason(text: str) -> str:
+    """Extract NCSI's machine-readable ChangeReason from an event message."""
+    m = re.search(r"\bChangeReason:\s*([A-Za-z0-9]+)", text or "")
+    return m.group(1) if m else ""
+
+
 def _looks_like_cidr_or_ip(entry: str) -> Optional[str]:
     """Return a CIDR string if entry is an IP or CIDR, else None (treat as domain)."""
     e = entry.strip()
@@ -467,7 +474,6 @@ def make_proxy_config(cfg: dict) -> "ProxyConfig":
         exclude_loopback=cfg.get("exclude_loopback", True),
         bypass_list=cfg.get("bypass_list", []),
         log_level=cfg.get("log_level", _DEFAULT_LOG_LEVEL),
-        ncsi_fallback=cfg.get("ncsi_fallback", True),
         auto_bypass=cfg.get("auto_bypass", True),
     )
 
@@ -1002,7 +1008,8 @@ class SingBoxController:
         # agents) off the stats loop so the GUI stays responsive. Writes
         # %ProgramData%\ProxyForce\diagnostics.txt + a one-line GUI verdict; now
         # also VERIFIES the enforcement above took (expects 2/2 split routes).
-        threading.Thread(target=self._run_diagnostics, daemon=True).start()
+        threading.Thread(target=self._run_diagnostics_after_ncsi_settle,
+                         daemon=True).start()
         while not self._stop_event.is_set():
             if self._proc.poll() is not None:
                 self._set_state(SingBoxState.ERROR)
@@ -1373,44 +1380,6 @@ class SingBoxController:
             except Exception:
                 pass
 
-    def _suppress_ncsi_active_probing(self):
-        """Suppress NCSI's ACTIVE probing unconditionally (not as a diagnostics-
-        triggered fallback — see the v2.2.1 postmortem below). NCSI's own DNS/web
-        probes are also fixed at the sing-box config level (predefined DNS answer +
-        the port-80 redirect rule in _render_config), and that fix genuinely works —
-        confirmed via the Microsoft-Windows-NCSI/Operational event log showing
-        ActiveDnsProbeSucceeded / Capability:Internet right after start. But active
-        probing requires a tight (~3.5s, registry WebTimeout) round trip through our
-        interception layer, and that round trip is NOT reliably fast: it was starved
-        by our OWN _run_diagnostics() subprocess-spawning burst in one observed case,
-        and could equally be slowed by corporate-proxy latency or AV scanning the new
-        connection on someone else's network. A single missed window flips NCSI to
-        "no internet" and it does not proactively retry on any schedule useful to a
-        user watching in real time — which is exactly what silently broke Windows
-        Spotlight even though the probes themselves were provably correct.
-
-        Passive detection (does real traffic actually flow?) has no such timing
-        sensitivity, which is why this is now unconditional standard takeover
-        behavior rather than a diagnostics-gated last resort — _run_diagnostics no
-        longer decides whether to apply it, only reports whether it took (see its
-        "NCSI active-probing fallback" section).
-
-        Extracted as its own method (rather than inlined in _takeover_system_proxy)
-        specifically so it can be unit-tested with core.ncsi stubbed out, without
-        touching the real registry/netsh calls the rest of that method makes."""
-        try:
-            if getattr(self.config, "ncsi_fallback", True):
-                from core import ncsi
-                if ncsi.suppress_active_probing():
-                    self._log("NCSI active probing suppressed (EnableActiveProbing=0) — "
-                              "Windows now determines internet connectivity passively "
-                              "from real traffic instead of a probe round-trip through "
-                              "ProxyForce, which is more reliable under load. Restored "
-                              "on stop. Disable via the NCSI fallback setting if you'd "
-                              "rather leave this untouched.")
-        except Exception as e:
-            self._log(f"Could not suppress NCSI active probing: {e}", "warning")
-
     def _takeover_system_proxy(self):
         """Point the Windows system proxy (WinINET + WinHTTP) at ProxyForce while it
         runs, using a PROTOCOL-SPLIT proxy so each scheme takes its working path:
@@ -1463,7 +1432,16 @@ class SingBoxController:
                       f"again.")
         except Exception as e:
             self._log(f"Could not set proxy environment variables: {e}", "warning")
-        self._suppress_ncsi_active_probing()
+        # Recover a crash-safe backup left by the short-lived v2.2.2 passive-only
+        # workaround. New sessions never disable active probing: NCSI needs its
+        # active HTTP/DNS result to classify the ProxyForce interface as Internet.
+        try:
+            from core import ncsi
+            if ncsi.restore():
+                self._log("Legacy NCSI active-probing setting restored; active "
+                          "probing remains enabled while ProxyForce runs.")
+        except Exception as e:
+            self._log(f"Could not restore the legacy NCSI setting: {e}", "warning")
         # v2.1.27: Store/UWP apps run in an AppContainer, which Windows blocks from
         # reaching loopback by default — so pointing the system proxy at 127.0.0.1
         # above makes the Microsoft Store (and every other UWP app) fail outright
@@ -1541,7 +1519,7 @@ class SingBoxController:
         try:
             from core import ncsi
             if ncsi.restore():
-                self._log("NCSI active-probing fallback restored to its previous setting.")
+                self._log("Legacy NCSI active-probing setting restored.")
         except Exception as e:
             self._log(f"Could not restore the NCSI active-probing setting: {e}", "warning")
 
@@ -1556,6 +1534,36 @@ class SingBoxController:
             return ((r.stdout or "") + (r.stderr or "")).strip()
         except Exception as e:
             return f"<command failed: {e}>"
+
+    def _proxyforce_connectivity(self) -> str:
+        """Return NCSI's IPv4 capability for the ProxyForce interface only."""
+        return self._ps(
+            "(Get-NetConnectionProfile -InterfaceAlias 'ProxyForce' "
+            "-ErrorAction SilentlyContinue).IPv4Connectivity").strip()
+
+    def _run_diagnostics_after_ncsi_settle(self):
+        """Keep startup quiet until NCSI's active probe has had a fair run.
+
+        The old diagnostics burst began one second before the diagnosed HTTP
+        probe and the interface fell back to LocalNetwork. If the first quiet
+        window still has not produced Internet capability, announce the already-
+        configured proxy once more (an NCSI refresh trigger) and allow one final
+        quiet window before collecting the full report.
+        """
+        if self._stop_event.wait(_NCSI_SETTLE_SECONDS):
+            return
+        if self._proxyforce_connectivity() != "Internet":
+            try:
+                from core import system_proxy
+                system_proxy.refresh()
+                self._log("ProxyForce network profile is not Internet yet; "
+                          "re-announced the proxy configuration and allowing NCSI "
+                          "one final quiet probe window.", "warning")
+            except Exception as e:
+                self._log(f"Could not refresh NCSI after startup: {e}", "warning")
+            if self._stop_event.wait(_NCSI_REFRESH_SECONDS):
+                return
+        self._run_diagnostics()
 
     def _run_diagnostics(self):
         """Capture the GROUND TRUTH of why traffic is/ isn't being redirected.
@@ -1760,10 +1768,17 @@ class SingBoxController:
             conn_profile = self._ps(
                 "Get-NetConnectionProfile | Select-Object InterfaceAlias,IPv4Connectivity | "
                 "Format-Table -Auto | Out-String")
-            pf_connectivity = self._ps(
-                "(Get-NetConnectionProfile -InterfaceAlias 'ProxyForce' "
-                "-ErrorAction SilentlyContinue).IPv4Connectivity").strip()
+            pf_connectivity = self._proxyforce_connectivity()
             ncsi_ok = pf_connectivity == "Internet"
+            ncsi_event = self._ps(
+                "$g=(Get-NetAdapter -Name 'ProxyForce' -ErrorAction SilentlyContinue)."
+                "InterfaceGuid.ToString();"
+                "if($g){Get-WinEvent -FilterHashtable "
+                "@{LogName='Microsoft-Windows-NCSI/Operational'} -ErrorAction "
+                "SilentlyContinue | Where-Object {$_.Message -match "
+                "[regex]::Escape($g)} | Select-Object -First 1 -ExpandProperty Message}",
+                timeout=10)
+            ncsi_reason = _ncsi_event_reason(ncsi_event)
             ncsi_conf = self._ps(
                 "$k='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NlaSvc\\Parameters\\Internet';"
                 "$p=Get-ItemProperty $k -ErrorAction SilentlyContinue;"
@@ -1802,6 +1817,10 @@ class SingBoxController:
                  "Windows reports Internet connectivity (NCSI)" if ncsi_ok else
                  "Windows does NOT report Internet connectivity (NCSI) — Spotlight/Store/"
                  "Widgets will silently stop refreshing")
+            section(fh, "Latest NCSI event for ProxyForce",
+                    ncsi_event or "(no matching event found)",
+                    (f"Latest change reason: {ncsi_reason}" if ncsi_reason else
+                     "No ChangeReason was available; use the DNS/web checks below."))
             section(fh, "NCSI DNS probe",
                     f"{dns_host}: want '{dns_want}', got '{dns_got or '(none)'}'",
                     ("PASS — matches exactly" if dns_probe_ok else
@@ -1815,33 +1834,19 @@ class SingBoxController:
                      "route rule sending it to the local forward-proxy, sing-box's CONNECT-only "
                      "outbound gets 403'd by the corporate proxy on :80."))
 
-            # ── NCSI active-probing fallback: report state, don't decide here anymore.
-            # _takeover_system_proxy() already applied this UNCONDITIONALLY (subject to
-            # cfg.ncsi_fallback) before this diagnostics pass started — see that
-            # method's comment for why a reactive, diagnostics-gated apply proved
-            # unreliable. This just confirms it actually took.
-            ncsi_fallback_enabled = getattr(self.config, "ncsi_fallback", True)
+            # Active probing must remain enabled. Passive polling alone cannot
+            # establish every connectivity state and previously left Spotlight idle.
             try:
                 from core import ncsi
                 ncsi_state = ncsi.current_state()
             except Exception as e:
                 ncsi_state = f"<unavailable: {e}>"
             probing_suppressed = "EnableActiveProbing=0" in ncsi_state
-            if not ncsi_fallback_enabled:
-                section(fh, "NCSI active-probing fallback", ncsi_state,
-                        "INFO — disabled by config (ncsi_fallback=false); relying solely "
-                        "on the DNS/web probe fixes above.")
-            elif probing_suppressed:
-                section(fh, "NCSI active-probing fallback", ncsi_state,
-                        "PASS — active probing suppressed at takeover; Windows determines "
-                        "connectivity passively from real traffic instead of a timing-"
-                        "sensitive probe round trip.")
-            else:
-                section(fh, "NCSI active-probing fallback", ncsi_state,
-                        "WARN — fallback is enabled but EnableActiveProbing is not 0; "
-                        "suppression may have failed at takeover (check the log for a "
-                        "'Could not suppress NCSI active probing' warning) or something "
-                        "else re-enabled it since.")
+            section(fh, "NCSI active probing", ncsi_state,
+                    ("FAIL — active probing is disabled; ProxyForce no longer makes "
+                     "this change. Check Group Policy or a legacy ncsi_backup.json."
+                     if probing_suppressed else
+                     "PASS — active probing remains enabled."))
 
             # ── End-to-end capture probe ──
             section(fh, "Capture probe (TCP 443 → example.com)", self._ps(
@@ -2138,11 +2143,9 @@ class SingBoxController:
                            "report 'Internet' connectivity, even though capture/DNS/the proxy "
                            "takeover all work. Every component that gates on connectivity level — "
                            "Windows Spotlight/lock-screen images, Microsoft Store, Widgets, Teams "
-                           "presence — silently stops refreshing with no visible error. If the "
-                           "'NCSI active-probing fallback' section above shows PASS, this should "
-                           "self-correct within a short time as passive detection observes real "
-                           "traffic; if it shows WARN, that's the actual problem to chase. See the "
-                           "NCSI connectivity / DNS probe / web probe sections for detail.")
+                           "presence — silently stops refreshing with no visible error. See the "
+                           "latest NCSI event plus the DNS/web probe sections for the exact "
+                           "active-probe failure reason.")
             elif problems:
                 verdict = "PARTIAL — engine mostly healthy; see the WARN lines in diagnostics.txt."
             else:

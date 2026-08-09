@@ -1,25 +1,10 @@
 """
-ProxyForce — NCSI active-probing fallback (last resort for the Spotlight/NCSI fix).
+ProxyForce — legacy NCSI active-probing recovery.
 
-WHY THIS EXISTS: the port-80 route rule (singbox_controller._render_config) and the
-NCSI DNS `predefined` rule (_ncsi_dns_probe) are the REAL fix — they make NlaSvc's
-own probes genuinely succeed, so Windows correctly reports Internet connectivity
-while ProxyForce runs. This module is the fallback for anything that fix doesn't
-anticipate (a probe host/path retargeted by policy in a way the two rules above
-don't cover, an NlaSvc quirk on a specific Windows build, …): it tells NlaSvc to
-stop ACTIVELY probing and fall back to passive connectivity detection, which reports
-Internet as long as traffic is actually flowing — sidestepping the probe entirely
-rather than trying to make it succeed.
-
-Because it is a fallback, singbox_controller only calls suppress_active_probing()
-if diagnostics still finds IPv4Connectivity != Internet after the real fix has had
-a chance to take effect — never unconditionally. See core.config_store's
-"ncsi_fallback" key to disable this lane entirely.
-
-Snapshot/backup/restore follows the exact same crash-safe contract as
-core.system_proxy: the backup is written to disk BEFORE the first mutation, so a
-crashed run can be rolled back on the next start, and an existing backup found at
-start is kept as the true original (a previous run is still mid-takeover).
+v2.2.2 briefly disabled EnableActiveProbing and saved its previous registry value
+here. Current versions keep active probing enabled, as required for Windows to mark
+the ProxyForce interface as Internet. This module remains only to restore a backup
+left by an interrupted older run and to report the current value in diagnostics.
 """
 
 import os
@@ -82,19 +67,8 @@ def _clear_backup():
 
 # ── public API ───────────────────────────────────────────────────────────────────
 
-def _set_disabled():
-    """The actual registry mutation for suppress_active_probing(), split out so
-    tests can stub just this primitive (see tests/test_ncsi.py) rather than
-    touching the real machine's NlaSvc setting."""
-    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NCSI_KEY, 0,
-                        winreg.KEY_SET_VALUE) as k:
-        winreg.SetValueEx(k, _VALUE, 0, winreg.REG_DWORD, 0)
-
-
 def _write_entry(entry):
-    """The actual registry mutation for restore(), split out for the same reason
-    as _set_disabled(). `entry` is None (value never existed — delete it again) or
-    [value, type] (write it back verbatim)."""
+    """Restore None (delete) or a saved [value, registry_type] pair."""
     with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NCSI_KEY, 0,
                         winreg.KEY_SET_VALUE) as k:
         if entry is None:
@@ -105,19 +79,6 @@ def _write_entry(entry):
         else:
             val, typ = entry
             winreg.SetValueEx(k, _VALUE, 0, typ, val)
-
-
-def suppress_active_probing() -> bool:
-    """Snapshot (crash-safe) then set EnableActiveProbing=0, so NlaSvc stops
-    actively probing dns.msftncsi.com / www.msftconnecttest.com and falls back to
-    passive detection instead. Returns True if the value was set."""
-    if _read_backup() is None:
-        _write_backup(_snapshot())
-    try:
-        _set_disabled()
-        return True
-    except OSError:
-        return False
 
 
 def restore() -> bool:

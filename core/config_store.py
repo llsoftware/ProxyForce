@@ -39,8 +39,6 @@ _DEFAULTS = {
     "exclude_private": True,
     "exclude_loopback": True,
     "bypass_list": [],
-    "ncsi_fallback": True,   # last-resort EnableActiveProbing=0 if NCSI still reports
-                             # no internet after the port-80/DNS fixes (core.ncsi)
     "auto_bypass": True,    # auto-add + reconnect when the proxy explicitly refuses a
                              # CONNECT, instead of requiring a manual Bypass List edit
     "autostart": False,
