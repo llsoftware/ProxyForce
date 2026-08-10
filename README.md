@@ -333,15 +333,8 @@ Many corporate proxies permit HTTP `CONNECT` only to **:443** (or otherwise refu
 specific ports/hosts by policy) and answer with a **403** — the same restriction
 documented above for the Microsoft Edge updater on plaintext :80. Every network's
 policy is different (mail ports are one common case, but ProxyForce has seen
-internal/internal-only hosts refused on arbitrary ports too), so ProxyForce
-**auto-bypasses** any destination the proxy explicitly refuses: it notices the
-refusal, adds the host to the Bypass List itself, and reconnects — no manual step
-needed. Watch the **Log** tab for a line like *"Auto-bypass: added `host` to the
-Bypass List … — reconnecting…"*, and check Settings ▸ **Bypass List** afterward to
-see (and, if you want, remove) what was added automatically. Turn this off via the
-**"Auto-bypass"** checkbox in Settings if you'd rather every exception be manual.
-
-If auto-bypass is off, or you'd rather pre-empt the brief reconnect it causes:
+internal/internal-only hosts refused on arbitrary ports too). ProxyForce does not
+add exceptions on its own — route the refused destination(s) DIRECT yourself:
 
 1. Settings ▸ **Bypass List** ▸ add the destination hostname(s), e.g.
    `imaps.example.com` and `smtps.example.com` for mail (one per line — CIDRs and
@@ -353,8 +346,7 @@ If auto-bypass is off, or you'd rather pre-empt the brief reconnect it causes:
    and reports each port's actual status — a `403` there tells you definitively
    this proxy refuses that port, rather than a bare "reachable" that says nothing
    about policy. `diagnostics.txt`'s **"Proxy CONNECT policy"** section reports
-   the same thing after the fact, sourced from sing-box's own log — and now also
-   notes when auto-bypass has already handled it for you.
+   the same thing after the fact, sourced from sing-box's own log.
 
 If the destination isn't reachable at all without ProxyForce running either, this
 won't help — bypassing only works for hosts your network can already reach
@@ -363,7 +355,10 @@ workaround the way there is for plaintext HTTP: mail isn't HTTP, so it can't be
 relayed as a `GET` — direct routing (automatic or manual) is the only fix.
 
 **407 Proxy Authentication Required**
-Wrong credentials or auth type. Open Settings and check username/password/auth type.
+Wrong credentials or auth type. Open Settings and check username/password/auth type —
+in particular, Auth Type must be **Basic** for a username/password to be sent at all;
+Settings shows a warning (and the Log tab logs one on Save/Connect) if Auth Type is
+**None** or **NTLM** while credentials are filled in, since neither of those sends them.
 
 **SSL errors / certificate warnings**
 Push your corporate CA certificate to Trusted Root via GPO:

@@ -166,9 +166,6 @@ class ProxyConfig:
     exclude_loopback: bool = True
     bypass_list: list = None        # extra hosts/CIDRs to send DIRECT
     log_level: str = "info"         # sing-box log verbosity (see _SINGBOX_LOG_LEVELS)
-    auto_bypass: bool = True        # auto-add + reconnect when the proxy explicitly
-                                     # refuses a CONNECT, instead of requiring a manual
-                                     # Bypass List edit (core.auto_bypass)
 
     def __post_init__(self):
         if self.bypass_list is None:
@@ -474,7 +471,6 @@ def make_proxy_config(cfg: dict) -> "ProxyConfig":
         exclude_loopback=cfg.get("exclude_loopback", True),
         bypass_list=cfg.get("bypass_list", []),
         log_level=cfg.get("log_level", _DEFAULT_LOG_LEVEL),
-        auto_bypass=cfg.get("auto_bypass", True),
     )
 
 
@@ -482,21 +478,11 @@ class SingBoxController:
     """Runs and supervises sing-box; presents the Redirector interface."""
 
     def __init__(self, config: ProxyConfig, on_state_change: Callable = None,
-                 on_stats_update: Callable = None, on_log: Callable = None,
-                 on_auto_bypass: Callable = None):
+                 on_stats_update: Callable = None, on_log: Callable = None):
         self.config = config
         self.on_state_change = on_state_change
         self.on_stats_update = on_stats_update
         self.on_log = on_log
-        # Called with a list of newly-discovered hostnames the moment
-        # _check_auto_bypass finds an explicit proxy CONNECT refusal for them —
-        # never with dial timeouts/unreachable, only real "the proxy answered and
-        # said no" cases. The controller can't safely restart itself from inside
-        # its own steady-state thread; the caller (the GUI) owns swapping in a
-        # fresh SingBoxController, same as it already does for a Settings-save
-        # restart. See _check_auto_bypass and core/auto_bypass for the full
-        # rationale.
-        self.on_auto_bypass = on_auto_bypass
         self.state = SingBoxState.STOPPED
         self.stats = ConnectionStats()
 
@@ -519,12 +505,6 @@ class SingBoxController:
         self._trace_conns = True
         self._uwp_thread: Optional[threading.Thread] = None
         self._uwp_sweep_ticks = 0
-        # Hosts already reported/handed to on_auto_bypass this engine lifetime, so
-        # a rejection that keeps reappearing in the log tail (it will, until enough
-        # newer lines push it out) doesn't re-trigger the callback/restart request
-        # every tick while a restart is still pending.
-        self._auto_bypass_reported = set()
-        self._auto_bypass_ticks = 0
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -1036,14 +1016,6 @@ class SingBoxController:
                     self._uwp_thread = threading.Thread(
                         target=self._exempt_uwp_loopback, daemon=True)
                     self._uwp_thread.start()
-            # Check for new proxy CONNECT refusals every ~6s (3 ticks at 2s each) —
-            # short enough to feel immediate, long enough to naturally batch several
-            # refusals discovered close together into one restart instead of one per
-            # host. See _check_auto_bypass / core/auto_bypass.
-            self._auto_bypass_ticks += 1
-            if self._auto_bypass_ticks >= 3:
-                self._auto_bypass_ticks = 0
-                self._check_auto_bypass()
             self._stop_event.wait(2)
 
     # ── TUN adapter lifecycle (Win 10 wintun cleanup) ─────────────────────────
@@ -1933,18 +1905,10 @@ class SingBoxController:
             # (a bypassed host, a manual routing override) is still hitting CONNECT
             # on :80, which is worth surfacing rather than silently swallowing.
             #
-            # As of v2.2.2 this is no longer purely a "go fix it yourself" WARN:
-            # _check_auto_bypass (running periodically in the steady-state loop)
-            # already handles this automatically when cfg.auto_bypass is enabled,
-            # so by the time a user reads this report the destination has often
-            # already been bypassed and reconnected past. This section reports
-            # what was SEEN, not what the user needs to go do about it.
-            from core import auto_bypass as _auto_bypass_mod
             reject_lines = self._scan_upstream_rejections(self._tail_log_lines(200))
-            rejections = _auto_bypass_mod.extract_rejections(reject_lines)
+            rejections = self._extract_rejections(reject_lines)
             connect_denied = bool(rejections)
             denied_desc = ", ".join(f"{h}:{p}" for h, p, _c in rejections)
-            auto_bypass_on = getattr(self.config, "auto_bypass", True)
             already_bypassed = {normalize_bypass_entry(e)[0]
                                 for e in (self.config.bypass_list or [])}
             all_handled = connect_denied and all(
@@ -1954,24 +1918,19 @@ class SingBoxController:
                      else "No CONNECT refusals seen in the recent log."),
                     ("PASS — refusal(s) seen but already routed DIRECT via the Bypass List "
                      f"({denied_desc})" if all_handled else
-                     f"INFO — the proxy refused CONNECT for {denied_desc}; auto-bypass is "
-                     "enabled and will route it DIRECT automatically (a brief reconnect "
-                     "follows if it hasn't already happened by the time you read this)."
-                     if connect_denied and auto_bypass_on else
-                     f"WARN — the proxy refuses CONNECT for {denied_desc} and auto-bypass is "
-                     "disabled; add the destination(s) to the Bypass List manually so they "
-                     "route DIRECT."
+                     f"WARN — the proxy refuses CONNECT for {denied_desc}; add the "
+                     "destination(s) to the Bypass List so they route DIRECT."
                      if connect_denied else
                      "PASS — no CONNECT refusals seen in the recent log."))
             step(not connect_denied or all_handled,
                  "no proxy CONNECT refusals seen" if not connect_denied else
-                 (f"refusal(s) already auto-bypassed ({denied_desc})" if all_handled else
+                 (f"refusal(s) already bypassed ({denied_desc})" if all_handled else
                   f"proxy refuses CONNECT for {denied_desc} — "
-                  + ("auto-bypass will apply shortly" if auto_bypass_on else
-                     "route those hosts DIRECT via the Bypass List")))
-            # connect_denied now only drives the VERDICT when auto-bypass hasn't
-            # (yet, or can't) resolve it — see the verdict block below.
-            connect_denied = connect_denied and not all_handled and not auto_bypass_on
+                  "route those hosts DIRECT via the Bypass List"))
+            # connect_denied now only drives the VERDICT when it hasn't already
+            # been resolved by a manual Bypass List entry — see the verdict
+            # block below.
+            connect_denied = connect_denied and not all_handled
 
             # ── System proxy: must point at OUR local listener (so proxy-aware apps,
             # incl. the Edge updater, route through sing-box over TCP — not QUIC/direct
@@ -2117,10 +2076,9 @@ class SingBoxController:
                            "the Proxy reachability section.")
             elif connect_denied:
                 verdict = ("PROXY CONNECT POLICY — the upstream proxy is reachable but refuses "
-                           f"CONNECT for {denied_desc}. Auto-bypass is disabled (Settings), so this "
-                           "won't resolve on its own — add the destination(s) to the Bypass List "
-                           "manually so they route DIRECT instead of retrying the proxy, or "
-                           "re-enable auto-bypass. See the Proxy CONNECT policy section.")
+                           f"CONNECT for {denied_desc}. This won't resolve on its own — add the "
+                           "destination(s) to the Bypass List (Settings) so they route DIRECT "
+                           "instead of retrying the proxy. See the Proxy CONNECT policy section.")
             elif competing:
                 verdict = ("WFP CONTENTION LIKELY — routes/DNS look OK but a competing agent is "
                            "present and may outbid capture. Disable it to confirm.")
@@ -2222,6 +2180,16 @@ class SingBoxController:
     # logs this as `unexpected status: 403 Forbidden` (or 407/502/503).
     _UPSTREAM_REJECT_MARKER = "unexpected status:"
 
+    # sing-box logs a refusal as (verified against the bundled 1.13.12 binary, e.g.):
+    #   "connection: open connection to docker.illo.secure:1688 using
+    #    outbound/http[proxy-out]: unexpected status: 403 Forbidden"
+    # The host:port and status code are both right there in the same line
+    # _scan_upstream_rejections isolates — no need to correlate against a
+    # separate "outbound connection to ..." line.
+    _UPSTREAM_REJECT_RE = re.compile(
+        r"open connection to (?P<host>[^\s:]+):(?P<port>\d+) "
+        r"using outbound/\S+: unexpected status: (?P<code>\d+)")
+
     @classmethod
     def _scan_upstream_rejections(cls, lines) -> List[str]:
         """Return log lines where sing-box's proxy-out outbound got a real HTTP
@@ -2231,63 +2199,22 @@ class SingBoxController:
         _DIAL_FAIL_KEYWORDS (guarded by tests/test_proxy_reachability.py) since
         the two failure modes need different verdicts and different fixes: a
         dial failure means the proxy is unreachable; a rejection means it IS
-        reachable and is refusing this port by policy — see _check_auto_bypass,
-        which now handles this automatically rather than requiring a manual
-        Bypass List edit."""
+        reachable and is refusing this port by policy — surfaced in diagnostics
+        so the user can add it to the Bypass List themselves."""
         return [ln for ln in (lines or []) if cls._UPSTREAM_REJECT_MARKER in ln.lower()]
 
-    def _check_auto_bypass(self):
-        """Detect NEW proxy CONNECT refusals and, if cfg.auto_bypass allows it, ask
-        to route them DIRECT going forward — no manual Bypass List edit required.
-
-        ProxyForce is used against many different corporate proxy policies, each
-        with its own idea of what gets refused (diagnosed 2026-08-08: an internal
-        DNS-suffixed hostname refused on an arbitrary internal port, nothing to do
-        with any documented case like Outlook's mail ports). The general answer is
-        to try the proxy first and notice when it explicitly says no, rather than
-        hardcode assumptions about any particular network.
-
-        Deliberately narrow: only an EXPLICIT refusal counts (the proxy answered
-        with a real non-2xx status — see core.auto_bypass.extract_rejections,
-        fed from _scan_upstream_rejections). A dial timeout/unreachable condition
-        is a different failure mode (_scan_upstream_dial_failures) and must NOT
-        trigger this — that's evidence of a network problem, not a policy
-        decision, and auto-bypassing on it would silently leak traffic around the
-        proxy for the wrong reason.
-
-        Can't safely restart the engine from inside its own steady-state thread,
-        so this only detects + persists + asks (via on_auto_bypass); the actual
-        restart is the GUI's job, reusing the exact same path a Settings-save
-        restart already uses.
-        """
-        if not getattr(self.config, "auto_bypass", True):
-            return
-        try:
-            from core import auto_bypass
-            reject_lines = self._scan_upstream_rejections(self._tail_log_lines(200))
-            rejections = auto_bypass.extract_rejections(reject_lines)
-        except Exception:
-            return
-        if not rejections:
-            return
-        existing = {normalize_bypass_entry(e)[0] for e in (self.config.bypass_list or [])}
-        new_entries = []
-        for host, port, code in rejections:
-            base, _apex, err = normalize_bypass_entry(host)
-            if err or base is None or base in existing or base in self._auto_bypass_reported:
-                continue
-            self._auto_bypass_reported.add(base)
-            new_entries.append((base, port, code))
-        if not new_entries:
-            return
-        for base, port, code in new_entries:
-            self._log(f"{base} now routes DIRECT — the proxy refused CONNECT on "
-                      f"port {port} (status {code}). Reconnecting to apply…")
-        if self.on_auto_bypass:
-            try:
-                self.on_auto_bypass([base for base, _port, _code in new_entries])
-            except Exception as e:
-                self._log(f"Auto-bypass callback failed: {e}", "warning")
+    @classmethod
+    def _extract_rejections(cls, reject_lines):
+        """Parse (host, port, code) out of each already-isolated rejection log
+        line (i.e. lines that matched _scan_upstream_rejections). Lines that
+        don't match the expected shape are silently skipped — best-effort, used
+        only to name the refused destination in diagnostics."""
+        out = []
+        for ln in reject_lines or []:
+            m = cls._UPSTREAM_REJECT_RE.search(ln)
+            if m:
+                out.append((m.group("host"), int(m.group("port")), int(m.group("code"))))
+        return out
 
     def _close_log(self):
         try:

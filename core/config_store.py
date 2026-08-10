@@ -39,8 +39,6 @@ _DEFAULTS = {
     "exclude_private": True,
     "exclude_loopback": True,
     "bypass_list": [],
-    "auto_bypass": True,    # auto-add + reconnect when the proxy explicitly refuses a
-                             # CONNECT, instead of requiring a manual Bypass List edit
     "autostart": False,
     "start_minimized": False,
     "log_level": "info",
@@ -160,6 +158,83 @@ def load_config() -> dict:
             pass
 
     return result
+
+
+def auth_config_warnings(cfg: dict) -> list:
+    """Warn when Auth Type and the credential fields disagree, i.e. the config
+    looks authenticated but no credentials will actually reach the proxy (the
+    engine only sends them when auth_type == "basic" — see
+    SingBoxController._render_config). Returns [] when consistent.
+
+    Diagnosed 2026-08-08: auto-bypass silently flipped a saved config's
+    auth_type to "none" while leaving username/password populated, so the
+    proxy got no credentials and answered 407 with nothing telling the user
+    why — hours were lost to that. This has no dependency on auto-bypass
+    (removed) since the same silent mismatch could arise from any other
+    partial config write, a hand-edited registry value, or a stale JSON
+    fallback file."""
+    auth = str(cfg.get("auth_type", "none")).lower()
+    username = cfg.get("username") or ""
+    password = cfg.get("password") or ""
+    warnings = []
+    if auth == "none" and (username or password):
+        warnings.append(
+            'Auth Type is "None" but a username/password is configured — the '
+            "credentials will NOT be sent to the proxy. Set Auth Type to Basic "
+            "if the proxy requires authentication.")
+    elif auth == "basic" and not username:
+        warnings.append(
+            'Auth Type is "Basic" but the username is empty — the proxy will '
+            "answer 407 Proxy Authentication Required.")
+    elif auth == "basic" and not password:
+        warnings.append(
+            'Auth Type is "Basic" but the password is empty — the proxy will '
+            "answer 407 if it requires one.")
+    elif auth == "ntlm" and (username or password):
+        warnings.append(
+            'Auth Type is "NTLM", which ProxyForce does not implement — the '
+            "credentials will NOT be sent (NTLM behaves exactly like None). "
+            "Use Basic if the proxy accepts it.")
+    return warnings
+
+
+# ── Legacy migration ────────────────────────────────────────────────────────
+# The v2.2.2 "auto_bypass" registry/JSON value is gone from _DEFAULTS (the
+# feature it drove — auto-discovering and adding hosts to the Bypass List —
+# was removed: it picked up bad entries and, via a partial-config-write bug,
+# reset Auth Type to "none" on every reconnect). A machine that still carries
+# the leftover value may also carry Bypass List entries that feature added on
+# its own, worth a one-time nudge to review.
+_LEGACY_AUTO_BYPASS_KEY = "auto_bypass"
+
+
+def consume_legacy_auto_bypass_flag() -> bool:
+    """True (once) if this machine still carries the v2.2.2 `auto_bypass`
+    value, meaning entries may have been auto-added to bypass_list. Deletes it
+    from both stores so the notice never repeats. Best-effort, never raises."""
+    found = False
+    try:
+        with winreg.OpenKey(REG_ROOT, REG_KEY, 0, winreg.KEY_ALL_ACCESS) as key:
+            try:
+                winreg.QueryValueEx(key, _LEGACY_AUTO_BYPASS_KEY)
+                found = True
+                winreg.DeleteValue(key, _LEGACY_AUTO_BYPASS_KEY)
+            except FileNotFoundError:
+                pass
+    except OSError:
+        pass
+    if os.path.exists(CONFIG_FILE_FALLBACK):
+        try:
+            with open(CONFIG_FILE_FALLBACK) as f:
+                data = json.load(f)
+            if _LEGACY_AUTO_BYPASS_KEY in data:
+                found = True
+                del data[_LEGACY_AUTO_BYPASS_KEY]
+                with open(CONFIG_FILE_FALLBACK, "w") as f:
+                    json.dump(data, f, indent=2)
+        except Exception:
+            pass
+    return found
 
 
 # ── Autostart (Scheduled Task) ─────────────────────────────────────────────────

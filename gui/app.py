@@ -19,7 +19,10 @@ import customtkinter as ctk
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE_DIR, ".."))
 
-from core.config_store import load_config, save_config, save_autostart
+from core.config_store import (
+    load_config, save_config, save_autostart, auth_config_warnings,
+    consume_legacy_auto_bypass_flag,
+)
 from core.singbox_controller import (
     SingBoxController, SingBoxState, make_proxy_config, normalize_bypass_entry,
     probe_connect, _CONNECT_PROBE_PORTS,
@@ -374,14 +377,18 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._entry(s2, "username", placeholder="domain\\user")
         self._lbl(s2, "Password")
         self._entry(s2, "password", show="●", placeholder="●●●●●●●●")
+        self._auth_warn_lbl = ctk.CTkLabel(
+            s2, text="", justify="left", wraplength=260, anchor="w",
+            font=ctk.CTkFont("Segoe UI", 10), text_color=THEME["yellow"])
+        self._auth_warn_lbl.pack(anchor="w", pady=(6, 0))
+        for k in ("_auth_display", "username", "password"):
+            self._vars[k].trace_add("write", lambda *_: self._refresh_auth_warning())
+        self._refresh_auth_warning()
 
         s3 = self._section("TRAFFIC RULES")
         self._check(s3, "exclude_private",
                     "Bypass private IP ranges (RFC1918 / ULA / link-local)")
         self._check(s3, "exclude_loopback", "Bypass loopback (127.x / ::1)")
-        self._check(s3, "auto_bypass",
-                    "Auto-bypass hosts the proxy explicitly refuses (reconnects "
-                    "automatically; entries appear below)")
         self._lbl(s3, "Bypass List  —  one entry per line: hostname, *.hostname, "
                       "or CIDR. No scheme, port or path — routed DIRECT for any "
                       "protocol/port, e.g. mail hosts on 993/465/587.")
@@ -480,20 +487,48 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         return d
 
     def set_values(self, d: dict):
+        """Apply values from `d` to the matching widgets. `d` may be PARTIAL (a
+        caller updating just one field, e.g. the Bypass List) — a key/pseudo-key
+        with nothing in `d` for it MUST be left exactly as the user has it. This
+        used to be the bug behind a since-removed feature: the three pseudo-keys
+        below read d.get(..., "none"/"stable"/"info") unconditionally, so a
+        partial dict silently reset Auth Type/Update Channel/Log Level to their
+        defaults on every call — including flipping Basic auth to None while the
+        username/password stayed put, so the proxy quietly stopped
+        authenticating. Each pseudo-key is now guarded exactly like a plain key."""
         for k, var in self._vars.items():
             if k == "_auth_display":
-                var.set(_AUTH_DISPLAY.get(str(d.get("auth_type", "none")).lower(), "None"))
+                if "auth_type" in d:
+                    var.set(_AUTH_DISPLAY.get(str(d.get("auth_type", "none")).lower(), "None"))
             elif k == "_channel_display":
-                var.set("Development" if str(d.get("update_channel", "stable")).lower() == "dev"
-                        else "Stable")
+                if "update_channel" in d:
+                    var.set("Development" if str(d.get("update_channel", "stable")).lower() == "dev"
+                            else "Stable")
             elif k == "_loglevel_display":
-                var.set(_LOGLEVEL_DISPLAY.get(str(d.get("log_level", "info")).lower(),
-                                              _LOGLEVEL_DISPLAY["info"]))
+                if "log_level" in d:
+                    var.set(_LOGLEVEL_DISPLAY.get(str(d.get("log_level", "info")).lower(),
+                                                  _LOGLEVEL_DISPLAY["info"]))
             elif k in d:
                 var.set(d[k])
         if "bypass_list" in d and self._bypass_text:
             self._bypass_text.delete("1.0", "end")
             self._bypass_text.insert("1.0", "\n".join(d["bypass_list"]))
+        self._refresh_auth_warning()
+
+    def _refresh_auth_warning(self):
+        """Live-updates the yellow note under the Auth Type control whenever it,
+        the username, or the password changes — see auth_config_warnings for
+        the cases covered. No Save needed to see it."""
+        lbl = getattr(self, "_auth_warn_lbl", None)
+        if lbl is None:
+            return
+        cfg = {
+            "auth_type": _AUTH_INTERNAL.get(self._vars["_auth_display"].get(), "none"),
+            "username": self._vars["username"].get(),
+            "password": self._vars["password"].get(),
+        }
+        warnings = auth_config_warnings(cfg)
+        lbl.configure(text=("⚠ " + warnings[0]) if warnings else "")
 
     def set_update_status(self, text: str, color: str = None):
         lbl = getattr(self, "_upd_status", None)
@@ -969,10 +1004,19 @@ class ProxyForceApp(ctk.CTk):
             self._proxy_info_var.set(f"→ {cfg['host']}:{cfg['port']}{auth_str}")
         mode_label = _APPEARANCE_RMAP.get(cfg.get("appearance", "system"), "🖥 Auto")
         self._theme_var.set(mode_label)
+        for w in auth_config_warnings(cfg):
+            self._log(w, "warning")
+        if consume_legacy_auto_bypass_flag() and cfg.get("bypass_list"):
+            self._log("Automatic bypass discovery has been removed. Review "
+                      "Settings ▸ Bypass List and delete any entries you did not "
+                      "add yourself — earlier versions could add hosts there on "
+                      "their own.", "warning")
 
     def _save_config(self):
         vals = self._settings_panel.get_values()
         for w in getattr(self._settings_panel, "_bypass_warnings", []):
+            self._log(w, "warning")
+        for w in auth_config_warnings(vals):
             self._log(w, "warning")
         vals["appearance"] = _APPEARANCE_MAP.get(self._theme_var.get(), "system")
         if not save_config(vals):
@@ -1004,7 +1048,7 @@ class ProxyForceApp(ctk.CTk):
     # update_*) are intentionally excluded so they never cause a disconnect.
     _PROXY_FIELDS = ("host", "port", "auth_type", "username", "password",
                      "exclude_private", "exclude_loopback", "bypass_list",
-                     "log_level", "auto_bypass")
+                     "log_level")
 
     def _proxy_settings_changed(self, vals: dict) -> bool:
         """True if any proxy-affecting field in `vals` differs from the config the
@@ -1037,6 +1081,8 @@ class ProxyForceApp(ctk.CTk):
                 "Could not save configuration.\nRun ProxyForce as administrator.")
             self._log("Config save FAILED.", "error")
             return
+        for w in auth_config_warnings(vals):
+            self._log(w, "warning")
         auth     = vals.get("auth_type", "none")
         auth_str = f"  [{auth.upper()}]" if auth != "none" else ""
         self._proxy_info_var.set(f"→ {vals['host']}:{vals['port']}{auth_str}")
@@ -1059,15 +1105,11 @@ class ProxyForceApp(ctk.CTk):
                 def on_log(m, l):
                     self._queue.put(("log", m, l))
 
-                def on_auto_bypass(hosts):
-                    self._queue.put(("auto_bypass", hosts))
-
                 proxy_cfg    = make_proxy_config(vals)
                 engine       = SingBoxController(proxy_cfg,
                                                   on_state_change=on_state,
                                                   on_stats_update=on_stats,
-                                                  on_log=on_log,
-                                                  on_auto_bypass=on_auto_bypass)
+                                                  on_log=on_log)
                 self._engine  = engine
                 engine.start()
             except Exception as e:
@@ -1075,28 +1117,6 @@ class ProxyForceApp(ctk.CTk):
                 self._queue.put(("state", "error"))
 
         threading.Thread(target=work, daemon=True).start()
-
-    def _apply_auto_bypass(self, new_hosts):
-        """Merge auto-discovered bypass hosts (SingBoxController.on_auto_bypass,
-        fired when the proxy explicitly refuses a CONNECT — see
-        core/auto_bypass) into Settings and reconnect. Runs on the main thread
-        (dispatched via _queue like every other engine callback) since it touches
-        the Settings panel's Tkinter widgets — the engine's own background thread
-        can't safely do this or replace itself with a new SingBoxController, which
-        is why this indirection exists at all."""
-        if not new_hosts:
-            return
-        vals = self._settings_panel.get_values()
-        current = list(vals.get("bypass_list") or [])
-        added = [h for h in new_hosts if h not in current]
-        if not added:
-            return
-        self._settings_panel.set_values({"bypass_list": current + added})
-        self._log(f"Auto-bypass: added {', '.join(added)} to the Bypass List "
-                  f"(the proxy explicitly refused a connection) — reconnecting…",
-                  "info")
-        if self._last_state in ("running", "waiting", "starting"):
-            self._start_engine()
 
     def _stop_engine(self):
         self._log("Stopping ProxyForce engine…", "info")
@@ -1637,8 +1657,6 @@ class ProxyForceApp(ctk.CTk):
                 elif tag == "quit":
                     self._do_quit()
                     return
-                elif tag == "auto_bypass":
-                    self._apply_auto_bypass(item[1])
         except queue.Empty:
             pass
         if self._running:

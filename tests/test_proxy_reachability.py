@@ -82,5 +82,47 @@ class UpstreamDialFailureScanTests(unittest.TestCase):
         self.assertEqual(scan(["dial tcp 203.0.113.10:800: i/o timeout"], None, None), [])
 
 
+REJECTION_LINE = (
+    "-0700 2026-08-08 10:25:56 ERROR [1929908630 614ms] connection: open connection "
+    "to docker.illo.secure:1688 using outbound/http[proxy-out]: unexpected status: "
+    "403 Forbidden")
+
+DIAL_TIMEOUT_LINE = (
+    "-0700 2026-08-08 10:25:07 ERROR [3918389240 5.0s] connection: open connection "
+    "to 192.168.48.76:7680 using outbound/direct[direct]: dial tcp "
+    "192.168.48.76:7680: i/o timeout")
+
+extract = SingBoxController._extract_rejections
+
+
+class ExtractRejectionsTests(unittest.TestCase):
+    """Guards _extract_rejections, used by diagnostics to name the destination
+    an upstream proxy explicitly refused (distinct from an unreachable proxy,
+    covered above)."""
+
+    def test_extracts_host_port_code_from_a_real_rejection_line(self):
+        self.assertEqual(extract([REJECTION_LINE]),
+                         [("docker.illo.secure", 1688, 403)])
+
+    def test_dial_timeout_line_is_not_a_rejection(self):
+        """A dial timeout is a DIFFERENT failure mode (unreachable, not refused) —
+        must never be mistaken for an explicit policy refusal."""
+        self.assertEqual(extract([DIAL_TIMEOUT_LINE]), [])
+
+    def test_multiple_lines_all_extracted(self):
+        other = REJECTION_LINE.replace("docker.illo.secure:1688", "other.host:9999") \
+                              .replace("403 Forbidden", "407 Proxy Authentication Required")
+        result = extract([REJECTION_LINE, other])
+        self.assertEqual(result, [("docker.illo.secure", 1688, 403),
+                                  ("other.host", 9999, 407)])
+
+    def test_empty_and_none_inputs_are_safe(self):
+        self.assertEqual(extract([]), [])
+        self.assertEqual(extract(None), [])
+
+    def test_unrelated_line_yields_nothing(self):
+        self.assertEqual(extract(["INFO: all fine here"]), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
