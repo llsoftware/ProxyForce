@@ -38,8 +38,21 @@ import urllib.parse
 import secrets
 import stat
 
-from core import _ed25519
+from core import _ed25519, hostos, netprobe
 from core._version import __version__ as APP_VERSION
+
+# The application executable inside a release archive, and the per-platform asset
+# name. Both builds are plain zips of a PyInstaller onedir tree, so the download,
+# SHA256SUMS, Ed25519 signature and extraction paths below are shared verbatim.
+# Zip does not carry the POSIX execute bit, which is why the Linux side re-applies
+# it at extraction time (see _restore_exec_bits) rather than trusting the archive.
+APP_EXE = "ProxyForce" + hostos.EXE_SUFFIX
+_ASSET_PLATFORM = "win64" if hostos.IS_WINDOWS else "linux64"
+
+
+def asset_name(tag: str) -> str:
+    """The release asset this platform should download for `tag`."""
+    return f"ProxyForce-{tag}-{_ASSET_PLATFORM}.zip"
 
 # ── repo / release identity ───────────────────────────────────────────────────
 REPO = "llsoftware/ProxyForce"
@@ -52,11 +65,30 @@ _UA = "ProxyForce-Updater"
 # never committed. Empty key ⇒ verify() fails closed (no unsigned update can install).
 RELEASE_PUBKEY_B64 = "6718APpvsP0uJfLY96Z+gBdbz6GkMjO/XA6ZiJwLKt4="
 
-# ── Windows process-creation flags ────────────────────────────────────────────
+# ── Windows process-creation flags (0 elsewhere; see _detached_kwargs) ───────
 _CREATE_NO_WINDOW = 0x08000000
 _DETACHED_PROCESS = 0x00000008
 _CREATE_NEW_PROCESS_GROUP = 0x00000200
 _CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def _detached_kwargs(breakaway: bool = False) -> dict:
+    """Popen kwargs for a worker that must OUTLIVE this process.
+
+    Windows needs explicit flags, including CREATE_BREAKAWAY_FROM_JOB so the apply
+    worker escapes the kill-on-close Job Object the GUI puts its children in —
+    otherwise the worker dies with the very process it is waiting for. POSIX has no
+    job objects; start_new_session detaches the child from our process group and
+    controlling terminal, which achieves the same outcome. Note it must NOT inherit
+    PR_SET_PDEATHSIG either, and it does not: that is set per-child in
+    hostos.kill_on_parent_death_preexec and not used here.
+    """
+    if hostos.IS_WINDOWS:
+        flags = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP
+        if breakaway:
+            flags |= _CREATE_BREAKAWAY_FROM_JOB
+        return {"creationflags": flags}
+    return {"start_new_session": True}
 
 # Post-relaunch health check. Being SLOW is not a failure, only being dead or wedged
 # is: poll at _HEALTH_INTERVAL; if the new build exits first, roll back immediately;
@@ -139,11 +171,26 @@ _hardened_paths = set()
 
 
 def _harden_acl(path: str):
-    """Protect an update directory using language-independent Windows SIDs."""
-    if os.name != "nt":
-        return
+    """Make the update workspace writable only by the administrator/root.
+
+    This is a security control, not housekeeping: everything in this directory is
+    about to be executed with full privileges, so an unprivileged user must not be
+    able to substitute a file between verification and execution. Windows uses
+    language-independent SIDs (SYSTEM + the Administrators group) because the
+    account names are localized. POSIX says the same thing in one chmod: owned by
+    root, mode 0700. A failure to apply it RAISES on both — falling through to a
+    world-writable staging directory would defeat the signature check entirely.
+    """
     key = os.path.normcase(os.path.abspath(path))
     if key in _hardened_paths:
+        return
+    if not hostos.IS_WINDOWS:
+        try:
+            os.chown(path, 0, 0)
+            os.chmod(path, 0o700)
+        except OSError as e:
+            raise PermissionError(f"could not protect update workspace: {e}")
+        _hardened_paths.add(key)
         return
     commands = (
         ["icacls", path, "/inheritance:r"],
@@ -152,8 +199,8 @@ def _harden_acl(path: str):
         ["icacls", path, "/setowner", "*S-1-5-32-544"],
     )
     for args in commands:
-        r = subprocess.run(args, capture_output=True, text=True,
-                           creationflags=_CREATE_NO_WINDOW, timeout=20)
+        r = subprocess.run(args, capture_output=True, text=True, timeout=20,
+                           **hostos.popen_kwargs())
         if r.returncode:
             raise PermissionError(f"could not protect update workspace: {r.stderr.strip()}")
     _hardened_paths.add(key)
@@ -254,7 +301,7 @@ class UpdateInfo:
         self.zip_url = zip_url
         self.sums_url = sums_url
         self.sig_url = sig_url
-        self.zip_name = f"ProxyForce-{tag}-win64.zip"
+        self.zip_name = asset_name(tag)
         self.sig_name = self.zip_name + ".sig"
 
     def __repr__(self):
@@ -295,7 +342,7 @@ def _release_to_info(rel):
     if not tag or not _TAG_RE.fullmatch(str(tag)):
         return None
     assets = {a["name"]: a.get("browser_download_url") for a in (rel.get("assets") or [])}
-    zip_name = f"ProxyForce-{tag}-win64.zip"
+    zip_name = asset_name(tag)
     zip_url = assets.get(zip_name)
     sums_url = assets.get("SHA256SUMS")
     sig_url = assets.get(zip_name + ".sig")
@@ -478,10 +525,33 @@ def stage(info: UpdateInfo, ddir: str) -> str:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             with z.open(zi) as src, open(dest, "xb") as out:
                 shutil.copyfileobj(src, out, 1 << 20)
-    if not os.path.isfile(os.path.join(staged, "ProxyForce.exe")) \
+    if not os.path.isfile(os.path.join(staged, APP_EXE)) \
             or not os.path.isdir(os.path.join(staged, "_internal")):
         raise ValueError("archive does not contain the expected application layout")
+    _restore_exec_bits(staged)
     return staged
+
+
+def _restore_exec_bits(staged: str):
+    """Re-apply the execute bit that the zip format cannot carry.
+
+    Both platforms ship a zip, which stores no POSIX mode. On Windows that is
+    irrelevant. On Linux, an extracted ProxyForce and its bundled sing-box come out
+    0644 and the update would "succeed" into a build that cannot start — so the two
+    files we know must be executable are marked here, immediately after extraction
+    and before the staged build's own --selftest gate runs (that gate executes the
+    binary, so it would be the first thing to fail).
+    """
+    if hostos.IS_WINDOWS:
+        return
+    targets = [os.path.join(staged, APP_EXE),
+               os.path.join(staged, "_internal", "singbox", "sing-box")]
+    for path in targets:
+        if os.path.isfile(path):
+            try:
+                os.chmod(path, 0o755)
+            except OSError:
+                pass
 
 
 def transaction_id(ddir: str) -> str:
@@ -558,12 +628,12 @@ def mark_update_ready(txid: str):
 def selftest_staged(staged: str) -> bool:
     """Run the staged build's own --selftest as a pre-swap gate (verifies imports +
     `sing-box check`). Returns True only on a clean pass."""
-    exe = os.path.join(staged, "ProxyForce.exe")
+    exe = os.path.join(staged, APP_EXE)
     if not os.path.isfile(exe):
         return False
     try:
         r = subprocess.run([exe, "--selftest"], capture_output=True, text=True,
-                           creationflags=_CREATE_NO_WINDOW, timeout=120)
+                           timeout=120, **hostos.popen_kwargs())
         return r.returncode == 0
     except Exception:
         return False
@@ -582,7 +652,7 @@ def begin_apply(staged: str, install_dir: str, wait_pid: int):
     _assert_no_reparse(staged, root)
     if os.path.dirname(txdir) != os.path.abspath(root):
         raise ValueError("staged worker is outside the protected workspace")
-    exe = os.path.join(staged, "ProxyForce.exe")
+    exe = os.path.join(staged, APP_EXE)
     meta_path = os.path.join(os.path.dirname(staged), "transaction.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
@@ -595,13 +665,14 @@ def begin_apply(staged: str, install_dir: str, wait_pid: int):
     # not args) — so we don't pass an arg value that itself starts with "--".
     args = [exe, "--apply-update", "--target", install_dir, "--wait-pid", str(wait_pid),
             "--apply-token", token]
-    flags = _DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP | _CREATE_BREAKAWAY_FROM_JOB
     try:
-        subprocess.Popen(args, cwd=staged, close_fds=True, creationflags=flags)
+        subprocess.Popen(args, cwd=staged, close_fds=True,
+                         **_detached_kwargs(breakaway=True))
     except OSError:
         # Job disallows breakaway (rare; GUI isn't normally in a job) — retry without.
-        subprocess.Popen(args, cwd=staged, close_fds=True,
-                         creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP)
+        # Unreachable on POSIX, where _detached_kwargs has no breakaway concept and
+        # start_new_session cannot be refused, but harmless to keep symmetrical.
+        subprocess.Popen(args, cwd=staged, close_fds=True, **_detached_kwargs())
 
 
 # ── apply worker (runs from the staged copy, --apply-update) ──────────────────
@@ -625,23 +696,41 @@ def _wait_pid_exit(pid: int, timeout: float) -> bool:
     which is worth logging rather than silently falling through."""
     if not pid:
         return True
-    import ctypes
-    SYNCHRONIZE = 0x00100000
-    WAIT_OBJECT_0 = 0x00000000
-    h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
-    if not h:
-        return True                             # already gone
+    if hostos.IS_WINDOWS:
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        WAIT_OBJECT_0 = 0x00000000
+        h = ctypes.windll.kernel32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not h:
+            return True                         # already gone
+        try:
+            rc = ctypes.windll.kernel32.WaitForSingleObject(h, int(timeout * 1000))
+            return rc == WAIT_OBJECT_0
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
+    # POSIX has no wait for a non-child, so poll signal 0 — which only tests for
+    # existence and permission, never delivers anything. The worker is detached
+    # from the GUI, so the GUI is not its child and waitpid() is unavailable.
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False        # alive and owned by someone else
+        time.sleep(0.2)
     try:
-        rc = ctypes.windll.kernel32.WaitForSingleObject(h, int(timeout * 1000))
-        return rc == WAIT_OBJECT_0
-    finally:
-        ctypes.windll.kernel32.CloseHandle(h)
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return True
+    return False
 
 
 def _spawn(exe: str, relaunch_args: str):
     args = [exe] + (relaunch_args.split() if relaunch_args else [])
     return subprocess.Popen(args, cwd=os.path.dirname(exe), close_fds=True,
-                            creationflags=_DETACHED_PROCESS | _CREATE_NEW_PROCESS_GROUP)
+                            **_detached_kwargs())
 
 
 def _retry(fn, tries=10, delay=1.0):
@@ -677,24 +766,37 @@ def _applog(msg: str):
 
 def _kill_image(name: str):
     """Force-kill every process with this image name (best-effort)."""
-    try:
-        subprocess.run(["taskkill", "/F", "/IM", name],
-                       capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=15)
-    except Exception:
-        pass
+    netprobe.kill_image(name)
 
 
 def _procs_under(prefix_norm: str, exclude_pid: int):
     """PIDs of running processes whose executable image lives under `prefix_norm`
     (a normcased absolute path ending in os.sep), excluding `exclude_pid`. Used to
     find anything still running FROM the install dir we are about to rename."""
+    pids = []
+    if not hostos.IS_WINDOWS:
+        # /proc/<pid>/exe is the kernel's own answer, with no subprocess involved.
+        # A pid we cannot read belongs to another user and therefore cannot be
+        # running from our root-owned install tree, so skipping it is correct.
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == exclude_pid:
+                continue
+            try:
+                path = os.readlink(f"/proc/{entry}/exe")
+            except OSError:
+                continue
+            if os.path.normcase(path).startswith(prefix_norm):
+                pids.append(pid)
+        return pids
     ps = ("Get-CimInstance Win32_Process | Where-Object {$_.ExecutablePath} | "
           "ForEach-Object { \"$($_.ProcessId)|$($_.ExecutablePath)\" }")
-    pids = []
     try:
         r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                           capture_output=True, text=True,
-                           creationflags=_CREATE_NO_WINDOW, timeout=20)
+                           capture_output=True, text=True, timeout=20,
+                           **hostos.popen_kwargs())
         for line in (r.stdout or "").splitlines():
             pid_s, sep, path = line.strip().partition("|")
             if not sep or not path.strip():
@@ -725,10 +827,18 @@ def _free_install_dir(target: str, timeout: float = 30.0) -> bool:
         ProxyForce.exe + the _internal DLLs mapped.
     The worker itself runs from the STAGED dir (never under target), so it is never a
     target here. Kill sing-box, then kill/await any ProxyForce-under-target until the
-    dir is clear or we time out."""
+    dir is clear or we time out.
+
+    NONE OF THIS IS NEEDED ON LINUX. A directory there can be renamed while files
+    inside it are open and mapped — the open descriptors keep pointing at the same
+    inodes, which is exactly what makes the swap safe. sing-box is still killed
+    (it is ours, it is stateless, and the relaunched build restarts it), but the
+    locker hunt is skipped rather than reimplemented: there is no lock to find."""
     me = os.getpid()
     prefix = os.path.normcase(os.path.abspath(target)).rstrip("\\/") + os.sep
-    _kill_image("sing-box.exe")
+    _kill_image("sing-box" + hostos.EXE_SUFFIX)
+    if not hostos.IS_WINDOWS:
+        return True
     deadline = time.time() + timeout
     while True:
         lockers = _procs_under(prefix, exclude_pid=me)
@@ -738,7 +848,7 @@ def _free_install_dir(target: str, timeout: float = 30.0) -> bool:
         for pid in lockers:
             try:
                 subprocess.run(["taskkill", "/F", "/PID", str(pid)],
-                               capture_output=True, creationflags=_CREATE_NO_WINDOW, timeout=10)
+                               capture_output=True, timeout=10, **hostos.popen_kwargs())
             except Exception:
                 pass
         if time.time() >= deadline:
@@ -828,7 +938,7 @@ def _bridge_legacy_apply(staged: str, target: str, wait_pid: int) -> bool:
             or not _TAG_RE.fullmatch(tag)
             or tag.lstrip("vV") != APP_VERSION
             or not target
-            or not os.path.isfile(os.path.join(os.path.abspath(target), "ProxyForce.exe"))):
+            or not os.path.isfile(os.path.join(os.path.abspath(target), APP_EXE))):
         _applog("legacy apply rejected: invocation is not a valid updater bootstrap")
         return False
 
@@ -1006,7 +1116,7 @@ def _apply_swap(staged: str, target: str, relaunch: str) -> bool:
     """Back up the install dir, copy the staged build in, relaunch it, and roll back
     if the copy is incomplete or the new build doesn't stay up. Returns True on a
     committed, healthy swap."""
-    target_exe = os.path.join(target, "ProxyForce.exe")
+    target_exe = os.path.join(target, APP_EXE)
     backup = target.rstrip("\\/") + ".old"
 
     try:

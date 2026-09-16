@@ -19,9 +19,10 @@ import customtkinter as ctk
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(BASE_DIR, ".."))
 
+from core import hostos
 from core.config_store import (
     load_config, save_config, save_autostart, auth_config_warnings,
-    consume_legacy_auto_bypass_flag,
+    consume_legacy_auto_bypass_flag, autostart_available,
 )
 from core.singbox_controller import (
     SingBoxController, SingBoxState, make_proxy_config, normalize_bypass_entry,
@@ -61,13 +62,19 @@ except Exception:
     _HAS_IMAGETK = False
 
 try:
+    # The tray is genuinely optional. On Windows pystray always has a backend; on
+    # Linux it needs an AppIndicator/XOrg one, and a bare Wayland session without
+    # a StatusNotifier host has neither — importing still succeeds there, so
+    # _setup_tray's own try/except is what actually catches it and the window
+    # simply stays a normal window. _on_close() accounts for that: with no tray to
+    # minimise into, hiding the window would strand the app with no way back.
     import pystray
     _HAS_TRAY = _HAS_PIL          # the tray needs Pillow to render its icon
 except ImportError:
     _HAS_TRAY = False
 
 _APP_VERSION = _PF_VERSION
-DATA_DIR    = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "ProxyForce")
+DATA_DIR    = hostos.data_dir()
 SINGBOX_LOG = os.path.join(DATA_DIR, "singbox", "singbox.log")
 _ANSI_RE    = re.compile(r"\x1b\[[0-9;]*m")
 ANIM_INTERVAL_MS = 250  # sidebar pulse cadence while a state is animating (~4 fps)
@@ -343,14 +350,19 @@ class SettingsPanel(ctk.CTkScrollableFrame):
                      font=ctk.CTkFont("Segoe UI", 11)).pack(fill="x", ipady=4)
         return var
 
-    def _check(self, parent, key: str, label: str):
+    def _check(self, parent, key: str, label: str, enabled: bool = True):
         var = tk.BooleanVar()
         self._vars[key] = var
-        ctk.CTkCheckBox(parent, text=label, variable=var,
-                        fg_color=THEME["accent_dk"], hover_color=THEME["accent"],
-                        checkmark_color=THEME["text"], text_color=THEME["text"],
-                        font=ctk.CTkFont("Segoe UI", 10),
-                        corner_radius=4).pack(anchor="w", pady=4)
+        box = ctk.CTkCheckBox(parent, text=label, variable=var,
+                              fg_color=THEME["accent_dk"], hover_color=THEME["accent"],
+                              checkmark_color=THEME["text"], text_color=THEME["text"],
+                              font=ctk.CTkFont("Segoe UI", 10),
+                              corner_radius=4)
+        box.pack(anchor="w", pady=4)
+        if not enabled:
+            # Disabled rather than hidden, with the reason shown next to it: a
+            # setting that silently vanishes on one platform looks like a bug.
+            box.configure(state="disabled", text_color=THEME["muted"])
 
     def _build(self):
         ctk.CTkFrame(self, fg_color="transparent", height=4).pack()
@@ -429,7 +441,14 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._refresh_ca_status()
 
         s4 = self._section("APP OPTIONS")
-        self._check(s4, "autostart",       "Launch & connect at logon  (runs elevated, no prompt)")
+        auto_ok, auto_why = autostart_available()
+        self._check(s4, "autostart",
+                    ("Launch & connect at logon  (runs elevated, no prompt)"
+                     if hostos.IS_WINDOWS else
+                     "Start the engine at boot  (systemd service, headless)"),
+                    enabled=auto_ok)
+        if not auto_ok:
+            self._lbl(s4, auto_why)
         self._check(s4, "start_minimized", "Start minimized to system tray")
         self._lbl(s4, "Engine log level  —  Debug is verbose (larger logs)")
         loglvl_var = tk.StringVar(value=_LOGLEVEL_DISPLAY["info"])
@@ -620,13 +639,16 @@ class ProxyForceApp(ctk.CTk):
 
     def __init__(self, start_minimized: bool = False):
         # Give Windows an explicit app identity so the taskbar shows OUR icon and
-        # groups under "ProxyForce" rather than the generic Python host.
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
-                "ProxyForce.App")
-        except Exception:
-            pass
+        # groups under "ProxyForce" rather than the generic Python host. The Linux
+        # equivalent is the WM_CLASS the toolkit sets from the Tk class name, which
+        # a .desktop file matches on — handled at package time, not here.
+        if hostos.IS_WINDOWS:
+            try:
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                    "ProxyForce.App")
+            except Exception:
+                pass
 
         super().__init__()
         self.title("ProxyForce")
@@ -816,7 +838,12 @@ class ProxyForceApp(ctk.CTk):
                 icons = self._win_icons = [ImageTk.PhotoImage(
                                    render_logo(s, state="neutral", animated=False))
                                    for s in (256, 64, 48, 32, 20, 16)]
-            self.wm_iconbitmap()
+            if hostos.IS_WINDOWS:
+                # Resets the native icon slot so the iconphoto() below sticks past
+                # CustomTkinter's own reset. There is no such reset to defeat on
+                # Linux, where a bare wm_iconbitmap() is at best a no-op and on
+                # some window managers clears the icon we are about to set.
+                self.wm_iconbitmap()
             self.iconphoto(True, *self._win_icons)
         except Exception:
             pass
@@ -1607,7 +1634,14 @@ class ProxyForceApp(ctk.CTk):
         self._queue.put(("quit",))
 
     def _on_close(self):
-        self.withdraw()
+        # Only hide if there is a tray icon to get back from. Without one — a Linux
+        # session with no StatusNotifier host, or a tray that failed to start —
+        # withdrawing the window would leave the engine running with no way to
+        # reach the UI short of killing the process.
+        if getattr(self, "_tray", None) is not None:
+            self.withdraw()
+        else:
+            self._queue.put(("quit",))
 
     # ── Quit ──────────────────────────────────────────────────────────────────
 
