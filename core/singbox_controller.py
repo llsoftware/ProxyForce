@@ -44,10 +44,11 @@ from typing import Optional, Callable, List
 import logging
 
 from core._version import __version__ as APP_VERSION
+from core import hostos, netprobe
 
 logger = logging.getLogger("proxyforce.singbox")
 
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_NO_WINDOW = hostos.NO_WINDOW
 
 # A urllib opener that NEVER routes through a system/corporate proxy. The Clash
 # API lives on 127.0.0.1, but urllib.request.urlopen() honors the WinINET system
@@ -59,9 +60,11 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # (stats reads failed the same way). Force a direct loopback connection.
 _LOOPBACK_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
-# ── Windows Job Object (kill sing-box when the GUI process dies) ──────────────
-# If the GUI crashes without calling stop(), the OS kills sing-box automatically
-# because its process handle is assigned to this kill-on-close job object.
+# ── Kill sing-box when the GUI process dies ──────────────────────────────────
+# If the GUI crashes without calling stop(), the OS must kill sing-box for us —
+# otherwise a TUN stays up with the routing table hijacked and nothing running to
+# restore it. Windows does this with a kill-on-close Job Object (below); Linux
+# with PR_SET_PDEATHSIG, set in the child via hostos.kill_on_parent_death_preexec.
 
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _JOB_OBJECT_EXTENDED_LIMIT_INFO     = 9   # JobObjectExtendedLimitInformation
@@ -96,8 +99,11 @@ _job_handle = None
 
 
 def _ensure_job():
-    """Create (once) a Windows Job Object that kills all children on close."""
+    """Create (once) a Windows Job Object that kills all children on close.
+    Returns None on Linux, where the preexec PDEATHSIG covers the same case."""
     global _job_handle
+    if not hostos.IS_WINDOWS:
+        return None
     if _job_handle is not None:
         return _job_handle
     try:
@@ -121,11 +127,13 @@ def _ensure_job():
 # neighbour-discovery on the TUN adapter which crashes sing-box (exit code 1).
 FAKEIP_V4 = "198.18.0.0/15"
 
-# TUN interface — IPv4 only for maximum Win 10 compatibility.
+# TUN interface — IPv4 only for maximum Win 10 compatibility. The name is also
+# the Linux interface name, so it must stay within IFNAMSIZ (15 chars) and contain
+# no "/" or whitespace; "ProxyForce" is 10 and satisfies both platforms.
 TUN_NAME = "ProxyForce"
 TUN_V4   = "172.19.0.1/30"
 
-# ── Windows-10 wintun launch tuning ──────────────────────────────────────────
+# ── launch tuning (named for the Windows-10 wintun bug it was written for) ───
 # On Windows 10 (works on 11) sing-box's wintun adapter creation hits a well-known
 # timing bug — "configure tun interface: Cannot create a file when that file
 # already exists" — when a previous adapter has not finished being torn down, or
@@ -199,29 +207,39 @@ class ConnectionStats:
 
 
 def _data_dir() -> str:
-    base = os.environ.get("ProgramData", r"C:\ProgramData")
-    return os.path.join(base, "ProxyForce")
+    return hostos.data_dir()
 
 
 def _singbox_dir() -> str:
     return os.path.join(_data_dir(), "singbox")
 
 
+SINGBOX_EXE = "sing-box" + hostos.EXE_SUFFIX
+
+
 def _find_singbox_exe() -> Optional[str]:
-    """Locate the bundled sing-box.exe across frozen-onedir and source layouts."""
+    """Locate the bundled sing-box binary across frozen-onedir and source layouts.
+
+    The layouts are identical on both platforms — PyInstaller's onedir puts the
+    vendored engine in _internal/singbox/ either way — so only the filename differs
+    (sing-box.exe vs sing-box). The Linux build additionally marks it executable at
+    package time; a binary that lost its +x bit is reported by start()'s preflight
+    rather than failing as a bare "not found".
+    """
     candidates: List[str] = []
     mei = getattr(sys, "_MEIPASS", None)
     if mei:
-        candidates.append(os.path.join(mei, "singbox", "sing-box.exe"))
+        candidates.append(os.path.join(mei, "singbox", SINGBOX_EXE))
     if getattr(sys, "frozen", False):
         exedir = os.path.dirname(sys.executable)
     else:
         exedir = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.join(exedir, "_internal", "singbox", "sing-box.exe"))
-    candidates.append(os.path.join(exedir, "singbox", "sing-box.exe"))
-    # source / dev tree: <repo>/vendor/singbox/sing-box.exe
+    candidates.append(os.path.join(exedir, "_internal", "singbox", SINGBOX_EXE))
+    candidates.append(os.path.join(exedir, "singbox", SINGBOX_EXE))
+    # source / dev tree: <repo>/vendor/singbox/<sing-box>
     here = os.path.dirname(os.path.abspath(__file__))
-    candidates.append(os.path.normpath(os.path.join(here, "..", "vendor", "singbox", "sing-box.exe")))
+    candidates.append(os.path.normpath(
+        os.path.join(here, "..", "vendor", "singbox", SINGBOX_EXE)))
     for c in candidates:
         if os.path.isfile(c):
             return c
@@ -420,6 +438,37 @@ def normalize_bypass_entry(entry: str):
 # ports a corporate proxy commonly refuses CONNECT to (diagnosed 2026-08-07:
 # Outlook IMAPS/SMTPS through a proxy that only permits CONNECT on :443).
 _CONNECT_PROBE_PORTS = (443, 80, 993, 465, 587)
+
+
+def _tcp_probe(host: str, port: int, timeout: float = 8.0) -> str:
+    """Can this box open a TCP connection to host:port, and out of which local
+    address? Replaces PowerShell's Test-NetConnection with something that behaves
+    identically on both platforms and reports the same three facts the diagnostics
+    read: success, the remote address actually dialled, and the local source
+    address — which is how you tell whether the connection left via the TUN or the
+    physical NIC.
+    """
+    remote = local = ""
+    sock = None
+    try:
+        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)
+        if not infos:
+            return f"TcpTestSucceeded=False remote=(no A record for {host})"
+        family, socktype, proto, _canon, sockaddr = infos[0]
+        remote = sockaddr[0]
+        sock = socket.socket(family, socktype, proto)
+        sock.settimeout(timeout)
+        sock.connect(sockaddr)
+        local = "%s:%s" % sock.getsockname()[:2]
+        return f"TcpTestSucceeded=True remote={remote}:{port} from={local}"
+    except Exception as e:
+        return f"TcpTestSucceeded=False remote={remote or host}:{port} error={e}"
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except Exception:
+                pass
 
 
 def probe_connect(proxy_host, proxy_port, target_host, target_port,
@@ -795,8 +844,30 @@ class SingBoxController:
         sb = _find_singbox_exe()
         if not sb:
             self._set_state(SingBoxState.ERROR)
-            self._log("sing-box.exe not found in the install folder (vendor/singbox).", "error")
+            self._log(f"{SINGBOX_EXE} not found in the install folder (vendor/singbox).",
+                      "error")
             return
+        # Preflight the kernel's TUN support BEFORE launching. Without this, a
+        # missing /dev/net/tun or a container without NET_ADMIN surfaces as a
+        # sing-box exit code and three pointless retries; with it, the user gets the
+        # one command that fixes it.
+        tun_ok, tun_why = netprobe.tun_supported()
+        if not tun_ok:
+            self._set_state(SingBoxState.ERROR)
+            self._log(f"Cannot create the TUN interface: {tun_why}", "error")
+            return
+        if not hostos.IS_WINDOWS and not os.access(sb, os.X_OK):
+            # A zip round-trip (or an archive extracted on Windows) drops the
+            # execute bit, and the resulting "Permission denied" says nothing about
+            # why. Fix it in place rather than failing — we own this file.
+            try:
+                os.chmod(sb, 0o755)
+            except OSError:
+                self._set_state(SingBoxState.ERROR)
+                self._log(f"The bundled engine at {sb} is not executable and the "
+                          f"permission could not be corrected. Run: chmod +x {sb}",
+                          "error")
+                return
 
         # Reserve the forward-proxy port here too (not just clash/local-proxy):
         # _render_config's port-80 route rule needs a concrete override_port at
@@ -933,20 +1004,26 @@ class SingBoxController:
                 cwd=sbdir,
                 stdout=self._log_fh,
                 stderr=subprocess.STDOUT,
-                creationflags=_NO_WINDOW,
+                # On Linux this installs PR_SET_PDEATHSIG so the engine dies with a
+                # crashed GUI; on Windows it is None and the Job Object below does
+                # the same job.
+                preexec_fn=hostos.kill_on_parent_death_preexec(),
+                **hostos.popen_kwargs()
             )
         except Exception as e:
             self._set_state(SingBoxState.ERROR)
             self._log(f"Failed to launch sing-box: {e}", "error")
             self._close_log()
             return False
-        # Assign to the kill-on-close job so a GUI crash still cleans up.
-        try:
-            job = _ensure_job()
-            if job and self._proc._handle:
-                ctypes.windll.kernel32.AssignProcessToJobObject(job, self._proc._handle)
-        except Exception:
-            pass
+        # Assign to the kill-on-close job so a GUI crash still cleans up (Windows;
+        # the preexec above is the Linux half and is already in effect).
+        if hostos.IS_WINDOWS:
+            try:
+                job = _ensure_job()
+                if job and self._proc._handle:
+                    ctypes.windll.kernel32.AssignProcessToJobObject(job, self._proc._handle)
+            except Exception:
+                pass
         self._log(f"sing-box launched (pid {self._proc.pid}); bringing up TUN…")
         return True
 
@@ -1014,7 +1091,7 @@ class SingBoxController:
             # exempt packages are skipped by CheckNetIsolation — and skipped
             # entirely while the previous sweep is still running.
             self._uwp_sweep_ticks += 1
-            if self._uwp_sweep_ticks >= 150:
+            if hostos.IS_WINDOWS and self._uwp_sweep_ticks >= 150:
                 self._uwp_sweep_ticks = 0
                 if self._uwp_thread is None or not self._uwp_thread.is_alive():
                     self._uwp_thread = threading.Thread(
@@ -1026,60 +1103,38 @@ class SingBoxController:
 
     @staticmethod
     def _is_retryable_tun_error(tail: str) -> bool:
-        """True if the failure looks like the Win 10 wintun adapter timing bug."""
+        """True if the failure looks like a transient TUN-creation race worth one
+        more attempt after a cleanup pass.
+
+        The Windows strings come from the wintun adapter timing bug. The Linux ones
+        cover the equivalent race: an orphaned sing-box still holding the tun fd, so
+        the device name is taken until the kernel reaps it. A PERMISSION error is
+        deliberately NOT retryable on either platform — retrying a missing
+        CAP_NET_ADMIN just delays a clear failure by three attempts.
+        """
         t = (tail or "").lower()
         return ("already exists" in t or "file exists" in t
                 or "device is not ready" in t or "take too much time" in t
-                or "configure tun interface" in t)
+                or "configure tun interface" in t
+                or "device or resource busy" in t)
 
     def _tun_adapter_exists(self) -> bool:
         """True if a network interface named TUN_NAME currently exists."""
-        try:
-            r = subprocess.run(
-                ["netsh", "interface", "show", "interface"],
-                capture_output=True, text=True,
-                creationflags=_NO_WINDOW, timeout=5,
-            )
-            return TUN_NAME in (r.stdout or "")
-        except Exception:
-            return False
+        return netprobe.tun_exists(TUN_NAME)
 
     def _cleanup_stale_tun(self):
-        """Release a leftover sing-box TUN adapter so the next launch can recreate it.
+        """Release a leftover sing-box TUN so the next launch can recreate it.
 
-        TerminateProcess gives sing-box no chance to remove its own adapter, so a
-        crashed/killed instance can leave the wintun device behind. Kill any
-        orphaned sing-box.exe (releases the device the wintun driver owns), make a
-        best-effort attempt to remove the adapter outright, then wait for Windows
-        to finish the teardown before the caller relaunches.
+        A hard kill gives sing-box no chance to remove its own interface, so a
+        crashed instance can leave the device behind. netprobe.cleanup_stale_tun
+        kills any orphaned engine process and removes the interface (the wintun
+        NetAdapter/pnputil dance on Windows, `ip link delete` on Linux); the wait
+        below is shared, because on both platforms the teardown is asynchronous and
+        a fresh create must not race it.
         """
-        try:
-            subprocess.run(["taskkill", "/F", "/IM", "sing-box.exe"],
-                           capture_output=True, creationflags=_NO_WINDOW, timeout=10)
-        except Exception:
-            pass
-        # Best-effort device removal in case the adapter lingers with no owning
-        # process: try the NetAdapter API, then fall back to pnputil removing the
-        # underlying PnP device by instance id — this covers wintun adapters that
-        # Remove-NetAdapter can't drop in some Windows-10 states.
-        ps = (
-            "$ErrorActionPreference='SilentlyContinue';"
-            f"$a = Get-NetAdapter -Name '{TUN_NAME}';"
-            "if ($a) {"
-            " Disable-NetAdapter -Name $a.Name -Confirm:$false;"
-            " Remove-NetAdapter  -Name $a.Name -Confirm:$false;"
-            f" $b = Get-NetAdapter -Name '{TUN_NAME}';"
-            " if ($b -and $b.PnpDeviceID) { pnputil /remove-device \"$($b.PnpDeviceID)\" }"
-            "}"
-        )
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
-                capture_output=True, creationflags=_NO_WINDOW, timeout=25)
-        except Exception:
-            pass
-        # Wait for the adapter to actually disappear, then a short settle so a
-        # fresh CreateAdapter does not race the in-progress teardown.
+        netprobe.cleanup_stale_tun(TUN_NAME)
+        # Wait for the interface to actually disappear, then a short settle so a
+        # fresh create does not race the in-progress teardown.
         end = time.time() + _ADAPTER_WAIT
         while time.time() < end and self._tun_adapter_exists():
             if self._stop_event.wait(0.5):
@@ -1184,7 +1239,7 @@ class SingBoxController:
     # ── capture-route enforcement (THE Win 10 fix) ────────────────────────────────
 
     def _enforce_capture_routes(self):
-        """Guarantee the TUN wins the default route on Windows.
+        """Guarantee the TUN wins the default route.
 
         Root cause of the Win 10 "green but no capture" failure (diagnosed from a
         hardware diagnostics.txt, 2026-06-18): sing-box's auto_route installed only
@@ -1194,79 +1249,47 @@ class SingBoxController:
         Ethernet and nothing ever entered the tunnel — even though the engine was
         fully healthy.
 
-        The standard remedy is the split-route trick: 0.0.0.0/1 + 128.0.0.0/1 are
-        MORE SPECIFIC than any 0.0.0.0/0, so Windows longest-prefix-match always
-        picks the TUN for them, regardless of metric. We also pin the TUN interface
-        metric to 1. Both are non-persistent (ActiveStore + tied to the adapter), so
-        sing-box's teardown on stop() removes them — nothing leaks past shutdown.
+        The remedy is the split-route trick: 0.0.0.0/1 + 128.0.0.0/1 are MORE
+        SPECIFIC than any 0.0.0.0/0, so longest-prefix-match always picks the TUN
+        regardless of metric. Plus a /32 host route pinning the upstream proxy to
+        the physical gateway, so sing-box's OWN connection escapes the tunnel rather
+        than looping back into it (the v2.1.8 fix — the loop surfaces as "dial tcp
+        <proxy>:<port>: i/o timeout").
+
+        Linux does not have the metric fight at all: auto_route there uses policy
+        routing, which is consulted ahead of the main table. The same check still
+        applies and the same repair is still safe, so this runs on both — see
+        core/netprobe for how each platform answers "are the prefixes present".
 
         Belt-and-suspenders with the config's `route_address` (which asks auto_route
         to install the same /1 routes): if either path lands them, capture works.
-        Idempotent — only adds a /1 route that is missing; always re-pins the metric.
-        Proven on the failing box: adding these flipped capture ON (example.com:443
-        then flowed through proxy-out with real bytes).
+        Idempotent, and non-persistent on both platforms — everything added here is
+        tied to the TUN and vanishes when sing-box tears it down on stop.
         """
-        idx = self._ps("$a=Get-NetAdapter -Name '" + TUN_NAME + "' "
-                       "-ErrorAction SilentlyContinue; if($a){$a.ifIndex}else{''}").strip()
-        if not idx.isdigit():
-            self._log("Capture-route enforcement skipped: TUN adapter not found yet.",
+        if not netprobe.tun_index(TUN_NAME):
+            self._log("Capture-route enforcement skipped: TUN interface not found yet.",
                       "warning")
             return
 
-        # SERVER-EXCLUDE (the v2.1.8 loop fix). With the split-default routes
-        # capturing the WHOLE address space, sing-box's OWN connection out to the
-        # upstream proxy would also match 128.0.0.0/1 and get routed back into the
-        # TUN — an infinite loop that surfaces as "dial tcp <proxy>:<port>: i/o
-        # timeout" (observed on Win 11 v2.1.7; requesting the split routes via
-        # route_address suppressed sing-box's automatic server-exclude). Pin a /32
-        # host route for the proxy via the REAL default gateway: a /32 is more
-        # specific than /1, so that single connection escapes the tunnel while
-        # everything else stays captured. IPv4-literal proxies only; for a hostname
-        # we leave the exclude to sing-box (can't pre-resolve it — DNS is hijacked).
-        proxy_v4 = None
-        try:
-            _ip = ipaddress.ip_address(self.config.host.strip())
-            if _ip.version == 4:
-                proxy_v4 = str(_ip)
-        except ValueError:
-            proxy_v4 = None
+        # IPv4-literal proxies only; for a hostname the pre-resolved address from
+        # start() is used when we have one, and otherwise the exclude is left to
+        # sing-box (we cannot resolve it here — DNS is hijacked by now).
+        proxy_v4 = _looks_like_cidr_or_ip(str(self.config.host).strip()) or ""
+        if "/" in proxy_v4:
+            proxy_v4 = ""
+        if not proxy_v4:
+            resolved = _looks_like_cidr_or_ip(
+                getattr(self, "_proxy_connect_host", "") or "") or ""
+            proxy_v4 = resolved if "/" not in resolved else ""
 
-        excl = ""
-        if proxy_v4:
-            excl = (
-                "$gw = Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction SilentlyContinue |"
-                " Where-Object {$_.InterfaceAlias -ne '" + TUN_NAME + "' -and $_.NextHop -and "
-                "$_.NextHop -ne '0.0.0.0'} | Sort-Object RouteMetric,InterfaceMetric |"
-                " Select-Object -First 1;"
-                "if($gw){Remove-NetRoute -DestinationPrefix '" + proxy_v4 + "/32' -Confirm:$false "
-                "-ErrorAction SilentlyContinue;"
-                "New-NetRoute -DestinationPrefix '" + proxy_v4 + "/32' -InterfaceIndex $gw.ifIndex "
-                "-NextHop $gw.NextHop -RouteMetric 1 -PolicyStore ActiveStore | Out-Null};"
-            )
-
-        ps = (
-            "$ErrorActionPreference='SilentlyContinue';"
-            + excl +
-            "Set-NetIPInterface -InterfaceIndex " + idx + " -InterfaceMetric 1;"
-            "foreach($p in '0.0.0.0/1','128.0.0.0/1'){"
-            " if(-not (Get-NetRoute -InterfaceIndex " + idx + " -DestinationPrefix $p "
-            "-ErrorAction SilentlyContinue)){"
-            "  New-NetRoute -DestinationPrefix $p -InterfaceIndex " + idx +
-            " -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore | Out-Null}};"
-            "(Get-NetRoute -InterfaceIndex " + idx + " -ErrorAction SilentlyContinue | "
-            "Where-Object {$_.DestinationPrefix -in '0.0.0.0/1','128.0.0.0/1'} | "
-            "Measure-Object).Count"
-        )
-        out = self._ps(ps, timeout=25)
-        count = out.strip().splitlines()[-1].strip() if out.strip() else "?"
-        excl_note = (f"; proxy {proxy_v4} pinned to physical gateway (loop-break)"
-                     if proxy_v4 else "")
-        if count == "2":
-            self._log("Capture routes enforced on TUN (0.0.0.0/1 + 128.0.0.0/1, metric 1"
-                      + excl_note + ") — all traffic now flows through the proxy.")
+        count, note = netprobe.enforce_capture_routes(TUN_NAME, proxy_v4)
+        if count == 2:
+            self._log("Capture routes enforced on TUN (0.0.0.0/1 + 128.0.0.0/1"
+                      + note + ") — all traffic now flows through the proxy.")
         else:
-            self._log(f"Capture-route enforcement incomplete ({count}/2 split routes). "
-                      "A VPN/endpoint agent may own the route table — see diagnostics.txt.",
+            self._log(f"Capture-route enforcement incomplete ({count}/2 split routes)."
+                      + note +
+                      " A VPN/endpoint agent may own the route table — see diagnostics.txt.",
                       "warning")
 
     # ── system-proxy takeover (make capture universal) ────────────────────────────
@@ -1357,8 +1380,8 @@ class SingBoxController:
                 pass
 
     def _takeover_system_proxy(self):
-        """Point the Windows system proxy (WinINET + WinHTTP) at ProxyForce while it
-        runs, using a PROTOCOL-SPLIT proxy so each scheme takes its working path:
+        """Point the OS/desktop proxy at ProxyForce while it runs, using a
+        PROTOCOL-SPLIT proxy so each scheme takes its working path:
 
           https=127.0.0.1:<sing-box mixed>  — TLS via CONNECT (sing-box, native/fast)
           http =127.0.0.1:<local forward>   — plaintext HTTP relayed as a forward-proxy
@@ -1370,21 +1393,40 @@ class SingBoxController:
         forward proxy did not start, fall back to the single sing-box listener (HTTPS
         keeps working; port-80 stays broken). Proxy-aware apps then route through us; the
         TUN still captures apps that ignore proxy settings. The previous config is
-        snapshotted and restored on stop (crash-recovered from proxy_backup.json)."""
+        snapshotted and restored on stop (crash-recovered from proxy_backup.json).
+
+        Scope differs sharply by platform, and the logging says so rather than
+        pretending otherwise. On Windows, WinINET + WinHTTP genuinely cover most
+        apps. On Linux this reaches only the desktop environment's own setting
+        (GNOME GSettings / KDE kioslaverc) — there is no machine-wide equivalent,
+        and the load-bearing lane is the environment variables set just below."""
         try:
             from core import system_proxy
-            if self._http_proxy_port:
-                server = (f"http=127.0.0.1:{self._http_proxy_port};"
-                          f"https=127.0.0.1:{self._local_proxy_port}")
+            https_addr = f"127.0.0.1:{self._local_proxy_port}"
+            http_addr = (f"127.0.0.1:{self._http_proxy_port}" if self._http_proxy_port
+                         else https_addr)
+            if hostos.IS_WINDOWS:
+                server = (f"http={http_addr};https={https_addr}"
+                          if self._http_proxy_port else https_addr)
             else:
-                server = f"127.0.0.1:{self._local_proxy_port}"
-            prev = system_proxy.point_at(server, self._build_proxy_bypass())
-            was = f" (was: {prev})" if prev else ""
-            self._log(f"Windows system proxy pointed at ProxyForce ({server}){was} — "
-                      f"HTTPS via sing-box, plaintext HTTP via the local forward-proxy; "
-                      f"original restored on stop.")
+                server = http_addr      # https passed separately below
+            if not hostos.IS_WINDOWS and not system_proxy.desktop_available():
+                self._log("No desktop proxy setting to take over (no GNOME/KDE "
+                          "session detected) — capture relies on the TUN and the "
+                          "proxy environment variables, which is the normal "
+                          "arrangement on a server.")
+            else:
+                prev = system_proxy.point_at(server, self._build_proxy_bypass(),
+                                             https_server=https_addr)
+                was = f" (was: {prev})" if prev else ""
+                label = ("Windows system proxy" if hostos.IS_WINDOWS
+                         else "Desktop proxy setting")
+                self._log(f"{label} pointed at ProxyForce "
+                          f"(http={http_addr}, https={https_addr}){was} — "
+                          f"HTTPS via sing-box, plaintext HTTP via the local forward-proxy; "
+                          f"original restored on stop.")
         except Exception as e:
-            self._log(f"Could not take over the Windows system proxy: {e}", "warning")
+            self._log(f"Could not take over the system/desktop proxy: {e}", "warning")
         # Also export HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY (both cases, user +
         # machine environment) — the fix for CLI/dev tools (yt-dlp, curl, git, pip,
         # node, …) that read the environment instead of WinINET/WinHTTP and can be
@@ -1398,9 +1440,11 @@ class SingBoxController:
             https_url = f"http://127.0.0.1:{self._local_proxy_port}"
             prev = env_proxy.point_at(http_url, https_url, self._build_no_proxy())
             was = f" (was: {prev})" if prev else ""
+            from core import env_store as _es
             self._log(f"Proxy environment variables set (HTTP_PROXY={http_url}, "
-                      f"HTTPS_PROXY={https_url}){was} — fixes CLI tools (yt-dlp, curl, "
-                      f"pip, git, …) that read the environment instead of the Windows "
+                      f"HTTPS_PROXY={https_url}){was} in {_es.storage_description()} — "
+                      f"fixes CLI tools (yt-dlp, curl, "
+                      f"pip, git, …) that read the environment instead of the system "
                       f"proxy setting. A shell opened BEFORE this value ever existed "
                       f"still needs reopening once to pick it up; after that, restarts "
                       f"normally keep the same port (_bind_ports_preferring) so an "
@@ -1428,9 +1472,10 @@ class SingBoxController:
                         f"Corporate TLS-inspection CA trusted: {st['cert_summary']} "
                         f"-> {st['total']} CAs in {st['bundle']} "
                         f"({st['base']} public baseline + {st['system']} from the "
-                        f"OS trust store + {st['corporate']} corporate){was}. "
+                        f"{'Windows' if hostos.IS_WINDOWS else 'system'} trust store "
+                        f"+ {st['corporate']} corporate){was}. "
                         f"Fixes docker/pip/npm/git/curl/go/aws and friends, which "
-                        f"read their own CA bundle instead of the Windows store. "
+                        f"read their own CA bundle instead of the OS trust store. "
                         f"Reopen any shell that was already running to pick it up.")
                 else:
                     self._log(f"Corporate CA trust NOT applied: {st['error']} — "
@@ -1474,8 +1519,10 @@ class SingBoxController:
         # seconds and must not delay the GUI going green. stop() joins this
         # thread (briefly) before restoring, so a fast start->stop can't race
         # the sweep and leave an exemption it added un-restored.
-        self._uwp_thread = threading.Thread(target=self._exempt_uwp_loopback, daemon=True)
-        self._uwp_thread.start()
+        if hostos.IS_WINDOWS:
+            self._uwp_thread = threading.Thread(target=self._exempt_uwp_loopback,
+                                                daemon=True)
+            self._uwp_thread.start()
 
     def _exempt_uwp_loopback(self):
         try:
@@ -1561,20 +1608,15 @@ class SingBoxController:
     # ── diagnostics (ground-truth capture for the "green but no capture" bug) ──────
 
     def _ps(self, command: str, timeout: int = 20) -> str:
-        """Run a PowerShell one-liner; return combined stdout+stderr (best-effort)."""
-        try:
-            r = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-                capture_output=True, text=True, creationflags=_NO_WINDOW, timeout=timeout)
-            return ((r.stdout or "") + (r.stderr or "")).strip()
-        except Exception as e:
-            return f"<command failed: {e}>"
+        """Run a PowerShell one-liner; return combined stdout+stderr (best-effort).
+        Windows-only by nature — every remaining caller is inside a Windows-guarded
+        diagnostics branch."""
+        return netprobe.ps(command, timeout=timeout)
 
     def _proxyforce_connectivity(self) -> str:
-        """Return NCSI's IPv4 capability for the ProxyForce interface only."""
-        return self._ps(
-            "(Get-NetConnectionProfile -InterfaceAlias 'ProxyForce' "
-            "-ErrorAction SilentlyContinue).IPv4Connectivity").strip()
+        """What the OS itself thinks the ProxyForce interface's connectivity is —
+        NCSI's IPv4 capability on Windows, NetworkManager's verdict on Linux."""
+        return netprobe.interface_connectivity(TUN_NAME)
 
     def _run_diagnostics_after_ncsi_settle(self):
         """Keep startup quiet until NCSI's active probe has had a fair run.
@@ -1585,6 +1627,15 @@ class SingBoxController:
         configured proxy once more (an NCSI refresh trigger) and allow one final
         quiet window before collecting the full report.
         """
+        if not hostos.IS_WINDOWS:
+            # Nothing to settle for: there is no NCSI active probe racing us, and
+            # the whole point of the delay was to stop this method's own subprocess
+            # burst starving that probe's ~3.5s round trip. A short pause is still
+            # worth taking so auto_route has finished on a loaded box.
+            if self._stop_event.wait(2.0):
+                return
+            self._run_diagnostics()
+            return
         if self._stop_event.wait(_NCSI_SETTLE_SECONDS):
             return
         if self._proxyforce_connectivity() != "Internet":
@@ -1606,8 +1657,10 @@ class SingBoxController:
         The Clash API is pure loopback, so a green dashboard says NOTHING about
         whether the OS is actually routing packets into the TUN or whether
         strict_route's WFP filters win against a corporate agent. This writes a full
-        report to %ProgramData%\\ProxyForce\\diagnostics.txt and echoes a one-line
-        verdict to the GUI log. Everything here is READ-ONLY except one safe,
+        report to <data dir>/diagnostics.txt and echoes a one-line verdict to the
+        GUI log. Checks that only exist on one platform (NCSI, Store/UWP loopback
+        isolation, WFP on Windows) are SKIPPED rather than failed elsewhere, so a
+        Linux report never carries a phantom problem. Everything here is READ-ONLY except one safe,
         non-persistent route/metric repair attempted ONLY when auto_route's
         split-default routes are missing (i.e. nothing was capturing anyway); those
         routes live on the TUN adapter and vanish when it is torn down on stop().
@@ -1624,8 +1677,8 @@ class SingBoxController:
             return
         path = os.path.join(_data_dir(), "diagnostics.txt")
         self._log("Running live diagnostics — verifying the capture path "
-                  "(adapter -> routes -> DNS -> proxy); full report will be written "
-                  r"to %ProgramData%\ProxyForce\diagnostics.txt.")
+                  "(interface -> routes -> DNS -> proxy); full report will be "
+                  f"written to {path}.")
 
         def section(fh, title, body, v=None):
             fh.write(f"\n===== {title} =====\n")
@@ -1650,86 +1703,70 @@ class SingBoxController:
             fh.write(f"Proxy target : {self.config.host}:{self.config.port} "
                      f"(auth={self.config.auth_type})\n")
             fh.write(f"Clash API    : 127.0.0.1:{self._clash_port}\n")
-            section(fh, "OS", self._ps(
-                "(Get-CimInstance Win32_OperatingSystem).Caption + ' build ' + "
-                "(Get-CimInstance Win32_OperatingSystem).BuildNumber"))
+            fh.write(f"Platform     : {hostos.platform_name()}\n")
+            section(fh, "OS", netprobe.os_info())
 
-            # ── TUN adapter ──
-            idx_raw = self._ps("$a=Get-NetAdapter -Name 'ProxyForce' "
-                               "-ErrorAction SilentlyContinue; if($a){$a.ifIndex}else{'NONE'}")
-            adapter_present = idx_raw.strip().isdigit()
-            tun_idx = idx_raw.strip() if adapter_present else ""
-            section(fh, "TUN adapter", self._ps(
-                "Get-NetAdapter -Name 'ProxyForce' -ErrorAction SilentlyContinue | "
-                "Select-Object Name,ifIndex,Status,InterfaceDescription | "
-                "Format-List | Out-String"),
-                (f"PASS — adapter present (ifIndex={tun_idx})" if adapter_present
-                 else "FAIL — ProxyForce wintun adapter not found / not Up "
-                      "(driver-signature / HVCI policy block on this box?)"))
+            # ── TUN interface ──
+            tun_idx = netprobe.tun_index(TUN_NAME)
+            adapter_present = bool(tun_idx)
+            section(fh, "TUN interface", netprobe.tun_details(TUN_NAME),
+                    (f"PASS — interface present (ifIndex={tun_idx})" if adapter_present
+                     else ("FAIL — ProxyForce wintun adapter not found / not Up "
+                           "(driver-signature / HVCI policy block on this box?)"
+                           if hostos.IS_WINDOWS else
+                           "FAIL — the ProxyForce tun interface does not exist. Check "
+                           "that /dev/net/tun is present and that ProxyForce is running "
+                           "with CAP_NET_ADMIN (i.e. as root).")))
             step(adapter_present,
-                 f"TUN adapter up (ifIndex={tun_idx})" if adapter_present
-                 else "TUN adapter not found / not Up")
+                 f"TUN interface up (ifIndex={tun_idx})" if adapter_present
+                 else "TUN interface not found / not Up")
 
-            section(fh, "TUN IP address", self._ps(
-                "Get-NetIPAddress -InterfaceAlias 'ProxyForce' -ErrorAction SilentlyContinue | "
-                "Select-Object IPAddress,PrefixLength,AddressFamily | Format-Table -Auto | Out-String"))
+            section(fh, "TUN IP address", netprobe.tun_addresses(TUN_NAME))
 
             # ── DECISIVE: did auto_route install the split-default routes? ──
+            # On Windows they must be on the TUN's own interface; on Linux they live
+            # in sing-box's policy-routing table, which is why the count comes from
+            # netprobe rather than an interface-scoped query. See core/netprobe.
             if adapter_present:
-                count_cmd = ("(Get-NetRoute -InterfaceIndex " + tun_idx +
-                             " -ErrorAction SilentlyContinue | Where-Object "
-                             "{$_.DestinationPrefix -in '0.0.0.0/1','128.0.0.0/1'} | "
-                             "Measure-Object).Count")
-                before = self._ps(count_cmd).strip()
-                if before == "2":
+                before = netprobe.capture_route_count(TUN_NAME, tun_idx)
+                if before == 2:
                     routes_ok = True
                     section(fh, "Split-default routes (DECISIVE)",
-                            f"Found {before}/2 split-default routes on the TUN.",
+                            f"Found {before}/2 split-default routes via the TUN.",
                             "PASS — 0.0.0.0/1 + 128.0.0.0/1 present on ProxyForce "
-                            "(route_address + startup enforcement) → TUN wins by "
-                            "longest-prefix-match; all traffic captured.")
+                            "(route_address + startup enforcement) -> TUN wins the "
+                            "routing decision; all traffic captured.")
                 else:
-                    # Safe, non-persistent repair: lower the TUN metric and add the
-                    # split routes on-link. Only when MISSING. Removed with the adapter.
-                    repair_cmd = (
-                        "Set-NetIPInterface -InterfaceIndex " + tun_idx +
-                        " -InterfaceMetric 1 -ErrorAction SilentlyContinue;"
-                        "New-NetRoute -DestinationPrefix '0.0.0.0/1' -InterfaceIndex " + tun_idx +
-                        " -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore "
-                        "-ErrorAction SilentlyContinue | Out-Null;"
-                        "New-NetRoute -DestinationPrefix '128.0.0.0/1' -InterfaceIndex " + tun_idx +
-                        " -NextHop '0.0.0.0' -RouteMetric 1 -PolicyStore ActiveStore "
-                        "-ErrorAction SilentlyContinue | Out-Null;" + count_cmd)
-                    out = self._ps(repair_cmd, timeout=25)
-                    after = out.strip().splitlines()[-1].strip() if out.strip() else "?"
-                    routes_ok = after == "2"
+                    # Safe, non-persistent repair — only when MISSING, i.e. nothing
+                    # was capturing anyway. Everything it adds is tied to the TUN and
+                    # goes away with it on stop.
+                    after, note = netprobe.enforce_capture_routes(TUN_NAME)
+                    routes_ok = after == 2
                     section(fh, "Split-default routes (DECISIVE)",
-                            f"Found {before}/2 BEFORE repair. Attempted metric=1 + on-link "
-                            f"route-add. Now {after}/2.",
-                            (f"WARN — routes were MISSING at diag time; re-added them (now {after}/2). "
-                             "Capture should be live now — re-test your browser."
+                            f"Found {before}/2 BEFORE repair. Attempted re-add.{note} "
+                            f"Now {after}/2.",
+                            (f"WARN — routes were MISSING at diag time; re-added them "
+                             f"(now {after}/2). Capture should be live now — re-test "
+                             "your browser."
                              if routes_ok else
-                             "FAIL — split-default routes missing AND repair failed; a VPN / "
-                             "endpoint agent likely owns the route table. Disable it and retest."))
+                             "FAIL — split-default routes missing AND repair failed; a "
+                             "VPN / endpoint agent likely owns the route table. Disable "
+                             "it and retest."))
             else:
-                section(fh, "Split-default routes (DECISIVE)", "Skipped — no TUN adapter.")
+                section(fh, "Split-default routes (DECISIVE)", "Skipped — no TUN interface.")
             step(routes_ok,
                  "capture routes present (0.0.0.0/1 + 128.0.0.0/1) — TUN wins the route table"
                  if routes_ok else "capture routes MISSING — traffic may bypass the TUN")
 
-            section(fh, "Full IPv4 route table", self._ps(
-                "Get-NetRoute -AddressFamily IPv4 | Sort-Object RouteMetric | Select-Object "
-                "DestinationPrefix,InterfaceAlias,NextHop,RouteMetric,InterfaceMetric | "
-                "Format-Table -Auto | Out-String", timeout=25))
-            section(fh, "Interface metrics", self._ps(
-                "Get-NetIPInterface -AddressFamily IPv4 | Sort-Object InterfaceMetric | "
-                "Select-Object InterfaceAlias,InterfaceMetric,ConnectionState | "
-                "Format-Table -Auto | Out-String"))
+            section(fh, "Routing state", netprobe.route_table(TUN_NAME))
+            if hostos.IS_WINDOWS:
+                section(fh, "Interface metrics", self._ps(
+                    "Get-NetIPInterface -AddressFamily IPv4 | Sort-Object InterfaceMetric | "
+                    "Select-Object InterfaceAlias,InterfaceMetric,ConnectionState | "
+                    "Format-Table -Auto | Out-String"))
 
             # ── DNS: is it hijacked to fakeip? (proves DNS traverses the TUN) ──
-            a_ip = self._ps(
-                "ipconfig /flushdns | Out-Null; (Resolve-DnsName -Name example.com -Type A "
-                "-ErrorAction SilentlyContinue | Where-Object {$_.IPAddress}).IPAddress -join ','")
+            a_ip = netprobe.dns_a_lookup("example.com")
             fakeip_ok = "198.18." in a_ip or "198.19." in a_ip
             section(fh, "DNS A → fakeip", f"example.com A = {a_ip or '(none)'}",
                     ("PASS — DNS hijacked to fakeip (CONNECT-by-hostname path active)" if fakeip_ok
@@ -1739,9 +1776,11 @@ class SingBoxController:
             step(fakeip_ok,
                  f"DNS hijacked to fakeip (example.com -> {a_ip})" if fakeip_ok
                  else "DNS NOT hijacked to fakeip (DoH or routing gap)")
-            aaaa = self._ps(
-                "(Resolve-DnsName -Name example.com -Type AAAA -ErrorAction SilentlyContinue | "
-                "Where-Object {$_.IPAddress}).IPAddress -join ','")
+            unspec_all = netprobe.getaddrinfo_unspec("example.com")
+            # The AAAA question, asked through the same call an app makes: any IPv6
+            # answer here is a Happy-Eyeballs leak around the IPv4-only TUN.
+            aaaa = "\n".join(l for l in unspec_all.splitlines()
+                             if "InterNetworkV6" in l)
             section(fh, "DNS AAAA suppression", f"example.com AAAA = {aaaa or '(none — good)'}",
                     ("PASS — AAAA suppressed (no IPv6 leak)" if not aaaa.strip()
                      else "WARN — AAAA returned real IPv6; Happy Eyeballs may bypass the "
@@ -1755,9 +1794,9 @@ class SingBoxController:
             # a tool gets a REAL IP (or an outright resolution failure if the real
             # resolver blocks the domain) and bypasses capture entirely — invisible to
             # every proxy-aware app tested, since none of them call getaddrinfo() ──
-            unspec_ip = self._ps(
-                "([System.Net.Dns]::GetHostAddresses('example.com') | "
-                "Where-Object {$_.AddressFamily -eq 'InterNetwork'}).IPAddressToString -join ','")
+            unspec_ip = ", ".join(
+                l.split()[-1] for l in unspec_all.splitlines()
+                if l.startswith("InterNetwork ")) or unspec_all
             unspec_ok = "198.18." in unspec_ip or "198.19." in unspec_ip
             section(fh, "DNS getaddrinfo(AF_UNSPEC) — the path apps actually call",
                     f"example.com getaddrinfo = {unspec_ip or '(none)'}",
@@ -1800,106 +1839,117 @@ class SingBoxController:
             # ProxyForce interface specifically — Ethernet's own NCSI reading was
             # the one observed flapping in the event log and isn't the profile the
             # fixes target.
-            conn_profile = self._ps(
-                "Get-NetConnectionProfile | Select-Object InterfaceAlias,IPv4Connectivity | "
-                "Format-Table -Auto | Out-String")
-            pf_connectivity = self._proxyforce_connectivity()
-            ncsi_ok = pf_connectivity == "Internet"
-            ncsi_event = self._ps(
-                "$g=(Get-NetAdapter -Name 'ProxyForce' -ErrorAction SilentlyContinue)."
-                "InterfaceGuid.ToString();"
-                "if($g){Get-WinEvent -FilterHashtable "
-                "@{LogName='Microsoft-Windows-NCSI/Operational'} -ErrorAction "
-                "SilentlyContinue | Where-Object {$_.Message -match "
-                "[regex]::Escape($g)} | Select-Object -First 1 -ExpandProperty Message}",
-                timeout=10)
-            ncsi_reason = _ncsi_event_reason(ncsi_event)
-            ncsi_conf = self._ps(
-                "$k='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NlaSvc\\Parameters\\Internet';"
-                "$p=Get-ItemProperty $k -ErrorAction SilentlyContinue;"
-                "$dh=$p.ActiveDnsProbeHost; $dw=$p.ActiveDnsProbeContent;"
-                "$wh=$p.ActiveWebProbeHost; $wp=$p.ActiveWebProbePath; $ww=$p.ActiveWebProbeContent;"
-                "$dg=(Resolve-DnsName -Name $dh -Type A -ErrorAction SilentlyContinue | "
-                "Select-Object -First 1).IPAddress;"
-                "try {"
-                "  $req=[System.Net.HttpWebRequest]::Create(\"http://$wh/$wp\");"
-                "  $req.Proxy=$null; $req.Timeout=8000;"
-                "  $resp=$req.GetResponse();"
-                "  $sr=New-Object System.IO.StreamReader($resp.GetResponseStream());"
-                "  $wg=$sr.ReadToEnd().Trim(); $resp.Close()"
-                "} catch { $wg=\"<error: $($_.Exception.Message)>\" }"
-                "\"DNSHOST=$dh|DNSWANT=$dw|DNSGOT=$dg|WEBHOST=$wh|WEBWANT=$ww|WEBGOT=$wg\"",
-                timeout=20)
+            if hostos.IS_WINDOWS:
+                conn_profile = self._ps(
+                    "Get-NetConnectionProfile | Select-Object InterfaceAlias,IPv4Connectivity | "
+                    "Format-Table -Auto | Out-String")
+                pf_connectivity = self._proxyforce_connectivity()
+                ncsi_ok = pf_connectivity == "Internet"
+                ncsi_event = self._ps(
+                    "$g=(Get-NetAdapter -Name 'ProxyForce' -ErrorAction SilentlyContinue)."
+                    "InterfaceGuid.ToString();"
+                    "if($g){Get-WinEvent -FilterHashtable "
+                    "@{LogName='Microsoft-Windows-NCSI/Operational'} -ErrorAction "
+                    "SilentlyContinue | Where-Object {$_.Message -match "
+                    "[regex]::Escape($g)} | Select-Object -First 1 -ExpandProperty Message}",
+                    timeout=10)
+                ncsi_reason = _ncsi_event_reason(ncsi_event)
+                ncsi_conf = self._ps(
+                    "$k='HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NlaSvc\\Parameters\\Internet';"
+                    "$p=Get-ItemProperty $k -ErrorAction SilentlyContinue;"
+                    "$dh=$p.ActiveDnsProbeHost; $dw=$p.ActiveDnsProbeContent;"
+                    "$wh=$p.ActiveWebProbeHost; $wp=$p.ActiveWebProbePath; $ww=$p.ActiveWebProbeContent;"
+                    "$dg=(Resolve-DnsName -Name $dh -Type A -ErrorAction SilentlyContinue | "
+                    "Select-Object -First 1).IPAddress;"
+                    "try {"
+                    "  $req=[System.Net.HttpWebRequest]::Create(\"http://$wh/$wp\");"
+                    "  $req.Proxy=$null; $req.Timeout=8000;"
+                    "  $resp=$req.GetResponse();"
+                    "  $sr=New-Object System.IO.StreamReader($resp.GetResponseStream());"
+                    "  $wg=$sr.ReadToEnd().Trim(); $resp.Close()"
+                    "} catch { $wg=\"<error: $($_.Exception.Message)>\" }"
+                    "\"DNSHOST=$dh|DNSWANT=$dw|DNSGOT=$dg|WEBHOST=$wh|WEBWANT=$ww|WEBGOT=$wg\"",
+                    timeout=20)
 
-            def _kv(s, key):
-                m = re.search(re.escape(key) + r"=(.*?)(?:\||$)", s)
-                return (m.group(1) if m else "").strip()
+                def _kv(s, key):
+                    m = re.search(re.escape(key) + r"=(.*?)(?:\||$)", s)
+                    return (m.group(1) if m else "").strip()
 
-            dns_host, dns_want, dns_got = (_kv(ncsi_conf, "DNSHOST"),
-                                            _kv(ncsi_conf, "DNSWANT"), _kv(ncsi_conf, "DNSGOT"))
-            web_host, web_want, web_got = (_kv(ncsi_conf, "WEBHOST"),
-                                            _kv(ncsi_conf, "WEBWANT"), _kv(ncsi_conf, "WEBGOT"))
-            dns_probe_ok = bool(dns_want) and dns_want == dns_got
-            web_probe_ok = bool(web_want) and web_want in web_got
-            section(fh, "NCSI connectivity (Get-NetConnectionProfile)", conn_profile,
-                    ("PASS — Windows reports Internet connectivity"
-                     if ncsi_ok else
-                     "FAIL — Windows does NOT report Internet connectivity "
-                     "(IPv4Connectivity is LocalNetwork/NoTraffic/Subnet). Every component "
-                     "gating on connectivity level — Windows Spotlight, Store, Widgets, Teams "
-                     "presence — will silently stop refreshing. See the two probe checks below."))
-            step(ncsi_ok,
-                 "Windows reports Internet connectivity (NCSI)" if ncsi_ok else
-                 "Windows does NOT report Internet connectivity (NCSI) — Spotlight/Store/"
-                 "Widgets will silently stop refreshing")
-            section(fh, "Latest NCSI event for ProxyForce",
-                    ncsi_event or "(no matching event found)",
-                    (f"Latest change reason: {ncsi_reason}" if ncsi_reason else
-                     "No ChangeReason was available; use the DNS/web checks below."))
-            section(fh, "NCSI DNS probe",
-                    f"{dns_host}: want '{dns_want}', got '{dns_got or '(none)'}'",
-                    ("PASS — matches exactly" if dns_probe_ok else
-                     "FAIL — fakeip answers this instead of the literal constant NCSI expects "
-                     "(see _ncsi_dns_probe's predefined DNS rule in _render_config)."))
-            section(fh, "NCSI web probe",
-                    f"http://{web_host}: want body '{web_want}', got '{web_got or '(none)'}'",
-                    ("PASS — matches" if web_probe_ok else
-                     "FAIL — request bypasses any proxy setting (.Proxy=$null, matching how "
-                     "NlaSvc itself probes) and is captured by the TUN; without the port-80 "
-                     "route rule sending it to the local forward-proxy, sing-box's CONNECT-only "
-                     "outbound gets 403'd by the corporate proxy on :80."))
+                dns_host, dns_want, dns_got = (_kv(ncsi_conf, "DNSHOST"),
+                                                _kv(ncsi_conf, "DNSWANT"), _kv(ncsi_conf, "DNSGOT"))
+                web_host, web_want, web_got = (_kv(ncsi_conf, "WEBHOST"),
+                                                _kv(ncsi_conf, "WEBWANT"), _kv(ncsi_conf, "WEBGOT"))
+                dns_probe_ok = bool(dns_want) and dns_want == dns_got
+                web_probe_ok = bool(web_want) and web_want in web_got
+                section(fh, "NCSI connectivity (Get-NetConnectionProfile)", conn_profile,
+                        ("PASS — Windows reports Internet connectivity"
+                         if ncsi_ok else
+                         "FAIL — Windows does NOT report Internet connectivity "
+                         "(IPv4Connectivity is LocalNetwork/NoTraffic/Subnet). Every component "
+                         "gating on connectivity level — Windows Spotlight, Store, Widgets, Teams "
+                         "presence — will silently stop refreshing. See the two probe checks below."))
+                step(ncsi_ok,
+                     "Windows reports Internet connectivity (NCSI)" if ncsi_ok else
+                     "Windows does NOT report Internet connectivity (NCSI) — Spotlight/Store/"
+                     "Widgets will silently stop refreshing")
+                section(fh, "Latest NCSI event for ProxyForce",
+                        ncsi_event or "(no matching event found)",
+                        (f"Latest change reason: {ncsi_reason}" if ncsi_reason else
+                         "No ChangeReason was available; use the DNS/web checks below."))
+                section(fh, "NCSI DNS probe",
+                        f"{dns_host}: want '{dns_want}', got '{dns_got or '(none)'}'",
+                        ("PASS — matches exactly" if dns_probe_ok else
+                         "FAIL — fakeip answers this instead of the literal constant NCSI expects "
+                         "(see _ncsi_dns_probe's predefined DNS rule in _render_config)."))
+                section(fh, "NCSI web probe",
+                        f"http://{web_host}: want body '{web_want}', got '{web_got or '(none)'}'",
+                        ("PASS — matches" if web_probe_ok else
+                         "FAIL — request bypasses any proxy setting (.Proxy=$null, matching how "
+                         "NlaSvc itself probes) and is captured by the TUN; without the port-80 "
+                         "route rule sending it to the local forward-proxy, sing-box's CONNECT-only "
+                         "outbound gets 403'd by the corporate proxy on :80."))
 
-            # Active probing must remain enabled. Passive polling alone cannot
-            # establish every connectivity state and previously left Spotlight idle.
-            try:
-                from core import ncsi
-                ncsi_state = ncsi.current_state()
-            except Exception as e:
-                ncsi_state = f"<unavailable: {e}>"
-            probing_suppressed = "EnableActiveProbing=0" in ncsi_state
-            section(fh, "NCSI active probing", ncsi_state,
-                    ("FAIL — active probing is disabled; ProxyForce no longer makes "
-                     "this change. Check Group Policy or a legacy ncsi_backup.json."
-                     if probing_suppressed else
-                     "PASS — active probing remains enabled."))
+                # Active probing must remain enabled. Passive polling alone cannot
+                # establish every connectivity state and previously left Spotlight idle.
+                try:
+                    from core import ncsi
+                    ncsi_state = ncsi.current_state()
+                except Exception as e:
+                    ncsi_state = f"<unavailable: {e}>"
+                probing_suppressed = "EnableActiveProbing=0" in ncsi_state
+                section(fh, "NCSI active probing", ncsi_state,
+                        ("FAIL — active probing is disabled; ProxyForce no longer makes "
+                         "this change. Check Group Policy or a legacy ncsi_backup.json."
+                         if probing_suppressed else
+                         "PASS — active probing remains enabled."))
+            else:
+                # Linux has no NCSI, and therefore none of the silent consequences
+                # it causes on Windows (Spotlight, Store and Widgets going dark
+                # while every other check passes). NetworkManager keeps a global
+                # connectivity verdict that uses the same plaintext-HTTP probe path
+                # the port-80 route rule exists to fix, so it is reported for
+                # information — but it is NOT allowed to fail the run: a server with
+                # no NetworkManager is a perfectly healthy ProxyForce host.
+                nm = self._proxyforce_connectivity()
+                ncsi_ok = True
+                section(fh, "OS connectivity verdict (informational)",
+                        netprobe.connectivity_detail(),
+                        f"NetworkManager connectivity: {nm or '(not reported)'}"
+                        + ("" if nm in ("", "full") else
+                           " — a value other than 'full' here does not by itself "
+                           "mean capture is broken; check the probes above."))
+                section(fh, "DNS servers", netprobe.dns_servers())
 
             # ── End-to-end capture probe ──
-            section(fh, "Capture probe (TCP 443 → example.com)", self._ps(
-                "$r=Test-NetConnection -ComputerName example.com -Port 443 "
-                "-WarningAction SilentlyContinue; "
-                "\"TcpTestSucceeded=$($r.TcpTestSucceeded) RemoteAddress=$($r.RemoteAddress)\"",
-                timeout=30))
+            section(fh, "Capture probe (TCP 443 -> example.com)",
+                    _tcp_probe("example.com", 443))
 
             # ── Proxy reachability: can sing-box's OWN connection escape the TUN? ──
             # If the split routes also capture the proxy IP, sing-box loops trying to
             # reach its upstream → "dial …: i/o timeout" and NOTHING is forwarded even
             # though capture/DNS look perfect. The /32 server-exclude (enforced before
             # this runs) must let this one connection out the physical NIC.
-            reach = self._ps(
-                "$r=Test-NetConnection -ComputerName '" + str(self.config.host) + "' -Port "
-                + str(self.config.port) + " -WarningAction SilentlyContinue;"
-                "\"TcpTestSucceeded=$($r.TcpTestSucceeded) via=$($r.InterfaceAlias) "
-                "remote=$($r.RemoteAddress)\"", timeout=30)
+            reach = _tcp_probe(str(self.config.host), int(self.config.port))
             # Decide reachability from AUTHORITATIVE signals, not log noise:
             #   1) the live TCP test to the proxy succeeded (reachable right now), OR
             #   2) real traffic has already been forwarded through the engine.
@@ -2007,17 +2057,28 @@ class SingBoxController:
             fwd = f"127.0.0.1:{self._http_proxy_port}" if self._http_proxy_port else ""
             ours = (f"http={fwd};https={mixed}" if fwd else mixed)
             sp_ok = (mixed in sp_state) and (not fwd or fwd in sp_state)
-            section(fh, "System proxy (should point at ProxyForce's local listeners)", sp_state,
-                    (f"PASS — system proxy points at ProxyForce ({ours}); proxy-aware apps "
-                     "route HTTPS through sing-box (CONNECT) and plaintext HTTP through the "
-                     "local forward-proxy (forward GET)"
+            sp_label = "System proxy" if hostos.IS_WINDOWS else "Desktop proxy setting"
+            # On Linux this lane is advisory: it reaches only a GNOME/KDE session, and
+            # the environment variables checked next are what actually carry the load.
+            # Failing the run on it would flag every healthy headless box.
+            sp_soft = not hostos.IS_WINDOWS
+            section(fh, f"{sp_label} (should point at ProxyForce's local listeners)",
+                    sp_state,
+                    (f"PASS — {sp_label.lower()} points at ProxyForce ({ours}); proxy-aware "
+                     "apps route HTTPS through sing-box (CONNECT) and plaintext HTTP through "
+                     "the local forward-proxy (forward GET)"
                      if sp_ok else
-                     "WARN — system proxy does not fully point at ProxyForce. Takeover may have "
-                     "been blocked (GPO?) or overridden by a per-app/group-policy proxy; "
-                     "proxy-aware apps may bypass capture."))
-            step(sp_ok,
-                 f"Windows system proxy points at ProxyForce ({ours})" if sp_ok
-                 else "Windows system proxy does NOT fully point at ProxyForce (proxy-aware apps may bypass)")
+                     ("INFO — no desktop proxy setting was taken over (no GNOME/KDE session). "
+                      "Normal on a server: the TUN and the environment variables below carry "
+                      "capture." if sp_soft else
+                      "WARN — system proxy does not fully point at ProxyForce. Takeover may "
+                      "have been blocked (GPO?) or overridden by a per-app/group-policy "
+                      "proxy; proxy-aware apps may bypass capture.")))
+            step(sp_ok or sp_soft,
+                 f"{sp_label} points at ProxyForce ({ours})" if sp_ok
+                 else (f"{sp_label}: none present (TUN + env vars carry capture)" if sp_soft
+                       else "Windows system proxy does NOT fully point at ProxyForce "
+                            "(proxy-aware apps may bypass)"))
 
             # ── Proxy environment variables: HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY.
             # CLI/dev tools (yt-dlp, curl, git, pip, node, …) read these INSTEAD of
@@ -2036,7 +2097,7 @@ class SingBoxController:
             section(fh, "Proxy environment variables (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY/NO_PROXY)",
                     ep_state,
                     (f"PASS — env vars point at ProxyForce ({expect_http} / {expect_https}); "
-                     "CLI/dev tools that read the environment instead of the Windows proxy "
+                     "CLI/dev tools that read the environment instead of the system proxy "
                      "setting will use the proxy instead of falling back to direct DNS"
                      if ep_ok else
                      "WARN — proxy environment variables do not point at ProxyForce. A shell "
@@ -2055,31 +2116,38 @@ class SingBoxController:
             # back to direct, so the TUN can't rescue it either. Probe the
             # Microsoft Store specifically since it's the package the user will
             # notice first (see core/appcontainer) ──
-            try:
-                from core import appcontainer
-                uwp_ok = appcontainer.is_exempt("Microsoft.WindowsStore_8wekyb3d8bbwe")
-                uwp_state = appcontainer.current_state()
-            except Exception as e:
-                uwp_state = f"<unavailable: {e}>"
-            # Raw `-s` text, not just the parsed summary above — the v2.1.27 fix's
-            # failure to root-cause came from having ONLY a summarized count to go on
-            # (a parser bug in core/appcontainer undercounted "122 exempt" as "1" with
-            # no way to see why from the log alone). Whatever CheckNetIsolation actually
-            # printed on THIS box is right here so a future mismatch is visible by eye.
-            raw_list = self._ps("CheckNetIsolation LoopbackExempt -s", timeout=20)
-            uwp_body = f"{uwp_state}\n\nRaw `CheckNetIsolation LoopbackExempt -s`:\n{raw_list}"
-            section(fh, "Store/UWP loopback exemption (Microsoft Store probe)", uwp_body,
-                    ("PASS — Microsoft Store is loopback-exempt; it can reach the local proxy"
+            if hostos.IS_WINDOWS:
+                try:
+                    from core import appcontainer
+                    uwp_ok = appcontainer.is_exempt("Microsoft.WindowsStore_8wekyb3d8bbwe")
+                    uwp_state = appcontainer.current_state()
+                except Exception as e:
+                    uwp_state = f"<unavailable: {e}>"
+                # Raw `-s` text, not just the parsed summary above — the v2.1.27 fix's
+                # failure to root-cause came from having ONLY a summarized count to go on
+                # (a parser bug in core/appcontainer undercounted "122 exempt" as "1" with
+                # no way to see why from the log alone). Whatever CheckNetIsolation actually
+                # printed on THIS box is right here so a future mismatch is visible by eye.
+                raw_list = self._ps("CheckNetIsolation LoopbackExempt -s", timeout=20)
+                uwp_body = f"{uwp_state}\n\nRaw `CheckNetIsolation LoopbackExempt -s`:\n{raw_list}"
+                section(fh, "Store/UWP loopback exemption (Microsoft Store probe)", uwp_body,
+                        ("PASS — Microsoft Store is loopback-exempt; it can reach the local proxy"
+                         if uwp_ok else
+                         "FAIL — Microsoft Store is NOT loopback-exempt. Windows blocks AppContainer "
+                         "apps from reaching 127.0.0.1 by default, so the Store (and other UWP apps) "
+                         "cannot reach the local proxy the system-proxy takeover points them at, and "
+                         "will fail to load. See core/appcontainer.exempt_installed()."))
+                step(uwp_ok,
+                     "Store/UWP apps exempted from loopback isolation"
                      if uwp_ok else
-                     "FAIL — Microsoft Store is NOT loopback-exempt. Windows blocks AppContainer "
-                     "apps from reaching 127.0.0.1 by default, so the Store (and other UWP apps) "
-                     "cannot reach the local proxy the system-proxy takeover points them at, and "
-                     "will fail to load. See core/appcontainer.exempt_installed()."))
-            step(uwp_ok,
-                 "Store/UWP apps exempted from loopback isolation"
-                 if uwp_ok else
-                 "Store/UWP apps CANNOT reach the local proxy — Microsoft Store and other "
-                 "Store apps will fail to load")
+                     "Store/UWP apps CANNOT reach the local proxy — Microsoft Store and other "
+                     "Store apps will fail to load")
+            else:
+                # No AppContainer, no loopback isolation: a Linux app reaching
+                # 127.0.0.1 is just an app reaching 127.0.0.1. Nothing to grant and
+                # nothing that can silently block the local listener, so this passes
+                # by construction rather than being checked.
+                uwp_ok = True
 
             # ── What sing-box itself saw ──
             conns = self._clash_get("/connections") or {}
@@ -2095,24 +2163,32 @@ class SingBoxController:
                     f"uploadTotal={conns.get('uploadTotal')}\n" + "\n".join(lines))
             section(fh, "sing-box log (last 40 lines, debug)", self._tail_log(40))
 
-            # ── Competing agents / WFP arbitration ──
+            # ── Competing agents / packet-filter arbitration ──
+            # The failure this looks for is the same on both platforms — something
+            # else on the box is also steering or filtering packets and can outbid
+            # ProxyForce — but it shows up differently. On Windows it is a named
+            # endpoint-agent process contending for a WFP callout; on Linux it is
+            # another tun/wg interface or an `ip rule` a VPN installed, which is why
+            # netprobe reports interfaces and policy routing there instead of a
+            # process-name match.
             procs = self._ps(
                 "Get-Process | Where-Object {$_.Name -match "
                 "'ZSATunnel|zscaler|nstunnel|netskope|vpnagent|csc_vpnagent|acvpnagent|"
                 "falcon|SentinelAgent|MpNetworkProtection|pangp|acosd|openvpn|wireguard|"
-                "forcefield|fdrsvc|umbrella'} | Select-Object Name,Id | Format-Table -Auto | Out-String")
+                "forcefield|fdrsvc|umbrella'} | Select-Object Name,Id | Format-Table -Auto | Out-String"
+            ) if hostos.IS_WINDOWS else ""
             competing = bool(procs.strip())
-            section(fh, "Competing VPN/endpoint agents", procs or "(none detected)",
-                    ("WARN — competing agent(s) detected; may outbid strict_route's WFP callout"
-                     if competing else "PASS — no known competing agent process"))
-            section(fh, "All network adapters (incl. hidden)", self._ps(
-                "Get-NetAdapter -IncludeHidden | Select-Object Name,InterfaceDescription,Status | "
-                "Format-Table -Auto | Out-String", timeout=25))
-            wfp_xml = os.path.join(_data_dir(), "wfp_state.xml")
-            section(fh, "WFP state dump", self._ps(
-                "netsh wfp show state file=\"" + wfp_xml + "\" | Out-Null;"
-                " if(Test-Path '" + wfp_xml + "'){'written: " + wfp_xml + "'}else{'FAILED to write'}",
-                timeout=45))
+            if hostos.IS_WINDOWS:
+                section(fh, "Competing VPN/endpoint agents", procs or "(none detected)",
+                        ("WARN — competing agent(s) detected; may outbid strict_route's "
+                         "WFP callout" if competing
+                         else "PASS — no known competing agent process"))
+            section(fh, "Network interfaces and policy routing",
+                    netprobe.competing_agents())
+            section(fh, "Local listeners", netprobe.listening_ports())
+            filter_out = os.path.join(_data_dir(), "wfp_state.xml")
+            section(fh, "Packet-filter state",
+                    netprobe.packet_filter_state(filter_out))
 
             # ── VERDICT ──
             if not adapter_present:
@@ -2151,7 +2227,7 @@ class SingBoxController:
                            "environment instead of the Windows proxy setting (yt-dlp, curl, "
                            "pip, git, …) may bypass capture. See the Proxy environment "
                            "variables section.")
-            elif not uwp_ok:
+            elif hostos.IS_WINDOWS and not uwp_ok:
                 verdict = ("UWP LOOPBACK BLOCKED — capture, DNS, and the proxy takeover all work, "
                            "but Store/UWP apps (Microsoft Store, Mail, Xbox, …) are not loopback-"
                            "exempt, so they cannot reach the local proxy and will fail to load. "
@@ -2159,7 +2235,7 @@ class SingBoxController:
                            "should have granted this automatically — check for an Access Denied "
                            "error in the log (requires elevation, which ProxyForce should already "
                            "have).")
-            elif not ncsi_ok:
+            elif hostos.IS_WINDOWS and not ncsi_ok:
                 verdict = ("NO INTERNET (NCSI) — Windows' ProxyForce network profile does not yet "
                            "report 'Internet' connectivity, even though capture/DNS/the proxy "
                            "takeover all work. Every component that gates on connectivity level — "
@@ -2173,6 +2249,11 @@ class SingBoxController:
                 verdict = ("ENGINE HEALTHY per diagnostics — routes + fakeip OK, no competing "
                            "agent. If the browser is still direct, disable its Secure DNS (DoH) "
                            "and retest.")
+            if not hostos.IS_WINDOWS and verdict.startswith("ENGINE HEALTHY"):
+                # Say plainly which Windows-only checks were skipped, so a Linux
+                # report is not read as "fewer checks ran, so trust it less".
+                verdict += (" (NCSI, Store/UWP loopback and WFP checks do not apply "
+                            "on Linux and were skipped.)")
             fh.write(f"\n========== VERDICT ==========\n{verdict}\n")
         finally:
             try:
@@ -2182,9 +2263,9 @@ class SingBoxController:
 
         bad = (not adapter_present) or (not routes_ok) or (not fakeip_ok) or \
               (not unspec_ok) or (not proxy_reachable) or connect_denied or \
-              (not ep_ok) or (not uwp_ok) or (not ncsi_ok) or competing or bool(problems)
-        self._log(f"DIAG: {verdict}  (full report: "
-                  r"%ProgramData%\ProxyForce\diagnostics.txt)",
+              (not ep_ok) or competing or bool(problems) or \
+              (hostos.IS_WINDOWS and ((not uwp_ok) or (not ncsi_ok)))
+        self._log(f"DIAG: {verdict}  (full report: {path})",
                   "warning" if bad else "info")
 
     # ── logs ──────────────────────────────────────────────────────────────────────
