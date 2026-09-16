@@ -32,7 +32,6 @@ import time
 import base64
 import socket
 import ctypes
-import winreg
 import threading
 import subprocess
 import ipaddress
@@ -340,8 +339,16 @@ _NCSI_DNS_CONTENT_DEFAULT = "131.107.255.255"
 def _ncsi_dns_probe():
     """Return (probe_host, probe_content) NCSI's DNS probe checks. Read from the
     registry rather than hardcoded — a corporate image can retarget NCSI's probe —
-    falling back to the stock Windows defaults if the key is missing/unreadable."""
+    falling back to the stock Windows defaults if the key is missing/unreadable.
+
+    Returns the defaults unread on Linux, where there is no NCSI. The caller omits
+    the predefined DNS rule entirely there (see _render_config), so the values are
+    never used; they are still returned rather than None so the signature stays the
+    same for the tests that stub this out."""
     host, content = _NCSI_DNS_HOST_DEFAULT, _NCSI_DNS_CONTENT_DEFAULT
+    if not hostos.IS_WINDOWS:
+        return host, content
+    import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NCSI_KEY) as k:
             try:
@@ -630,6 +637,8 @@ class SingBoxController:
         ncsi_probe_host, ncsi_probe_content = _ncsi_dns_probe()
         dns_rules = [
             {"query_type": ["AAAA"], "action": "predefined", "rcode": "NOERROR"},
+        ]
+        if hostos.IS_WINDOWS:
             # NCSI's DNS probe (see _ncsi_dns_probe) must get EXACTLY this literal
             # answer or Windows reports "no internet" — a `predefined` answer is
             # used rather than letting it fall through to fakeip/real resolution
@@ -637,10 +646,14 @@ class SingBoxController:
             # whatever corporate DNS happens to return. Nothing ever connects to
             # this address, so — unlike the bypass domains below — it never needs
             # a fakeip reverse-map entry. Must precede the blanket A → fakeip rule.
-            {"domain": [ncsi_probe_host], "query_type": ["A"], "action": "predefined",
-             "answer": [f"{ncsi_probe_host}. IN A {ncsi_probe_content}"]},
-            {"query_type": ["A"], "server": "fakeip"},
-        ]
+            #
+            # Omitted on Linux: nothing there queries dns.msftncsi.com, and
+            # hardcoding an answer for a Microsoft probe host on a Linux box would
+            # be a lie the resolver tells for no reason.
+            dns_rules.append(
+                {"domain": [ncsi_probe_host], "query_type": ["A"], "action": "predefined",
+                 "answer": [f"{ncsi_probe_host}. IN A {ncsi_probe_content}"]})
+        dns_rules.append({"query_type": ["A"], "server": "fakeip"})
 
         # ── route rules ──
         route_rules = [
