@@ -39,6 +39,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import env_certs
 
 
+# The corporate certificate is NOT committed (public repository), so a clean
+# clone -- CI included -- has no assets/ca/corporate-ca.pem. Tests that need one
+# skip rather than fail; the feature itself is required to work without it, and
+# that requirement has its own tests below.
+HAVE_SHIPPED = bool(env_certs._read_pem_ders(env_certs.shipped_corporate_ca()))
+_needs_shipped = unittest.skipUnless(
+    HAVE_SHIPPED, "no shipped corporate CA in this checkout (not committed)")
+
+
 def _shipped_der():
     ders = env_certs._read_pem_ders(env_certs.shipped_corporate_ca())
     if not ders:
@@ -51,6 +60,7 @@ class PemParsingTests(unittest.TestCase):
     an export tool, CRLF line endings, several concatenated certs. All of that
     must parse, and one malformed block must not discard the valid ones."""
 
+    @_needs_shipped
     def test_reads_shipped_certificate(self):
         ders = env_certs._read_pem_ders(env_certs.shipped_corporate_ca())
         self.assertEqual(len(ders), 1)
@@ -111,6 +121,7 @@ class AsciiHeaderTests(unittest.TestCase):
 
 class DescribeCertTests(unittest.TestCase):
 
+    @_needs_shipped
     def test_shipped_certificate_validates(self):
         ok, summary = env_certs.describe_cert_file(env_certs.shipped_corporate_ca())
         self.assertTrue(ok, summary)
@@ -160,7 +171,7 @@ class BundleMergeTests(unittest.TestCase):
     def test_bundle_contains_corporate_and_public_baseline(self):
         st = env_certs.build_bundle()
         self.assertTrue(st["ok"], st["error"])
-        self.assertEqual(st["corporate"], 1)
+        self.assertEqual(st["corporate"], 1 if HAVE_SHIPPED else 0)
         self.assertGreaterEqual(st["base"], 100)
         self.assertEqual(st["total"], st["base"] + st["windows"] + st["corporate"])
 
