@@ -43,6 +43,17 @@ _DEFAULTS = {
     "start_minimized": False,
     "log_level": "info",
     "appearance": "system",   # "light" | "dark" | "system" (follow OS)
+    # ── TLS inspection (see core/env_certs) ──
+    # OPT-IN. Points the CA-bundle environment variables (SSL_CERT_FILE,
+    # REQUESTS_CA_BUNDLE, NODE_EXTRA_CA_CERTS, …) at a merged bundle that trusts
+    # the corporate inspection CA, fixing docker/pip/npm/git/curl on a network
+    # that MITMs TLS. Off by default: repointing a machine's trust configuration
+    # is not something a proxy tool should do uninvited.
+    "ca_inject": False,
+    # Empty = use the corporate CA ProxyForce ships with (assets/ca/corporate-ca.pem).
+    # Set to a .pem/.crt path to trust a different one — the shipped cert expires,
+    # and other sites run a different appliance.
+    "ca_cert_path": "",
     # ── Auto-update ──
     "auto_update_check": True,      # nightly background check while running
     "update_hour": 3,               # local hour (0-23) for the nightly check / "install tonight"

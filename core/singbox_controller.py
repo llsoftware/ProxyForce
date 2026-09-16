@@ -166,6 +166,8 @@ class ProxyConfig:
     exclude_loopback: bool = True
     bypass_list: list = None        # extra hosts/CIDRs to send DIRECT
     log_level: str = "info"         # sing-box log verbosity (see _SINGBOX_LOG_LEVELS)
+    ca_inject: bool = False         # trust the corporate TLS-inspection CA (core/env_certs)
+    ca_cert_path: str = ""          # "" = the CA ProxyForce ships with
 
     def __post_init__(self):
         if self.bypass_list is None:
@@ -471,6 +473,8 @@ def make_proxy_config(cfg: dict) -> "ProxyConfig":
         exclude_loopback=cfg.get("exclude_loopback", True),
         bypass_list=cfg.get("bypass_list", []),
         log_level=cfg.get("log_level", _DEFAULT_LOG_LEVEL),
+        ca_inject=cfg.get("ca_inject", False),
+        ca_cert_path=cfg.get("ca_cert_path", ""),
     )
 
 
@@ -1404,6 +1408,50 @@ class SingBoxController:
                       f"again.")
         except Exception as e:
             self._log(f"Could not set proxy environment variables: {e}", "warning")
+        # TLS-inspection trust (opt-in, config: ca_inject). ProxyForce never
+        # terminates TLS, so it cannot make an inspection-CA error go away by
+        # routing — the tool has to trust the CA. Windows' own store usually
+        # already does (GPO), which is why browsers work while docker/pip/npm/git
+        # fail: those read their own bundled CA list, not the Windows one. This
+        # points them at a merged bundle that includes the corporate CA, and
+        # imports it into any Java truststore (which has no env-var override).
+        # Fail-closed inside env_certs: a bad cert leaves the environment alone.
+        if getattr(self.config, "ca_inject", False):
+            ca_ok = False
+            try:
+                from core import env_certs
+                st = env_certs.apply(getattr(self.config, "ca_cert_path", "") or "")
+                ca_ok = st["ok"]
+                if st["ok"]:
+                    was = f" (was: {st['previous']})" if st.get("previous") else ""
+                    self._log(
+                        f"Corporate TLS-inspection CA trusted: {st['cert_summary']} "
+                        f"-> {st['total']} CAs in {st['bundle']} "
+                        f"({st['base']} public baseline + {st['windows']} from the "
+                        f"Windows store + {st['corporate']} corporate){was}. "
+                        f"Fixes docker/pip/npm/git/curl/go/aws and friends, which "
+                        f"read their own CA bundle instead of the Windows store. "
+                        f"Reopen any shell that was already running to pick it up.")
+                else:
+                    self._log(f"Corporate CA trust NOT applied: {st['error']} — "
+                              f"environment left unchanged.", "warning")
+            except Exception as e:
+                self._log(f"Could not apply corporate CA trust: {e}", "warning")
+            # Only after the bundle built: java_trust reads the corporate-only
+            # file env_certs just wrote, which does not exist (or is stale from an
+            # earlier run) if the build failed.
+            try:
+                from core import java_trust, env_certs as _ec
+                jr = java_trust.apply(_ec.corporate_path()) if ca_ok else None
+                if jr and jr["imported"]:
+                    self._log(f"Corporate CA imported into {jr['imported']} Java "
+                              f"truststore alias(es) across {jr['stores']} JDK/JRE "
+                              f"install(s) — Java has no env-var CA override, so "
+                              f"this is the only way to fix it. Removed on stop.")
+                for s_ in (jr["skipped"] if jr else []):
+                    self._log(f"Java truststore skipped: {s_}", "warning")
+            except Exception as e:
+                self._log(f"Could not update Java truststores: {e}", "warning")
         # Recover a crash-safe backup left by the short-lived v2.2.2 passive-only
         # workaround. New sessions never disable active probing: NCSI needs its
         # active HTTP/DNS result to classify the ProxyForce interface as Internet.
@@ -1482,6 +1530,21 @@ class SingBoxController:
                           "setting.")
         except Exception as e:
             self._log(f"Could not restore proxy environment variables: {e}", "warning")
+        try:
+            from core import env_certs
+            if env_certs.restore():
+                self._log("CA-bundle environment variables restored to their "
+                          "previous setting.")
+        except Exception as e:
+            self._log(f"Could not restore CA-bundle environment variables: {e}",
+                      "warning")
+        try:
+            from core import java_trust
+            if java_trust.restore():
+                self._log("Corporate CA removed from the Java truststores "
+                          "ProxyForce imported it into.")
+        except Exception as e:
+            self._log(f"Could not clean up the Java truststores: {e}", "warning")
         try:
             from core import appcontainer
             if appcontainer.restore():

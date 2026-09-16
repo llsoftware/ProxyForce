@@ -53,6 +53,15 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
   **no internet** (`IPv4Connectivity: LocalNetwork`) — silently stopping Windows
   Spotlight, Microsoft Store, Widgets, and anything else that gates on connectivity
   level from refreshing. See **Troubleshooting → Windows Spotlight** below.
+- **TLS-inspection trust is handled for CLI/dev tools (opt-in).** ProxyForce never
+  terminates TLS, so an inspection appliance's certificate is something apps must
+  *trust*, not something routing can fix. Windows' store usually has the corporate
+  CA already (GPO) — but docker, pip, npm, git, curl, Go, cargo, aws and Java read
+  their own bundled CA list instead, which is why they fail while browsers work.
+  Enabling **Settings → TLS INSPECTION** points those tools at a merged bundle
+  (public baseline + live Windows store + your corporate CA) and imports it into
+  any Java truststore, then undoes all of it on stop. The certificate ships with
+  ProxyForce and is replaceable. See **Troubleshooting → SSL errors** below.
 - **IPv6 is suppressed** (AAAA answered with NODATA) so dual-stack apps fall back to
   IPv4 → fakeip → proxy. The TUN is IPv4-only by design (avoids a Windows 10 IPv6
   crash); suppressing AAAA is what stops IPv6 from leaking around the proxy.
@@ -360,8 +369,90 @@ in particular, Auth Type must be **Basic** for a username/password to be sent at
 Settings shows a warning (and the Log tab logs one on Save/Connect) if Auth Type is
 **None** or **NTLM** while credentials are filled in, since neither of those sends them.
 
-**SSL errors / certificate warnings**
-Push your corporate CA certificate to Trusted Root via GPO:
+**SSL errors / certificate warnings (TLS inspection)**
+Symptom: `docker pull`, `pip install`, `npm install`, `git clone`, `curl`, `go get`
+or `aws` fail with *unable to get local issuer certificate* / *self-signed
+certificate in certificate chain* / *x509: certificate signed by unknown
+authority* — while Edge, Chrome and Office on the same machine are fine.
+
+That split is the whole diagnosis. Your network inspects TLS, so the certificate
+an app sees is minted by the inspection appliance's CA. Windows' trust store
+already has that CA (pushed by GPO), which is why browsers work — but those CLI
+tools **do not read the Windows trust store**. Each ships its own baked-in CA
+bundle, and the corporate CA is not in it.
+
+ProxyForce cannot fix this by routing: it never terminates TLS, it only issues
+`CONNECT host:443` and relays bytes. The tool has to *trust* the CA. So enable:
+
+> **Settings → TLS INSPECTION → Trust the corporate TLS-inspection CA**
+
+While ProxyForce runs, that:
+
+1. Builds `C:\ProgramData\ProxyForce\ca-bundle.pem` — a **union** of a complete
+   public-trust baseline, your live Windows `ROOT` store (so any *other*
+   GPO-pushed CA is picked up automatically), and the corporate CA — deduplicated
+   by fingerprint.
+2. Points the CA-bundle environment variables at it, machine-wide and per-user:
+   `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`,
+   `PIP_CERT`, `AWS_CA_BUNDLE`, `CARGO_HTTP_CAINFO`,
+   `GRPC_DEFAULT_SSL_ROOTS_FILE_PATH`, `HTTPLIB2_CA_CERTS`, `DENO_CERT`,
+   `NIX_SSL_CERT_FILE`, `PERL_LWP_SSL_CA_FILE`, and `NODE_EXTRA_CA_CERTS`
+   (which gets the corporate CA *alone*, since Node extends its built-ins rather
+   than replacing them).
+3. Imports the CA into every **Java** truststore it finds (`keytool`), because the
+   JVM reads a keystore and has no environment-variable override.
+
+All of it is snapshotted first and undone on stop — including after a crash —
+exactly like the system-proxy takeover. Java aliases are removed one by one, and
+only ones ProxyForce created.
+
+> **Reopen your shell.** A process reads its environment at launch, so a terminal
+> that was already open before you enabled this will not see the change.
+
+**Where the CA comes from.** In order of authority:
+
+1. **A file you pick** in **Settings → Corporate CA certificate**. If you set one
+   and it cannot be read, ProxyForce *fails loudly and changes nothing* — a typo
+   must never leave you believing a CA is trusted when it is not.
+2. **`assets/ca/corporate-ca.pem`**, if the build has one. This file is **not in
+   the public repository** (it identifies a specific organisation's inspection
+   appliance), so official release builds do not carry one. A private/internal
+   build can drop one in before packaging and it will be used automatically.
+3. **Your live Windows `ROOT` store.** This is the fallback that makes the other
+   two optional: on a GPO-managed machine the inspection CA is *already there* —
+   that is exactly why your browsers work — so ProxyForce picks it up with no
+   configuration at all. Every root in your store that is not part of public
+   trust is treated as a private CA and carried into the bundle (and into
+   `NODE_EXTRA_CA_CERTS`).
+
+In practice this means **you usually do not need to configure anything**: turn the
+option on and the CA your machine already trusts is propagated to the tools that
+were not reading it. Point Settings at a file only when the CA is *not* in your
+Windows store.
+
+**Supplying your own certificate.** It must be **Base-64 (PEM)**, not DER/binary; a chain with
+several certificates in one file is fine. The Settings panel validates the file
+and shows the subject as soon as you pick it. To export yours from a machine that
+already trusts it:
+
+```powershell
+$ca = Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Subject -match 'YourCA' }
+@("-----BEGIN CERTIFICATE-----") +
+  [Convert]::ToBase64String($ca.RawData, 'InsertLineBreaks') +
+  @("-----END CERTIFICATE-----") | Set-Content C:\Temp\corporate-ca.pem -Encoding ascii
+```
+
+**What this does NOT cover**
+
+| Case | Why | What to do |
+|---|---|---|
+| Inside a container (`RUN pip install` in a `docker build`) | A container sees neither the Windows store nor host environment variables | `COPY` the CA into the image, or mount it |
+| WSL distributions | A separate Linux trust store | Copy the PEM to `/usr/local/share/ca-certificates/corp.crt`, then `sudo update-ca-certificates` |
+| A JDK with a non-default keystore password | `keytool` cannot open it | Import by hand with the real password (ProxyForce logs which store it skipped) |
+| Apps with a hardcoded bundle and no override | Nothing to point at the merged file | Replace that app's bundle with `C:\ProgramData\ProxyForce\ca-bundle.pem` |
+
+If you would rather not use this feature, the manual equivalent is to add the CA
+to the Windows Trusted Root store (which fixes browsers and .NET/PowerShell only):
 ```bat
 certutil -addstore Root YourCA.crt
 ```

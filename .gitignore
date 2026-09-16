@@ -18,4 +18,33 @@ offline_wheels/
 *.egg-info/
 
 # Generated app icon (CI rebuilds it via tools/make_assets.py before each build)
-assets/
+assets/*
+# ...but the PUBLIC-trust baseline is source data, not generated: core/env_certs
+# merges it, and without it the TLS-inspection feature fails closed in every
+# build. This is the same Mozilla/curl CA list that ships inside curl, git and
+# Python -- public by definition, nothing site-specific in it.
+!assets/ca/
+!assets/ca/mozilla-cacert.pem
+
+# NEVER commit the corporate inspection CA. This repository is PUBLIC, and that
+# certificate names the organisation and its security appliance. It is optional
+# by design (core/env_certs falls back to the live Windows ROOT store, which is
+# where a GPO-managed machine already has it), so excluding it costs nothing.
+assets/ca/corporate-ca.pem
+assets/ca/*corporate*
+assets/ca/*.key
+assets/ca/*.pfx
+assets/ca/*.p12
+
+# Runtime logs: these capture the proxy host, internal hostnames and browsing
+# history of whoever ran the app. Never commit them.
+logs/
+*.log
+diagnostics.txt
+
+# Local config snapshots / credential stores written next to the app
+config.json
+proxy_backup.json
+env_proxy_backup.json
+env_certs_backup.json
+java_trust_backup.json

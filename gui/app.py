@@ -12,7 +12,7 @@ import re
 import time
 from datetime import datetime
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 
 import customtkinter as ctk
 
@@ -400,6 +400,34 @@ class SettingsPanel(ctk.CTkScrollableFrame):
             relief="flat", font=("Consolas", 10), height=4, padx=10, pady=8)
         self._bypass_text.pack(fill="x")
 
+        s3b = self._section("TLS INSPECTION")
+        self._check(s3b, "ca_inject",
+                    "Trust the corporate TLS-inspection CA (fixes docker / pip / "
+                    "npm / git / curl SSL errors)")
+        self._lbl(s3b, "Corporate CA certificate  —  leave blank to use the one "
+                       "ProxyForce ships with. Base-64 (PEM) .cer/.crt/.pem only.")
+        row = ctk.CTkFrame(s3b, fg_color="transparent")
+        row.pack(fill="x")
+        cert_var = tk.StringVar()
+        self._vars["ca_cert_path"] = cert_var
+        ctk.CTkEntry(row, textvariable=cert_var,
+                     placeholder_text="(shipped certificate)",
+                     fg_color=THEME["input_bg"], border_color=THEME["border"],
+                     border_width=1, text_color=THEME["text"],
+                     placeholder_text_color=THEME["muted"], corner_radius=6,
+                     font=ctk.CTkFont("Segoe UI", 11)).pack(
+                         side="left", fill="x", expand=True, ipady=4)
+        ctk.CTkButton(row, text="Browse…", width=78, corner_radius=6,
+                      fg_color=THEME["accent_dk"], hover_color=THEME["accent"],
+                      font=ctk.CTkFont("Segoe UI", 10, weight="bold"),
+                      command=self._pick_ca_cert).pack(side="left", padx=(6, 0))
+        self._ca_status_lbl = ctk.CTkLabel(
+            s3b, text="", justify="left", wraplength=260, anchor="w",
+            font=ctk.CTkFont("Segoe UI", 10), text_color=THEME["muted"])
+        self._ca_status_lbl.pack(anchor="w", pady=(6, 0))
+        cert_var.trace_add("write", lambda *_: self._refresh_ca_status())
+        self._refresh_ca_status()
+
         s4 = self._section("APP OPTIONS")
         self._check(s4, "autostart",       "Launch & connect at logon  (runs elevated, no prompt)")
         self._check(s4, "start_minimized", "Start minimized to system tray")
@@ -514,6 +542,34 @@ class SettingsPanel(ctk.CTkScrollableFrame):
             self._bypass_text.delete("1.0", "end")
             self._bypass_text.insert("1.0", "\n".join(d["bypass_list"]))
         self._refresh_auth_warning()
+
+    def _pick_ca_cert(self):
+        path = filedialog.askopenfilename(
+            title="Select the corporate CA certificate",
+            filetypes=[("Certificates", "*.pem *.crt *.cer"), ("All files", "*.*")])
+        if path:
+            self._vars["ca_cert_path"].set(path)
+
+    def _refresh_ca_status(self):
+        """Live-validate the chosen CA file. Validation happens HERE, at pick time,
+        not at connect time: a certificate that does not parse would otherwise fail
+        silently in the engine log, long after the user stopped looking at it."""
+        lbl = getattr(self, "_ca_status_lbl", None)
+        if lbl is None:
+            return
+        try:
+            from core import env_certs
+            path = (self._vars["ca_cert_path"].get() or "").strip()
+            shipped = not path
+            ok, summary = env_certs.describe_cert_file(
+                path or env_certs.shipped_corporate_ca())
+        except Exception as e:
+            lbl.configure(text=f"Could not read the certificate: {e}",
+                          text_color=THEME["yellow"])
+            return
+        prefix = "Shipped certificate — " if shipped else ""
+        lbl.configure(text=prefix + summary,
+                      text_color=THEME["muted"] if ok else THEME["yellow"])
 
     def _refresh_auth_warning(self):
         """Live-updates the yellow note under the Auth Type control whenever it,
@@ -1048,7 +1104,7 @@ class ProxyForceApp(ctk.CTk):
     # update_*) are intentionally excluded so they never cause a disconnect.
     _PROXY_FIELDS = ("host", "port", "auth_type", "username", "password",
                      "exclude_private", "exclude_loopback", "bypass_list",
-                     "log_level")
+                     "log_level", "ca_inject", "ca_cert_path")
 
     def _proxy_settings_changed(self, vals: dict) -> bool:
         """True if any proxy-affecting field in `vals` differs from the config the

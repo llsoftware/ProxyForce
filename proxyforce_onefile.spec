@@ -54,6 +54,10 @@ a = Analysis(
     binaries=[],
     datas=[
         # sing-box binary + supporting files (placed in _internal\singbox\ in onedir).
+        # CA assets: the public-trust baseline + the shipped corporate
+        # inspection CA (core/env_certs). Without these the TLS-inspection
+        # feature fails closed and the env vars are never written.
+        ('assets/ca/*.pem', 'ca'),
     ] + _singbox_data + _ctk_data,
     hiddenimports=[
         # core modules (imported lazily in engine control path)
@@ -61,6 +65,8 @@ a = Analysis(
         'core.config_store',
         'core.system_proxy',
         'core.env_proxy',
+        'core.env_certs',
+        'core.java_trust',
         'core.local_proxy',
         # auto-updater (lazily imported in main.py for --apply-update)
         'core.updater',
