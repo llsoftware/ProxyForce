@@ -1,0 +1,23 @@
+[Unit]
+Description=ProxyForce transparent corporate-proxy redirector
+Documentation=https://github.com/llsoftware/ProxyForce
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=@PREFIX@/ProxyForce --headless
+Restart=on-failure
+RestartSec=5
+# The engine creates a TUN, rewrites the routing table and edits /etc files, so it
+# genuinely needs root and is deliberately not sandboxed here. Narrowing this to a
+# capability set was considered and rejected: it also writes /etc/environment,
+# /etc/profile.d and Java truststores, and a half-privileged run would fail those
+# silently rather than loudly.
+User=root
+# A missing proxy configuration exits 78 (EX_CONFIG). That is a real error, but not
+# one restarting fixes, so it is not treated as a failure to retry forever.
+SuccessExitStatus=78
+
+[Install]
+WantedBy=multi-user.target

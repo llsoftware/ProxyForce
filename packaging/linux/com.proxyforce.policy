@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!--
+  ProxyForce needs root: it creates a TUN interface, rewrites the routing table,
+  and edits machine-wide configuration. This action is what lets the GUI raise its
+  own privileges from a desktop launcher, the way ShellExecuteW("runas") triggers
+  UAC on Windows.
+
+  auth_admin_keep, NOT "yes": the user authenticates as an administrator, and the
+  grant is remembered only for the rest of the session. Allowing it outright would
+  hand any process on the desktop a root shell via pkexec.
+-->
+<policyconfig>
+  <vendor>ProxyForce</vendor>
+  <vendor_url>https://github.com/llsoftware/ProxyForce</vendor_url>
+
+  <action id="com.proxyforce.run">
+    <description>Run ProxyForce</description>
+    <message>Authentication is required to redirect this computer's network traffic through the corporate proxy.</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin_keep</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">@PREFIX@/ProxyForce</annotate>
+    <annotate key="org.freedesktop.policykit.exec.allow_gui">true</annotate>
+  </action>
+</policyconfig>

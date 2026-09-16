@@ -4,8 +4,15 @@
 # Modern GUI framework
 customtkinter==5.2.2
 
-# System tray integration (Windows)
+# System tray integration
 pystray==0.19.5
+
+# pystray's X11 backend on Linux. Pure Python, so PyInstaller can bundle it --
+# unlike the AppIndicator backend, which needs PyGObject and system typelibs that
+# do not travel inside a portable build. Without a usable backend the tray is
+# simply absent and the window stays a normal window (gui/app.py handles that);
+# with it, the tray works on X11 and on Wayland sessions running XWayland.
+python-xlib==0.33 ; sys_platform == "linux"
 
 # Image support (tray icon + CustomTkinter image widgets)
 pillow==11.3.0

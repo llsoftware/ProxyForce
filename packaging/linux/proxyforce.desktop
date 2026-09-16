@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=ProxyForce
+GenericName=Corporate proxy redirector
+Comment=Force all outbound TCP through a corporate HTTP proxy, including apps that ignore proxy settings
+Exec=@PREFIX@/ProxyForce
+Icon=@PREFIX@/_internal/proxyforce.png
+Terminal=false
+Categories=Network;Security;System;
+Keywords=proxy;network;corporate;tun;
+StartupNotify=true
+StartupWMClass=ProxyForce

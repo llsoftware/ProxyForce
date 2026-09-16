@@ -11,7 +11,23 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # One matrix, two artifacts. The build is identical apart from the engine
+    # binary and the Windows-only AV hardening, so keeping it in one job is what
+    # stops the two platforms' pipelines drifting apart. Steps use `shell: bash`
+    # throughout — Git Bash is present on windows-latest — so only the genuinely
+    # platform-specific steps carry an `if:`.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win64
+          - os: ubuntu-latest
+            platform: linux64
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
 
     steps:
       - name: Checkout
@@ -22,14 +38,62 @@ jobs:
         with:
           python-version: '3.11'
 
+      # PyInstaller can only bundle tkinter if the build machine has it. The
+      # setup-python builds normally include it; installing tk explicitly means a
+      # change upstream shows up as an apt failure here rather than as a GUI that
+      # cannot open a window on a user's machine.
+      - name: Install Linux build prerequisites
+        if: matrix.platform == 'linux64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-tk tk-dev
+
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # The Linux engine is not committed (the Windows one is, historically). Fetch
+      # the release matching vendor/singbox/VERSION.txt and verify it against the
+      # hash pinned in vendor/singbox-linux-amd64.sha256 BEFORE unpacking it. An
+      # unverified engine binary would be executed with root privileges on every
+      # user's machine, so a mismatch fails the build rather than warning.
+      - name: Fetch the Linux sing-box engine
+        if: matrix.platform == 'linux64'
+        run: |
+          set -euo pipefail
+          VER="$(tr -d '[:space:]' < vendor/singbox/VERSION.txt)"
+          ASSET="sing-box-${VER}-linux-amd64.tar.gz"
+          URL="https://github.com/SagerNet/sing-box/releases/download/v${VER}/${ASSET}"
+          echo "Fetching $URL"
+          curl -fsSL --retry 3 -o "$ASSET" "$URL"
+          # The pin lives OUTSIDE vendor/singbox/ on purpose: the spec globs that
+          # directory wholesale, so anything left in it ends up inside both
+          # platforms' packages. The pin is stored for the asset name it was
+          # computed from; if VERSION.txt moved, the name will not match and this
+          # fails loudly rather than verifying the wrong file.
+          grep -q "  ${ASSET}\$" vendor/singbox-linux-amd64.sha256 || {
+            echo "::error::vendor/singbox-linux-amd64.sha256 does not pin ${ASSET}."
+            echo "::error::VERSION.txt says ${VER}; re-pin the hash after bumping it."
+            exit 1
+          }
+          sha256sum -c vendor/singbox-linux-amd64.sha256
+          tar -xzf "$ASSET"
+          cp "sing-box-${VER}-linux-amd64/sing-box" vendor/singbox/sing-box
+          cp "sing-box-${VER}-linux-amd64/libcronet.so" vendor/singbox/libcronet.so
+          chmod 755 vendor/singbox/sing-box
+          # The Windows engine is committed and irrelevant to this build; leaving it
+          # in vendor/ would put a 45 MB Windows PE inside the Linux package, since
+          # the spec globs the whole directory.
+          rm -f vendor/singbox/sing-box.exe vendor/singbox/libcronet.dll
+          ls -la vendor/singbox/
 
       # Rebuild the PyInstaller bootloader from source so ProxyForce.exe carries a
       # unique stub hash — the prebuilt pip-wheel bootloader is fingerprinted by
       # Defender's ML engine (Sabsik.TE.A!ml). windows-latest has MSVC via VS 2022.
       # Falls back gracefully (warning, no failure) if the clone or build fails.
+      # Windows-only: there is no equivalent AV heuristic to defeat on Linux, and
+      # rebuilding there would only add a failure mode.
       - name: Rebuild PyInstaller bootloader from source
+        if: matrix.platform == 'win64'
         shell: pwsh
         run: |
           $version = (pip show pyinstaller | Select-String "^Version:").ToString().Trim() -replace "Version: ",""
@@ -51,22 +115,55 @@ jobs:
           Set-Location $env:GITHUB_WORKSPACE
           Write-Host "Bootloader rebuilt successfully"
 
-      - name: Run unit tests (Win 10 launch supervisor logic)
+      # Runs on both platforms deliberately. The point of the v3 platform layer is
+      # that these tests collect and pass on Linux too; if that regresses, the
+      # Linux job is where it shows up.
+      - name: Run unit tests
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
-      - name: Generate icon
+      - name: Generate icons
         run: python tools/make_assets.py
 
       - name: Build with PyInstaller (onedir)
         run: python -m PyInstaller proxyforce_onefile.spec --clean --noconfirm
 
       - name: Smoke test (verify imports + sing-box)
-        run: dist\ProxyForce\ProxyForce.exe --selftest
+        run: |
+          if [ "${{ matrix.platform }}" = "win64" ]; then
+            ./dist/ProxyForce/ProxyForce.exe --selftest
+          else
+            ./dist/ProxyForce/ProxyForce --selftest
+          fi
+
+      # The installer, polkit action, desktop entry and systemd unit ship next to
+      # the application rather than inside _internal/, because install.sh resolves
+      # the app root relative to its own location.
+      - name: Stage Linux packaging files
+        if: matrix.platform == 'linux64'
+        run: |
+          mkdir -p dist/ProxyForce/packaging
+          cp -a packaging/linux dist/ProxyForce/packaging/
+          chmod 755 dist/ProxyForce/packaging/linux/install.sh \
+                    dist/ProxyForce/packaging/linux/uninstall.sh
+          # install.sh is documented as ./packaging/install.sh; provide that path
+          # too so the README's command works without a linux/ in the middle.
+          ln -s linux/install.sh dist/ProxyForce/packaging/install.sh
 
       - name: Package onedir as zip
         run: |
-          $tag = "${{ github.ref_name }}"
-          Compress-Archive -Path dist\ProxyForce\* -DestinationPath "ProxyForce-$tag-win64.zip"
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          NAME="ProxyForce-${TAG}-${{ matrix.platform }}.zip"
+          cd dist/ProxyForce
+          if [ "${{ matrix.platform }}" = "win64" ]; then
+            7z a -tzip -mx=9 "../../${NAME}" ./* >/dev/null
+          else
+            # -y stores symlinks as symlinks rather than following them, which keeps
+            # packaging/install.sh a link instead of a duplicate 5 KB file.
+            zip -r -y -q -9 "../../${NAME}" .
+          fi
+          cd ../..
+          ls -la "${NAME}"
 
       # core/updater.py rejects a staged archive outright once it crosses
       # _MAX_MEMBERS / _MAX_EXTRACTED (a zip-bomb guard) — if the app ever grows
@@ -81,7 +178,7 @@ jobs:
           from core import updater
 
           tag = "${{ github.ref_name }}"
-          zip_path = f"ProxyForce-{tag}-win64.zip"
+          zip_path = f"ProxyForce-{tag}-${{ matrix.platform }}.zip"
           with zipfile.ZipFile(zip_path) as z:
               members = z.infolist()
               expanded = sum(m.file_size for m in members)
@@ -101,29 +198,34 @@ jobs:
                   f"pipeline's hard cap ({updater._MAX_EXTRACTED}); raise _MAX_EXTRACTED in "
                   f"core/updater.py before this silently breaks self-update")
 
-      # Integrity manifest consumed by the in-app auto-updater (and humans).
-      - name: Generate SHA256SUMS
+      # One line per platform. The publish job concatenates both into the single
+      # SHA256SUMS that the signature covers.
+      - name: Generate checksum line
         run: |
-          $tag = "${{ github.ref_name }}"
-          $zip = "ProxyForce-$tag-win64.zip"
-          $h = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
-          "$h  $zip" | Out-File -FilePath SHA256SUMS -Encoding ascii -NoNewline
-          "" | Out-File -FilePath SHA256SUMS -Encoding ascii -Append   # trailing newline
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          NAME="ProxyForce-${TAG}-${{ matrix.platform }}.zip"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${NAME}" > "SHA256SUMS.${{ matrix.platform }}"
+          else
+            python -c "import hashlib,sys; p=sys.argv[1]; print(hashlib.sha256(open(p,'rb').read()).hexdigest()+'  '+p)" "${NAME}" > "SHA256SUMS.${{ matrix.platform }}"
+          fi
+          cat "SHA256SUMS.${{ matrix.platform }}"
 
       - name: Upload unsigned release payload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: release-payload
+          name: release-payload-${{ matrix.platform }}
           path: |
-            ProxyForce-*-win64.zip
-            SHA256SUMS
+            ProxyForce-*-${{ matrix.platform }}.zip
+            SHA256SUMS.${{ matrix.platform }}
           if-no-files-found: error
           retention-days: 1
 
   sign-and-publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -139,50 +241,92 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Download release payload
+      - name: Download release payloads
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: release-payload
+          pattern: release-payload-*
+          merge-multiple: true
           path: release-payload
 
+      # ONE SHA256SUMS covering BOTH archives, in a deterministic order. The
+      # signature is over this file, so both platforms' updaters verify the same
+      # bytes and a tampered archive on either side fails the check.
+      - name: Combine checksums
+        working-directory: release-payload
+        run: |
+          set -euo pipefail
+          cat SHA256SUMS.win64 SHA256SUMS.linux64 > SHA256SUMS
+          rm -f SHA256SUMS.win64 SHA256SUMS.linux64
+          cat SHA256SUMS
+
+      # core/updater.py resolves the signature by the archive's own name
+      # (asset_name(tag) + ".sig"), so each platform needs a .sig it can find.
+      # Both are the SAME signature over the SAME SHA256SUMS — the per-platform
+      # naming is a lookup convenience, not two different signing operations.
       - name: Sign SHA256SUMS (Ed25519)
         working-directory: release-payload
         env:
           PROXYFORCE_SIGNING_KEY: ${{ secrets.PROXYFORCE_SIGNING_KEY }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          python ..\tools\sign_release.py SHA256SUMS "ProxyForce-$tag-win64.zip.sig"
-          if (-not (Test-Path "ProxyForce-$tag-win64.zip.sig")) { throw "signature missing" }
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          python ../tools/sign_release.py SHA256SUMS "ProxyForce-${TAG}-win64.zip.sig"
+          cp "ProxyForce-${TAG}-win64.zip.sig" "ProxyForce-${TAG}-linux64.zip.sig"
+          for f in "ProxyForce-${TAG}-win64.zip.sig" "ProxyForce-${TAG}-linux64.zip.sig"; do
+            [ -s "$f" ] || { echo "::error::signature missing: $f"; exit 1; }
+          done
+          ls -la
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2.6.1
         with:
           name: "ProxyForce ${{ github.ref_name }}"
           body: |
-            ## Installation
+            ## Windows
 
             1. Download `ProxyForce-${{ github.ref_name }}-win64.zip`
             2. Extract the zip to any folder (e.g. `C:\Tools\ProxyForce\`)
             3. Double-click `ProxyForce.exe` and approve the UAC elevation prompt
             4. Open the **Settings** tab, enter your proxy host/port, and click **Start Proxy**
 
-            > ⚠️ **Keep the folder intact** — `ProxyForce.exe` needs the `_internal\` folder next to it.
+            **Requirements:** Windows 10 22H2+ / Windows 11, 64-bit. No Python needed.
 
-            **Minimise to tray:** Click the window × button — enforcement keeps running in the background. Use **Quit** from the tray menu to exit.
+            > **Windows Defender false positive?** Go to Windows Security → Virus & threat protection → Protection history → find the item → **Allow**. This is a known false positive for unsigned network-proxy tools — we submit each release to Microsoft's portal for hash clearance.
 
-            **Requirements:** Windows 10/11 64-bit. No Python or other software needed.
+            ## Linux
 
-            > **Note:** A UAC prompt appears when ProxyForce requests administrator rights at startup (required for the TUN network adapter). This is normal.
+            1. Download `ProxyForce-${{ github.ref_name }}-linux64.zip`
+            2. `unzip ProxyForce-${{ github.ref_name }}-linux64.zip -d proxyforce && cd proxyforce`
+            3. Run it directly with `sudo ./ProxyForce`, or install it properly:
+               `sudo ./packaging/install.sh` (adds a desktop launcher and a polkit
+               rule so the GUI can ask for authentication itself)
+            4. Open the **Settings** tab, enter your proxy host/port, and click **Start Proxy**
 
-            > **Windows Defender false positive?** If Defender flags the download, go to Windows Security → Virus & threat protection → Protection history → find the item → **Allow**. This is a known false positive for unsigned network-proxy tools — we submit each release to Microsoft's portal for hash clearance.
+            Headless, for a server: `sudo ./ProxyForce --headless`, or
+            `sudo ./packaging/install.sh --service` to start it at boot.
+
+            **Requirements:** x86-64, a kernel with `/dev/net/tun`, iproute2, and root.
+            The GUI additionally needs Tk and an X11 or XWayland display.
+
+            > The zip format carries no execute bit. If you extracted with a tool that
+            > dropped it, `chmod +x ProxyForce _internal/singbox/sing-box` — the
+            > installer and the self-updater both handle this for you.
+
+            ## Both
+
+            > ⚠️ **Keep the folder intact** — the executable needs the `_internal/` folder next to it.
+
+            **Minimise to tray:** close the window and enforcement keeps running; use **Quit** from the tray menu to exit. Where no system tray is available (some Wayland sessions), closing the window quits instead.
+
+            `SHA256SUMS` covers both archives and is signed by the same Ed25519 key; the two `.sig` files are identical and are named per-archive so the in-app updater can find the right one.
 
             <!-- This release is published to the DEVELOPMENT channel (pre-release).
                  After testing, promote it to the STABLE channel with:
                    gh release edit ${{ github.ref_name }} --prerelease=false  -->
           files: |
-            release-payload/ProxyForce-*-win64.zip
+            release-payload/ProxyForce-*.zip
             release-payload/SHA256SUMS
-            release-payload/ProxyForce-*-win64.zip.sig
+            release-payload/ProxyForce-*.zip.sig
           draft: false
           # Every release lands on the DEVELOPMENT channel first; promote to stable by
           # clearing this flag on the release (gh release edit <tag> --prerelease=false).
