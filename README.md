@@ -72,9 +72,11 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
   other UWP app unable to reach it at all (not "bypassing capture" — the OS kills
   the connection before it leaves the app, so the TUN can't rescue it either).
   ProxyForce runs `CheckNetIsolation LoopbackExempt -a` for every installed package
-  on start, and removes exactly what it added on stop — snapshotted the same way as
-  the system proxy, so a crash doesn't leave the machine permanently loosened. An app
-  installed after Start won't be exempted until the next Start.
+  on start, then re-sweeps roughly every five minutes so an app installed *while*
+  ProxyForce is running (a Store app you just downloaded) is picked up too rather
+  than waiting for the next Start. It removes exactly what it added on stop —
+  including anything a re-sweep added — snapshotted the same way as the system proxy,
+  so a crash doesn't leave the machine permanently loosened.
 - **UDP is rejected** (including QUIC/HTTP3 on UDP/443). Proxy-aware apps don't try
   QUIC at all (a proxy is configured); anything that does falls back to TCP, which is
   captured. DNS is the one exception — it's hijacked to fakeip.
