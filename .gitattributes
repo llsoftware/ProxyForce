@@ -1,0 +1,29 @@
+# Line endings.
+#
+# The Linux package ships shell scripts and freedesktop/systemd files that are
+# parsed by programs which do NOT tolerate CRLF: /bin/sh reports
+# "bad interpreter: /bin/sh^M" and refuses to run, systemd and polkit silently
+# mis-parse the trailing carriage return into the value. Development happens on
+# Windows, where Git's autocrlf would otherwise hand these files CRLF endings, so
+# pin them explicitly rather than relying on a contributor's local config.
+
+* text=auto
+
+*.sh            text eol=lf
+*.service       text eol=lf
+*.desktop       text eol=lf
+*.policy        text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+
+# Batch files are the mirror image: cmd.exe needs CRLF.
+*.bat           text eol=crlf
+
+# Binaries and pre-hashed payloads must never be touched. The sing-box engine is
+# checked against a SHA256 pin; any normalisation would break that verification.
+*.exe           binary
+*.dll           binary
+*.so            binary
+*.ico           binary
+*.png           binary
+*.pem           text eol=lf

@@ -207,10 +207,15 @@ def capture_route_count(name: str, idx: str = "") -> int:
         tail = out.splitlines()[-1].strip() if out else ""
         return int(tail) if tail.isdigit() else 0
     table = _ip("route", "show", "table", "all")
+    # `dev <name>` must match the WHOLE field. A plain substring test counts
+    # "dev ProxyForceOld" — a stale interface from an earlier run, or an unrelated
+    # tunnel whose name merely starts the same way — as ours, and reports capture
+    # as healthy while every packet leaves through the other interface.
+    dev_re = re.compile(r"\bdev\s+%s(\s|$)" % re.escape(name))
     found = 0
     for prefix in SPLIT_PREFIXES:
         for line in table.splitlines():
-            if line.startswith(prefix + " ") and (" dev %s" % name) in line:
+            if line.startswith(prefix + " ") and dev_re.search(line):
                 found += 1
                 break
     return found
