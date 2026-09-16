@@ -173,7 +173,7 @@ class BundleMergeTests(unittest.TestCase):
         self.assertTrue(st["ok"], st["error"])
         self.assertEqual(st["corporate"], 1 if HAVE_SHIPPED else 0)
         self.assertGreaterEqual(st["base"], 100)
-        self.assertEqual(st["total"], st["base"] + st["windows"] + st["corporate"])
+        self.assertEqual(st["total"], st["base"] + st["system"] + st["corporate"])
 
     def test_bundle_is_never_smaller_than_the_public_baseline(self):
         """The regression guard: a bundle narrower than the shipped baseline would
@@ -264,15 +264,15 @@ class BundleMergeTests(unittest.TestCase):
     def test_refuses_to_build_from_a_sparse_windows_store_alone(self):
         """If the shipped baseline is missing, a 36-cert Windows store must NOT be
         emitted as a replace-semantics bundle."""
-        orig_base, orig_win = env_certs.base_bundle, env_certs._windows_root_ders
+        orig_base, orig_win = env_certs.base_bundle, env_certs._system_root_ders
         env_certs.base_bundle = lambda: ""
-        env_certs._windows_root_ders = lambda: [_shipped_der()]
+        env_certs._system_root_ders = lambda: [_shipped_der()]
         try:
             st = env_certs.build_bundle()
             self.assertFalse(st["ok"])
             self.assertIn("refusing", st["error"])
         finally:
-            env_certs.base_bundle, env_certs._windows_root_ders = orig_base, orig_win
+            env_certs.base_bundle, env_certs._system_root_ders = orig_base, orig_win
 
 
 class ApplyRestoreTests(unittest.TestCase):

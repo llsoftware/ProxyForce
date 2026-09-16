@@ -83,12 +83,9 @@ import sys
 import json
 import base64
 import hashlib
-import ctypes
-import winreg
-import subprocess
+import glob
 
-_USER_KEY = r"Environment"
-_MACHINE_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+from core import hostos, env_store
 
 # Vars whose value REPLACES the tool's own CA bundle -> must point at the full union.
 # Deliberately broad: every one of these is a real, documented override for a
@@ -115,11 +112,6 @@ _EXTRA_VARS = (
 )
 _ALL_VAR_NAMES = _BUNDLE_VARS + _EXTRA_VARS
 
-_HIVES = {"user": winreg.HKEY_CURRENT_USER, "machine": winreg.HKEY_LOCAL_MACHINE}
-_SUBKEYS = {"user": _USER_KEY, "machine": _MACHINE_KEY}
-
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-
 _PEM_RE = re.compile(
     rb"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----", re.S)
 
@@ -127,10 +119,12 @@ _PEM_RE = re.compile(
 # not a safe standalone source for a replace-semantics bundle (see module notes).
 _MIN_STANDALONE_ROOTS = 40
 
+# What to call the OS trust store in user-facing messages.
+_STORE_LABEL = "Windows trust store" if hostos.IS_WINDOWS else "system CA trust store"
+
 
 def _data_dir() -> str:
-    base = os.environ.get("ProgramData", r"C:\ProgramData")
-    return os.path.join(base, "ProxyForce")
+    return hostos.data_dir()
 
 
 def _backup_path() -> str:
@@ -203,20 +197,68 @@ def _read_pem_ders(path: str) -> list:
     return ders
 
 
-def _windows_root_ders() -> list:
-    """The live Windows ROOT store, filtered to certs trusted for server auth.
-    This is what makes a GPO-pushed corporate CA work with no configuration."""
-    server_auth = "1.3.6.1.5.5.7.3.1"
-    ders = []
-    try:
-        for cert, enc, trust in ssl.enum_certificates("ROOT"):
-            if enc != "x509_asn":
-                continue
-            # trust is True (valid for all purposes) or a set of EKU OIDs.
-            if trust is True or trust is None or server_auth in (trust or ()):
-                ders.append(cert)
-    except Exception:
-        pass
+# Where a Linux distribution keeps the system trust store, in the order we try
+# them. The first two are the merged single-file bundles Debian/Ubuntu and
+# RHEL/Fedora generate; the rest are the per-certificate directories used by SUSE,
+# Arch and anything that ran `update-ca-certificates` itself. Covering all of them
+# is what makes the corporate CA already installed by a config-management tool
+# (the Linux equivalent of a GPO push) work here with no extra configuration.
+_LINUX_TRUST_FILES = (
+    "/etc/ssl/certs/ca-certificates.crt",           # Debian, Ubuntu, Alpine
+    "/etc/pki/tls/certs/ca-bundle.crt",             # RHEL, Fedora, CentOS
+    "/etc/ssl/ca-bundle.pem",                       # openSUSE
+    "/etc/ssl/cert.pem",                            # Arch, some BSD-ish layouts
+)
+_LINUX_TRUST_DIRS = (
+    "/usr/local/share/ca-certificates",             # Debian/Ubuntu local additions
+    "/etc/pki/ca-trust/source/anchors",             # RHEL/Fedora local additions
+    "/usr/share/pki/trust/anchors",                 # openSUSE local additions
+    "/etc/ca-certificates/trust-source/anchors",    # Arch local additions
+)
+
+
+def _system_root_ders() -> list:
+    """The live OS trust store, as DER blobs.
+
+    WINDOWS: the ROOT store, filtered to certificates trusted for server auth.
+    This is what makes a GPO-pushed corporate CA work with no configuration.
+
+    LINUX: the distribution's merged bundle plus the local-anchor directories
+    where an administrator (or Ansible/Puppet/Intune) drops a corporate CA. There
+    is no per-purpose trust flag to filter on — a certificate in the anchor set is
+    trusted for everything — so every certificate found is taken.
+    """
+    if hostos.IS_WINDOWS:
+        server_auth = "1.3.6.1.5.5.7.3.1"
+        ders = []
+        try:
+            for cert, enc, trust in ssl.enum_certificates("ROOT"):
+                if enc != "x509_asn":
+                    continue
+                # trust is True (valid for all purposes) or a set of EKU OIDs.
+                if trust is True or trust is None or server_auth in (trust or ()):
+                    ders.append(cert)
+        except Exception:
+            pass
+        return ders
+
+    ders, seen = [], set()
+
+    def take(path):
+        for d in _read_pem_ders(path):
+            f = hashlib.sha256(d).hexdigest()
+            if f not in seen:
+                seen.add(f)
+                ders.append(d)
+
+    for path in _LINUX_TRUST_FILES:
+        if os.path.isfile(path):
+            take(path)
+            break       # the merged bundles are alternatives, not a union
+    for d in _LINUX_TRUST_DIRS:
+        for ext in ("*.crt", "*.pem"):
+            for path in sorted(glob.glob(os.path.join(d, ext))):
+                take(path)
     return ders
 
 
@@ -280,14 +322,20 @@ def describe_cert_file(path: str) -> tuple:
 
 
 def _subject_names(path: str) -> list:
-    """Best-effort human-readable subject CNs via certutil (always present on
-    Windows). Never raises — the caller falls back to fingerprints."""
-    try:
-        r = subprocess.run(["certutil", "-dump", path], capture_output=True,
-                           text=True, creationflags=_NO_WINDOW, timeout=15)
-        out = r.stdout or ""
-    except Exception:
+    """Best-effort human-readable subject CNs. certutil on Windows, openssl on
+    Linux — both are present by default on their platform, and both print the
+    subject in a `CN=...` form the regex below already handles. Never raises; the
+    caller falls back to fingerprints when neither is available."""
+    if hostos.IS_WINDOWS:
+        cmd = ["certutil", "-dump", path]
+    elif hostos.which("openssl"):
+        # storeutl reads a multi-certificate PEM in one pass and prints a subject
+        # line per certificate, which is what the CN regex below wants. It needs no
+        # shell pipeline (unlike crl2pkcs7 piped into pkcs7 -print_certs).
+        cmd = ["openssl", "storeutl", "-noout", "-text", "-certs", path]
+    else:
         return []
+    out = hostos.run_text(cmd, timeout=15)
     names = []
     for m in re.finditer(r"CN=([^,\r\n]+)", out):
         val = m.group(1).strip()
@@ -299,16 +347,16 @@ def _subject_names(path: str) -> list:
 # ── bundle construction ───────────────────────────────────────────────────────
 
 def build_bundle(corporate_ca: str = "") -> dict:
-    """Merge the shipped baseline, the live Windows ROOT store, and the corporate
-    CA into ca-bundle.pem (+ ca-corporate.pem). Returns a stats dict:
+    """Merge the shipped baseline, the live OS trust store, and the corporate CA
+    into ca-bundle.pem (+ ca-corporate.pem). Returns a stats dict:
 
-        {"ok": bool, "error": str, "total": int, "base": int, "windows": int,
+        {"ok": bool, "error": str, "total": int, "base": int, "system": int,
          "corporate": int, "cert_path": str, "cert_summary": str,
          "bundle": path, "corporate_file": path}
 
     `corporate_ca` defaults to the shipped certificate when empty, and the
     shipped certificate is OPTIONAL — see the note on sourcing below."""
-    stats = {"ok": False, "error": "", "total": 0, "base": 0, "windows": 0,
+    stats = {"ok": False, "error": "", "total": 0, "base": 0, "system": 0,
              "corporate": 0, "extras": 0, "cert_path": "", "cert_summary": "",
              "bundle": bundle_path(), "corporate_file": corporate_path()}
 
@@ -319,10 +367,11 @@ def build_bundle(corporate_ca: str = "") -> dict:
     #      NOT committed (the repository is public and the certificate identifies
     #      the organisation's inspection appliance), so a build made from a clean
     #      clone has no such file and must still work.
-    #   3. the live Windows ROOT store -> on a GPO-managed machine the inspection
-    #      CA is already there, which is why browsers work. It is merged in below
-    #      regardless, so case 2 is genuinely optional rather than a silent
-    #      degradation.
+    #   3. the live OS trust store -> on a GPO-managed Windows box, or a Linux box
+    #      where config management dropped the CA into the anchor directory, the
+    #      inspection CA is already there, which is why browsers work. It is merged
+    #      in below regardless, so case 2 is genuinely optional rather than a
+    #      silent degradation.
     explicit = bool(corporate_ca)
     corp_path = corporate_ca or shipped_corporate_ca()
     stats["cert_path"] = corp_path
@@ -337,29 +386,32 @@ def build_bundle(corporate_ca: str = "") -> dict:
             stats["cert_path"] = ""
             stats["cert_summary"] = (
                 f"shipped certificate unusable ({summary}); "
-                f"relying on the Windows trust store instead")
+                f"relying on the {_STORE_LABEL} instead")
     else:
         stats["cert_summary"] = ("no certificate file configured; taking the "
-                                 "inspection CA from the Windows trust store")
+                                 f"inspection CA from the {_STORE_LABEL}")
     corp_ders = _read_pem_ders(corp_path) if corp_path else []
 
     base_ders = _read_pem_ders(base_bundle())
-    win_ders = _windows_root_ders()
+    sys_ders = _system_root_ders()
 
-    if not base_ders and len(win_ders) < _MIN_STANDALONE_ROOTS:
-        # Shipped baseline missing AND the live store is its usual sparse self:
-        # emitting this would strip trust for most public CAs. Refuse outright.
+    if not base_ders and len(sys_ders) < _MIN_STANDALONE_ROOTS:
+        # Shipped baseline missing AND the live store is too sparse to stand in for
+        # it: emitting this would strip trust for most public CAs. Refuse outright.
+        # (A Linux box normally has a FULL ca-certificates bundle here, so this is
+        # mainly a Windows concern — but a container with a stripped-down trust
+        # store hits it there too, and the check is the same either way.)
         stats["error"] = (
-            f"refusing to build a bundle from {len(win_ders)} Windows roots alone "
-            f"(the shipped public-trust baseline is missing) — it would remove "
-            f"trust for most public CAs")
+            f"refusing to build a bundle from {len(sys_ders)} OS trust-store roots "
+            f"alone (the shipped public-trust baseline is missing) — it would "
+            f"remove trust for most public CAs")
         return stats
 
     seen = set()
     out = []
     # Corporate first so it is easy to find when eyeballing the file.
     for label, ders in (("corporate", corp_ders), ("base", base_ders),
-                        ("windows", win_ders)):
+                        ("system", sys_ders)):
         added = 0
         for d in ders:
             f = _fp(d)
@@ -376,13 +428,13 @@ def build_bundle(corporate_ca: str = "") -> dict:
 
     # The NODE_EXTRA_CA_CERTS file: certificates that are NOT part of public
     # trust, since Node extends its built-in roots rather than replacing them.
-    # Taking "everything in the Windows store that the public baseline does not
-    # have" is what makes the shipped certificate optional — on a GPO-managed
-    # machine that set IS the corporate CA (plus any other private root the
-    # organisation pushed), so Node is fixed with or without assets/ca.
+    # Taking "everything in the OS trust store that the public baseline does not
+    # have" is what makes the shipped certificate optional — on a managed machine
+    # that set IS the corporate CA (plus any other private root the organisation
+    # pushed), so Node is fixed with or without assets/ca.
     baseline_fps = {_fp(d) for d in base_ders}
     extras, extra_seen = [], set()
-    for d in corp_ders + win_ders:
+    for d in corp_ders + sys_ders:
         f = _fp(d)
         if f in baseline_fps or f in extra_seen:
             continue
@@ -392,9 +444,9 @@ def build_bundle(corporate_ca: str = "") -> dict:
 
     header = _ascii(
         "# ProxyForce merged CA bundle - generated, do not edit.\n"
-        "# Sources: shipped public-trust baseline + live Windows ROOT store"
+        f"# Sources: shipped public-trust baseline + live {_STORE_LABEL}"
         " + corporate CA.\n"
-        f"# Corporate CA: {corp_path or '(none - taken from the Windows store)'}\n"
+        f"# Corporate CA: {corp_path or '(none - taken from the OS trust store)'}\n"
         f"# {stats['cert_summary']}\n")
     try:
         _write_atomic(bundle_path(), header + "".join(_to_pem(d) for d in out))
@@ -416,85 +468,25 @@ def build_bundle(corporate_ca: str = "") -> dict:
 # ── snapshot / set / restore (mirrors core/env_proxy) ─────────────────────────
 
 def _snapshot() -> dict:
-    snap = {}
-    for scope, hive in _HIVES.items():
-        entry = {}
-        try:
-            with winreg.OpenKey(hive, _SUBKEYS[scope]) as k:
-                for name in _ALL_VAR_NAMES:
-                    try:
-                        val, typ = winreg.QueryValueEx(k, name)
-                        entry[name] = [val, typ]
-                    except FileNotFoundError:
-                        entry[name] = None
-        except OSError:
-            entry = {name: None for name in _ALL_VAR_NAMES}
-        snap[scope] = entry
-    return snap
+    return env_store.snapshot(_ALL_VAR_NAMES)
 
 
 def _describe(snap: dict) -> str:
-    parts = []
-    for scope in ("user", "machine"):
-        for name in _ALL_VAR_NAMES:
-            entry = (snap.get(scope) or {}).get(name)
-            if entry is not None and entry[0]:
-                parts.append(f"{scope}:{name}={entry[0]}")
-    return ", ".join(parts)
+    return env_store.describe(snap, _ALL_VAR_NAMES)
 
 
 def _set(bundle: str, corporate: str):
-    """Write every CA variable into both the machine and the current user's
-    environment. Unlike env_proxy there is no 'delete when empty' branch: both
-    paths are always non-empty by the time apply() calls this (it fails closed
-    before reaching here), and a half-written group is the failure mode that
-    breaks TLS."""
+    """Write every CA variable into both the machine and the user scope. Unlike
+    env_proxy there is no 'delete when empty' branch: both paths are always
+    non-empty by the time apply() calls this (it fails closed before reaching
+    here), and a half-written group is the failure mode that breaks TLS."""
     values = {name: bundle for name in _BUNDLE_VARS}
     values.update({name: corporate for name in _EXTRA_VARS})
-    for scope, hive in _HIVES.items():
-        try:
-            with winreg.OpenKey(hive, _SUBKEYS[scope], 0, winreg.KEY_SET_VALUE) as k:
-                for name, val in values.items():
-                    winreg.SetValueEx(k, name, 0, winreg.REG_SZ, val)
-        except OSError:
-            pass
-    _broadcast()
+    env_store.write(values)
 
 
 def _restore(snap: dict):
-    for scope, hive in _HIVES.items():
-        entry = snap.get(scope) or {}
-        try:
-            with winreg.OpenKey(hive, _SUBKEYS[scope], 0, winreg.KEY_SET_VALUE) as k:
-                for name in _ALL_VAR_NAMES:
-                    stored = entry.get(name)
-                    if stored is None:
-                        try:
-                            winreg.DeleteValue(k, name)
-                        except FileNotFoundError:
-                            pass
-                    else:
-                        val, typ = stored
-                        winreg.SetValueEx(k, name, 0, typ, val)
-        except OSError:
-            pass
-    _broadcast()
-
-
-def _broadcast():
-    """Tell running apps the environment changed (WM_SETTINGCHANGE). Best-effort:
-    most CLI tools read the environment once at process start, so a shell must be
-    reopened to pick this up."""
-    try:
-        HWND_BROADCAST = 0xFFFF
-        WM_SETTINGCHANGE = 0x001A
-        SMTO_ABORTIFHUNG = 0x0002
-        result = ctypes.c_ulong()
-        ctypes.windll.user32.SendMessageTimeoutW(
-            HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
-            SMTO_ABORTIFHUNG, 1000, ctypes.byref(result))
-    except Exception:
-        pass
+    env_store.restore(snap, _ALL_VAR_NAMES)
 
 
 def _write_backup(snap: dict):

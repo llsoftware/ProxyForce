@@ -24,19 +24,19 @@ class WinINetEnabledLogicTests(unittest.TestCase):
 
     def test_detects_enabled_proxy_server(self):
         snap = {"wininet": {"ProxyEnable": [1, 4], "ProxyServer": ["10.0.0.1:8080", 1]}}
-        self.assertEqual(system_proxy._wininet_proxy_on(snap), "10.0.0.1:8080")
+        self.assertEqual(system_proxy._win_previous(snap), "10.0.0.1:8080")
 
     def test_disabled_proxy_reports_empty(self):
         snap = {"wininet": {"ProxyEnable": [0, 4], "ProxyServer": ["10.0.0.1:8080", 1]}}
-        self.assertEqual(system_proxy._wininet_proxy_on(snap), "")
+        self.assertEqual(system_proxy._win_previous(snap), "")
 
     def test_pac_url_reported_when_no_server(self):
         snap = {"wininet": {"ProxyEnable": [0, 4],
                             "AutoConfigURL": ["http://x/proxy.pac", 1]}}
-        self.assertEqual(system_proxy._wininet_proxy_on(snap), "PAC http://x/proxy.pac")
+        self.assertEqual(system_proxy._win_previous(snap), "PAC http://x/proxy.pac")
 
     def test_empty_snapshot_is_safe(self):
-        self.assertEqual(system_proxy._wininet_proxy_on({}), "")
+        self.assertEqual(system_proxy._win_previous({}), "")
 
 
 class BackupRoundTripTests(unittest.TestCase):
@@ -70,19 +70,19 @@ class BackupRoundTripTests(unittest.TestCase):
 
 class PointAtTests(unittest.TestCase):
     """point_at() must SET the proxy (not disable it) and keep the crash-safe backup
-    semantics. _set is stubbed so the real registry/netsh is never touched."""
+    semantics. _win_set is stubbed so the real registry/netsh is never touched."""
 
     def setUp(self):
         self._tmp = tempfile.mkdtemp()
         self._orig_dir = system_proxy._data_dir
-        self._orig_set = system_proxy._set
+        self._orig_set = system_proxy._win_set
         system_proxy._data_dir = lambda: self._tmp
         self._calls = []
-        system_proxy._set = lambda server, bypass: self._calls.append((server, bypass))
+        system_proxy._win_set = lambda server, bypass: self._calls.append((server, bypass))
 
     def tearDown(self):
         system_proxy._data_dir = self._orig_dir
-        system_proxy._set = self._orig_set
+        system_proxy._win_set = self._orig_set
 
     def test_points_at_server_and_writes_backup(self):
         system_proxy.point_at("127.0.0.1:18080", "<local>;127.*")

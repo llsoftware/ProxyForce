@@ -33,18 +33,19 @@ import glob
 import json
 import base64
 import hashlib
-import subprocess
 
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+from core import hostos
+
+_NO_WINDOW = hostos.NO_WINDOW
 
 # Every alias we create starts with this, so restore() can identify its own work
 # and never deletes an alias that was already there.
 _ALIAS_PREFIX = "proxyforce-corporate-ca"
 _DEFAULT_STOREPASS = "changeit"     # the JDK default; unchanged on most installs
 
-# Where JDKs/JREs live on Windows. Globbed, so multiple installed versions are all
-# covered — a dev box commonly has several and builds pick between them.
-_SEARCH_GLOBS = (
+# Where JDKs/JREs live. Globbed, so multiple installed versions are all covered —
+# a dev box commonly has several and builds pick between them.
+_WINDOWS_GLOBS = (
     r"C:\Program Files\Java\*",
     r"C:\Program Files (x86)\Java\*",
     r"C:\Program Files\Eclipse Adoptium\*",
@@ -59,10 +60,32 @@ _SEARCH_GLOBS = (
     r"C:\Program Files\Android\Android Studio\jbr",
 )
 
+# The Linux equivalents. /usr/lib/jvm is the packaged location on every mainstream
+# distribution; the rest cover the ways a developer installs a JDK outside the
+# package manager (SDKMAN!, a tarball in /opt, a JetBrains IDE's bundled runtime,
+# the Android SDK). ~ entries are expanded per real user in _java_homes(), because
+# ProxyForce runs as root and "~" would resolve to /root.
+_LINUX_GLOBS = (
+    "/usr/lib/jvm/*",
+    "/usr/lib64/jvm/*",
+    "/opt/java/*",
+    "/opt/jdk*",
+    "/opt/*/jbr",
+    "/usr/local/java/*",
+    "~/.sdkman/candidates/java/*",
+    "~/.jdks/*",
+    "~/.gradle/jdks/*",
+    "~/android-studio/jbr",
+)
+
+_SEARCH_GLOBS = _WINDOWS_GLOBS if hostos.IS_WINDOWS else _LINUX_GLOBS
+
+# keytool is the binary; cacerts is the keystore it edits.
+_KEYTOOL = "keytool" + hostos.EXE_SUFFIX
+
 
 def _data_dir() -> str:
-    base = os.environ.get("ProgramData", r"C:\ProgramData")
-    return os.path.join(base, "ProxyForce")
+    return hostos.data_dir()
 
 
 def _backup_path() -> str:
@@ -83,23 +106,55 @@ def _java_homes() -> list:
                 homes.append(p)
 
     add(os.environ.get("JAVA_HOME", ""))
-    # java.exe on PATH -> its home is two levels up (<home>\bin\java.exe).
-    try:
-        r = subprocess.run(["where", "java"], capture_output=True, text=True,
-                           creationflags=_NO_WINDOW, timeout=15)
-        for line in (r.stdout or "").splitlines():
-            line = line.strip()
-            if line.lower().endswith("java.exe"):
-                add(os.path.dirname(os.path.dirname(line)))
-    except Exception:
-        pass
-    for pattern in _SEARCH_GLOBS:
+    # java on PATH -> its home is two levels up (<home>/bin/java). `where` on
+    # Windows, `which -a` on Linux; on Linux the result is usually a symlink chain
+    # through /etc/alternatives, so it is resolved before taking the parent or the
+    # home would come out as "/usr".
+    exe = "java" + hostos.EXE_SUFFIX
+    if hostos.IS_WINDOWS:
+        out = hostos.run_text(["where", "java"], timeout=15)
+    else:
+        out = hostos.run_text(["which", "-a", "java"], timeout=15)
+    for line in out.splitlines():
+        line = line.strip()
+        if not line or not os.path.basename(line).lower() == exe:
+            continue
         try:
-            for p in glob.glob(pattern):
-                add(p)
-        except Exception:
+            line = os.path.realpath(line)
+        except OSError:
             pass
+        add(os.path.dirname(os.path.dirname(line)))
+    for pattern in _SEARCH_GLOBS:
+        for expanded in _expand_user_pattern(pattern):
+            try:
+                for p in glob.glob(expanded):
+                    add(p)
+            except Exception:
+                pass
     return homes
+
+
+def _expand_user_pattern(pattern: str) -> list:
+    """A "~/..." glob, expanded once per real user on the box rather than once for
+    root. ProxyForce runs elevated, so the JDKs that matter — SDKMAN!, .jdks — live
+    under the developer's home, not root's. Non-"~" patterns pass through."""
+    if not pattern.startswith("~"):
+        return [pattern]
+    if hostos.IS_WINDOWS:
+        return [os.path.expanduser(pattern)]
+    homes = []
+    try:
+        import pwd
+        for entry in pwd.getpwall():
+            # Skip system accounts: their shells are nologin/false and they do not
+            # have developer toolchains installed under them.
+            if entry.pw_shell and entry.pw_shell.split("/")[-1] in ("nologin", "false"):
+                continue
+            if entry.pw_dir and os.path.isdir(entry.pw_dir) and entry.pw_dir not in homes:
+                homes.append(entry.pw_dir)
+    except Exception:
+        homes = [os.path.expanduser("~")]
+    return [os.path.join(h, pattern[2:]) for h in homes]
 
 
 def find_keystores() -> list:
@@ -111,13 +166,15 @@ def find_keystores() -> list:
     found = []
     seen = set()
     for home in _java_homes():
-        keytool = os.path.join(home, "bin", "keytool.exe")
+        keytool = os.path.join(home, "bin", _KEYTOOL)
         if not os.path.isfile(keytool):
             continue
         for rel in (("lib", "security", "cacerts"),
                     ("jre", "lib", "security", "cacerts")):
             ks = os.path.join(home, *rel)
-            key = ks.lower()
+            # Windows paths are case-insensitive, Linux paths are not — lowering
+            # the key on Linux would merge two genuinely different keystores.
+            key = ks.lower() if hostos.IS_WINDOWS else ks
             if os.path.isfile(ks) and key not in seen:
                 seen.add(key)
                 found.append((ks, keytool))
@@ -128,8 +185,7 @@ def find_keystores() -> list:
 
 def _run(args, timeout=60):
     try:
-        r = subprocess.run(args, capture_output=True, text=True,
-                           creationflags=_NO_WINDOW, timeout=timeout)
+        r = hostos.run(args, timeout=timeout)
         return r.returncode, (r.stdout or "") + (r.stderr or "")
     except Exception as e:
         return 1, str(e)
@@ -287,12 +343,12 @@ def restore() -> bool:
             continue    # never delete something we did not create
         keytool = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(keystore))),
-            "bin", "keytool.exe")
+            "bin", _KEYTOOL)
         if not os.path.isfile(keytool):
-            # Java 8 layout: <home>\jre\lib\security\cacerts -> one level further up.
+            # Java 8 layout: <home>/jre/lib/security/cacerts -> one level further up.
             keytool = os.path.join(
                 os.path.dirname(os.path.dirname(os.path.dirname(
-                    os.path.dirname(keystore)))), "bin", "keytool.exe")
+                    os.path.dirname(keystore)))), "bin", _KEYTOOL)
         if not os.path.isfile(keytool) or not os.path.isfile(keystore):
             continue    # JDK uninstalled since we imported — nothing to undo
         rc, _ = _run([keytool, "-delete", "-alias", alias,

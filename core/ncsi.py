@@ -1,23 +1,30 @@
 """
-ProxyForce — legacy NCSI active-probing recovery.
+ProxyForce — legacy NCSI active-probing recovery (Windows only).
 
 v2.2.2 briefly disabled EnableActiveProbing and saved its previous registry value
 here. Current versions keep active probing enabled, as required for Windows to mark
 the ProxyForce interface as Internet. This module remains only to restore a backup
 left by an interrupted older run and to report the current value in diagnostics.
+
+LINUX: there is no NCSI. The nearest equivalent is NetworkManager's connectivity
+check, which ProxyForce does not touch — NM probes a plain HTTP URL that the
+port-80 route rule already sends through the local forward-proxy, so the failure
+mode this module was written for (Windows concluding "no internet" and silently
+switching off Spotlight/Store/Widgets) has no counterpart. Both public functions
+are no-ops there rather than absent, so callers need no platform branch.
 """
 
 import os
 import json
-import winreg
+
+from core import hostos
 
 _NCSI_KEY = r"SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet"
 _VALUE = "EnableActiveProbing"
 
 
 def _data_dir() -> str:
-    base = os.environ.get("ProgramData", r"C:\ProgramData")
-    return os.path.join(base, "ProxyForce")
+    return hostos.data_dir()
 
 
 def _backup_path() -> str:
@@ -30,6 +37,7 @@ def _snapshot() -> dict:
     """Read the current EnableActiveProbing value. {"value": None} means the value
     doesn't exist (Windows treats absence as enabled=1) — restore() must delete it
     again rather than writing a value that was never really there."""
+    import winreg
     try:
         with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NCSI_KEY) as k:
             try:
@@ -65,40 +73,44 @@ def _clear_backup():
         pass
 
 
-# ── public API ───────────────────────────────────────────────────────────────────
-
 def _write_entry(entry):
-    """Restore None (delete) or a saved [value, registry_type] pair."""
-    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NCSI_KEY, 0,
-                        winreg.KEY_SET_VALUE) as k:
-        if entry is None:
-            try:
-                winreg.DeleteValue(k, _VALUE)
-            except FileNotFoundError:
-                pass
-        else:
-            val, typ = entry
-            winreg.SetValueEx(k, _VALUE, 0, typ, val)
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, _NCSI_KEY, 0,
+                            winreg.KEY_SET_VALUE) as k:
+            if entry is None:
+                try:
+                    winreg.DeleteValue(k, _VALUE)
+                except FileNotFoundError:
+                    pass
+            else:
+                val, typ = entry
+                winreg.SetValueEx(k, _VALUE, 0, typ, val)
+    except OSError:
+        pass
 
+
+# ── public API ──────────────────────────────────────────────────────────────────
 
 def restore() -> bool:
-    """Restore the snapshotted EnableActiveProbing value (or delete it if it never
-    existed). Idempotent: no backup -> no-op. Returns True if a restore ran."""
+    """Restore a backup left by the v2.2.2 passive-probing workaround. Idempotent:
+    no backup -> no-op. Returns True if a restore was performed."""
+    if not hostos.IS_WINDOWS:
+        return False
     snap = _read_backup()
     if snap is None:
         return False
-    try:
-        _write_entry(snap.get("value"))
-    except OSError:
-        pass
+    _write_entry(snap.get("value"))
     _clear_backup()
     return True
 
 
 def current_state() -> str:
-    """One-line human-readable current NCSI active-probing state (for diagnostics)."""
+    """One-line human-readable current state (for diagnostics)."""
+    if not hostos.IS_WINDOWS:
+        return "n/a on Linux (no NCSI; NetworkManager connectivity check untouched)"
     snap = _snapshot()
     entry = snap.get("value")
     if entry is None:
-        return f"{_VALUE}=<not set> (default: active probing enabled)"
-    return f"{_VALUE}={entry[0]}"
+        return "EnableActiveProbing not set (Windows default: active probing ON)"
+    return "EnableActiveProbing=%s" % entry[0]

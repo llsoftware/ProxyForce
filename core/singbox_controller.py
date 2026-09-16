@@ -1427,8 +1427,8 @@ class SingBoxController:
                     self._log(
                         f"Corporate TLS-inspection CA trusted: {st['cert_summary']} "
                         f"-> {st['total']} CAs in {st['bundle']} "
-                        f"({st['base']} public baseline + {st['windows']} from the "
-                        f"Windows store + {st['corporate']} corporate){was}. "
+                        f"({st['base']} public baseline + {st['system']} from the "
+                        f"OS trust store + {st['corporate']} corporate){was}. "
                         f"Fixes docker/pip/npm/git/curl/go/aws and friends, which "
                         f"read their own CA bundle instead of the Windows store. "
                         f"Reopen any shell that was already running to pick it up.")

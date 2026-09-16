@@ -1,6 +1,12 @@
 """
 ProxyForce — Store/UWP loopback exemptions (the "Microsoft Store won't load" fix).
 
+WINDOWS ONLY. Linux has no AppContainer and no loopback isolation: a sandboxed app
+(flatpak, snap) either shares the host network namespace and can reach 127.0.0.1
+like any other process, or has its own namespace where a loopback exemption would
+be meaningless anyway. Every public function below returns its "nothing to do"
+value there, so the controller needs no platform branch around the call.
+
 WHY THIS EXISTS (2026-08-06):
   ProxyForce's system-proxy takeover (core/system_proxy) points WinINET/WinHTTP at
   127.0.0.1 — ProxyForce's own local listeners. Every Windows Store / UWP app runs
@@ -66,7 +72,9 @@ import re
 import json
 import subprocess
 
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+from core import hostos
+
+_NO_WINDOW = hostos.NO_WINDOW
 
 # Matches a Package Family Name's stable shape: <name>_<13-char publisher id>, e.g.
 # "microsoft.windowsstore_8wekyb3d8bbwe". The 13-character base32-style suffix is a
@@ -77,8 +85,7 @@ _PFN_RE = re.compile(r"\b[A-Za-z0-9][\w.-]*_[A-Za-z0-9]{13}\b")
 
 
 def _data_dir() -> str:
-    base = os.environ.get("ProgramData", r"C:\ProgramData")
-    return os.path.join(base, "ProxyForce")
+    return hostos.data_dir()
 
 
 def _backup_path() -> str:
@@ -199,8 +206,11 @@ def exempt_installed() -> "tuple[int, int]":
     session) — already-exempt packages are simply skipped by CheckNetIsolation.
 
     Returns (added, total) — packages newly exempted this call, and the total
-    number of installed packages considered. (0, 0) on failure.
+    number of installed packages considered. (0, 0) on failure, and on Linux,
+    where there is nothing to exempt.
     """
+    if not hostos.IS_WINDOWS:
+        return (0, 0)
     try:
         pfns = _installed_package_family_names()
         if not pfns:
@@ -226,6 +236,8 @@ def restore() -> bool:
     exempt now but absent from the pre-takeover snapshot — then delete the backup.
     Never touches an exemption the user granted themselves outside ProxyForce.
     Idempotent: no backup -> no-op, returns False."""
+    if not hostos.IS_WINDOWS:
+        return False
     snap = _read_backup()
     if snap is None:
         return False
@@ -245,6 +257,8 @@ def restore() -> bool:
 
 def is_exempt(package_family_name: str) -> bool:
     """True if the given package family name currently holds a loopback exemption."""
+    if not hostos.IS_WINDOWS:
+        return False
     try:
         return package_family_name.strip().lower() in {n.lower() for n in _list_exempt()}
     except Exception:
@@ -253,6 +267,8 @@ def is_exempt(package_family_name: str) -> bool:
 
 def current_state() -> str:
     """One-line human-readable summary for diagnostics."""
+    if not hostos.IS_WINDOWS:
+        return "n/a on Linux (no AppContainer loopback isolation)"
     try:
         n = len(_list_exempt())
         return f"{n} package(s) loopback-exempt"
