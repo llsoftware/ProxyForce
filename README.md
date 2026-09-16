@@ -72,9 +72,9 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
   other UWP app unable to reach it at all (not "bypassing capture" — the OS kills
   the connection before it leaves the app, so the TUN can't rescue it either).
   ProxyForce runs `CheckNetIsolation LoopbackExempt -a` for every installed package
-  on start (and re-sweeps periodically for apps installed while it's running), and
-  removes exactly what it added on stop — snapshotted the same way as the system
-  proxy, so a crash doesn't leave the machine permanently loosened.
+  on start, and removes exactly what it added on stop — snapshotted the same way as
+  the system proxy, so a crash doesn't leave the machine permanently loosened. An app
+  installed after Start won't be exempted until the next Start.
 - **UDP is rejected** (including QUIC/HTTP3 on UDP/443). Proxy-aware apps don't try
   QUIC at all (a proxy is configured); anything that does falls back to TCP, which is
   captured. DNS is the one exception — it's hijacked to fakeip.
@@ -94,7 +94,7 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
 
 | | |
 |---|---|
-| **OS** | Windows 10 22H2+ or Windows 11 (64-bit) |
+| **OS** | Windows 10 (64-bit) or Windows 11; tested on 22H2+ |
 | **Privileges** | Administrator (UAC prompt on every launch) |
 | **Network** | HTTP proxy reachable from the machine |
 | **Dependencies** | None — everything is bundled in the release folder |
@@ -175,11 +175,11 @@ release is rejected. The staged build must also pass its own `--selftest` before
 swap, and the previous version is kept as a rollback target in case the new one fails
 to start.
 
-Update assets are stored in a randomly named, administrator-only workspace under
-`%ProgramData%`. Downloads are bounded and atomic, unsafe archive paths and links are
-rejected, and the signed archive is verified and freshly extracted again immediately
-before installation. The new build must emit a positive readiness signal or the
-updater rolls back.
+Update assets are stored in randomly named transaction folders inside an
+administrator-only workspace under `%ProgramData%`. Downloads are bounded and atomic,
+unsafe archive paths and links are rejected, and the signed archive is verified and
+freshly extracted again immediately before installation. The new build must emit a
+positive readiness signal or the updater rolls back.
 
 ProxyForce remains portable and is not Authenticode-signed. Keep its folder in a
 trusted location: software already running as the same Windows user may otherwise
