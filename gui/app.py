@@ -223,6 +223,35 @@ class StatCard(ctk.CTkFrame):
         self._accent_bar.configure(bg=cc("accent"))
 
 
+class _CountStrip(ctk.CTkFrame):
+    """The same counters a row of StatCards would show, on one line.
+
+    The Scanning tab exists for the table at the bottom of it; these numbers
+    are a header for that table, and four 70-pixel cards cost more rows than
+    they are worth once the page also carries the per-source panel."""
+
+    def __init__(self, parent, cells, **kwargs):
+        super().__init__(parent, fg_color="transparent", **kwargs)
+        self._cells = {}
+        for i, (key, text) in enumerate(cells):
+            cell = ctk.CTkFrame(self, fg_color="transparent")
+            cell.pack(side="left", padx=(0 if i == 0 else 24, 0))
+            var = tk.StringVar(value="0")
+            value = ctk.CTkLabel(cell, textvariable=var,
+                                 font=ctk.CTkFont("Segoe UI", 16, weight="bold"),
+                                 text_color=THEME["accent"])
+            value.pack(side="left")
+            ctk.CTkLabel(cell, text=text.upper(),
+                         font=ctk.CTkFont("Segoe UI", 9, weight="bold"),
+                         text_color=THEME["muted"]).pack(side="left", padx=(6, 0))
+            self._cells[key] = (var, value)
+
+    def set(self, key, value: str, colour_key: str = "accent"):
+        var, label = self._cells[key]
+        var.set(value)
+        label.configure(text_color=THEME[colour_key])
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Log panel
 # ─────────────────────────────────────────────────────────────────────────────
@@ -318,6 +347,19 @@ def _ago(ts: float) -> str:
     return f"{d // 86400}d ago"
 
 
+def _until(ts: float) -> str:
+    """The mirror of _ago, for when a daily API budget rolls over."""
+    if not ts:
+        return "—"
+    d = max(0, int(ts - time.time()))
+    if d < 60:
+        return f"{d}s"
+    if d < 3600:
+        return f"{d // 60}m"
+    h, m = d // 3600, (d % 3600) // 60
+    return f"{h}h {m}m" if m else f"{h}h"
+
+
 # Verdict -> (glyph, theme colour key, sort rank). Flagged sorts to the top so a
 # detection is never buried under hundreds of clean rows.
 _REP_UI = {
@@ -328,6 +370,23 @@ _REP_UI = {
     rep.CLEAN:     ("✓ clean",   "green",  4),
     "":            ("—",         "muted",  5),
 }
+
+
+# One column per reputation source, in the order the scan tiers run, so a row
+# shows who has already been past this host and who has not got to it yet.
+# (column key, provider name, heading)
+_CHECK_COLS = (("feeds", "feeds", "Feeds"),
+               ("gsb", "safebrowsing", "GSB"),
+               ("vt", "virustotal", "VT"))
+
+# What that source said. "·" is the important one: not checked — no key, still
+# queued, or a tier that never ran.
+_CHECK_GLYPH = {rep.CLEAN: "✓", rep.MALICIOUS: "⚠",
+                rep.UNKNOWN: "?", rep.ERROR: "!"}
+_CHECK_NONE = "·"
+# Sort rank when a source column's heading is clicked: what it flagged first,
+# what it has not looked at last.
+_CHECK_RANK = {rep.MALICIOUS: 0, rep.ERROR: 1, rep.UNKNOWN: 2, rep.CLEAN: 3}
 
 
 class ConnectionFeed(ctk.CTkFrame):
@@ -473,11 +532,12 @@ class SitesPanel(ctk.CTkFrame):
 
     _MAX_ROWS = 600     # bound the widget on long sessions; oldest rows evicted
 
-    def __init__(self, parent, on_select=None, **kwargs):
+    def __init__(self, parent, on_select=None, on_expand=None, **kwargs):
         super().__init__(parent, fg_color=THEME["card"], corner_radius=10,
                          border_width=1, border_color=THEME["border"], **kwargs)
         self._on_select = on_select
         self._rows = {}         # host -> last rendered tuple, for change detection
+        self._expand_lbl = None
 
         hdr = ctk.CTkFrame(self, fg_color="transparent")
         hdr.pack(fill="x", padx=14, pady=(10, 4))
@@ -490,6 +550,23 @@ class SitesPanel(ctk.CTkFrame):
                      font=ctk.CTkFont("Consolas", 10),
                      text_color=THEME["muted"]).pack(side="left", padx=(10, 0))
 
+        # Packed before the filter so it sits at the far right. The list is
+        # the reason to be on this tab, and on a laptop screen the summary above
+        # it costs more height than it is worth once you are reading rows.
+        if on_expand is not None:
+            self._expand_lbl = ctk.CTkLabel(
+                hdr, text="\u25b2 EXPAND", cursor="hand2",
+                font=ctk.CTkFont("Consolas", 10, weight="bold"),
+                text_color=THEME["muted"])
+            self._expand_lbl.pack(side="right", padx=(12, 0))
+            self._expand_lbl.bind("<Button-1>", lambda e: on_expand())
+            self._expand_lbl.bind(
+                "<Enter>",
+                lambda e: self._expand_lbl.configure(text_color=THEME["accent"]))
+            self._expand_lbl.bind(
+                "<Leave>",
+                lambda e: self._expand_lbl.configure(text_color=THEME["muted"]))
+
         self._filter_var = tk.StringVar(value="All")
         ctk.CTkSegmentedButton(
             hdr, values=["All", "Flagged", "Direct"], variable=self._filter_var,
@@ -501,6 +578,15 @@ class SitesPanel(ctk.CTkFrame):
             unselected_hover_color=THEME["nav_hover"],
             height=22).pack(side="right")
 
+        # The source columns carry one glyph each; say once what they mean
+        # rather than leaving the table to be decoded.
+        ctk.CTkLabel(self, anchor="w",
+                     text="Feeds / GSB / VT:   ✓ checked   ⚠ flagged   "
+                          "? no data   · not checked yet",
+                     font=ctk.CTkFont("Consolas", 9),
+                     text_color=THEME["muted"]).pack(fill="x", padx=14,
+                                                     pady=(0, 4))
+
         self._wrap = tk.Frame(self, bg=cc("input_bg"))
         self._wrap.pack(fill="both", expand=True, padx=14, pady=(0, 14))
 
@@ -508,18 +594,22 @@ class SitesPanel(ctk.CTkFrame):
         # widget CustomTkinter creates internally.
         self._style = ttk.Style()
         self._style_name = "ProxyForce.Sites.Treeview"
-        cols = ("host", "conns", "route", "rep", "seen")
+        cols = (("host", "conns", "route", "rep")
+                + tuple(c for c, _n, _t in _CHECK_COLS) + ("seen",))
         self._tree = ttk.Treeview(self._wrap, columns=cols, show="headings",
                                   style=self._style_name, selectmode="browse")
-        for key, text, width, anchor in (
-                ("host",  "Host",       320, "w"),
-                ("conns", "Conns",       60, "e"),
-                ("route", "Route",       90, "w"),
-                ("rep",   "Reputation", 130, "w"),
-                ("seen",  "Last seen",  100, "w")):
+        layout = [("host",  "Host",       240, "w"),
+                  ("conns", "Conns",       52, "e"),
+                  ("route", "Route",       66, "w"),
+                  ("rep",   "Reputation", 112, "w")]
+        # Narrow on purpose: one glyph each, and the host column is the one
+        # worth the width.
+        layout += [(c, t, 52, "center") for c, _n, t in _CHECK_COLS]
+        layout += [("seen", "Last seen", 86, "w")]
+        for key, text, width, anchor in layout:
             self._tree.heading(key, text=text,
                                command=lambda k=key: self._sort_by(k))
-            self._tree.column(key, width=width, anchor=anchor,
+            self._tree.column(key, width=width, anchor=anchor, minwidth=40,
                               stretch=(key == "host"))
 
         self._sb = tk.Scrollbar(self._wrap, command=self._tree.yview)
@@ -555,8 +645,11 @@ class SitesPanel(ctk.CTkFrame):
 
     def _row_values(self, record):
         glyph = _REP_UI.get(record.status, _REP_UI[""])[0]
-        return (record.host, str(record.conns), record.route or "—",
-                glyph, _ago(record.last_seen))
+        checks = getattr(record, "checks", None) or {}
+        marks = tuple(_CHECK_GLYPH.get(checks.get(name), _CHECK_NONE)
+                      for _c, name, _t in _CHECK_COLS)
+        return ((record.host, str(record.conns), record.route or "—", glyph)
+                + marks + (_ago(record.last_seen),))
 
     @staticmethod
     def _tag_for(record):
@@ -607,6 +700,8 @@ class SitesPanel(ctk.CTkFrame):
     def _sorted_records(self):
         key = self._sort_key
 
+        checked_by = {c: n for c, n, _t in _CHECK_COLS}
+
         def sort_key(r):
             if key == "host":
                 return (r.host,)
@@ -616,6 +711,9 @@ class SitesPanel(ctk.CTkFrame):
                 return (r.route or "",)
             if key == "rep":
                 return (_REP_UI.get(r.status, _REP_UI[""])[2], r.host)
+            if key in checked_by:
+                status = (getattr(r, "checks", None) or {}).get(checked_by[key])
+                return (_CHECK_RANK.get(status, 9), r.host)
             return (-r.last_seen,)
 
         return sorted(self._records.values(), key=sort_key)
@@ -634,6 +732,12 @@ class SitesPanel(ctk.CTkFrame):
     def selected_host(self):
         sel = self._tree.selection()
         return sel[0] if sel else None
+
+    def set_expanded(self, expanded: bool):
+        """Reflect which way the one-click toggle will move the split."""
+        if self._expand_lbl is not None:
+            self._expand_lbl.configure(
+                text="\u25bc COLLAPSE" if expanded else "\u25b2 EXPAND")
 
     def tick(self):
         """Refresh the relative 'last seen' column without rebuilding rows."""
@@ -695,18 +799,24 @@ _PSTATE_UI = {
 
 
 class _ProviderRow(ctk.CTkFrame):
-    """One provider's live status: a beacon, its role, and its own metrics.
+    """One provider's live status: a beacon, its role, its own metrics, and —
+    for the two sources that need a key — how much of that key's daily budget
+    today has spent.
 
     The beacon brightens for one refresh whenever the provider's call count has
     moved since the last tick, which is what makes the panel read as live rather
     than as a static summary."""
 
     _DOT = 12
+    _BAR_W = 96         # quota meter; wide enough that a fifth of it is visible
+    _BAR_H = 6
 
     def __init__(self, parent, **kwargs):
         super().__init__(parent, fg_color="transparent", **kwargs)
         self._calls = 0
         self._flash = False
+        self._frac = 0.0
+        self._quota_key = "muted"
 
         self._canvas = tk.Canvas(self, width=self._DOT + 8, height=self._DOT + 8,
                                  highlightthickness=0, bd=0, bg=cc("card"))
@@ -734,10 +844,32 @@ class _ProviderRow(ctk.CTkFrame):
                                        text_color=THEME["muted"])
         self._state_lbl.pack(side="right")
 
+        bot = ctk.CTkFrame(text, fg_color="transparent")
+        bot.pack(fill="x", pady=(1, 0))
+
+        # The daily budget for this provider's API key, right-aligned so the
+        # three meters line up as a column. Packed before the detail line so
+        # that line takes whatever width is left, and hidden outright for the
+        # feed source, which has no key and nothing to ration.
+        self._meter = ctk.CTkFrame(bot, fg_color="transparent")
+        self._quota_var = tk.StringVar(value="")
+        self._quota_lbl = ctk.CTkLabel(
+            self._meter, textvariable=self._quota_var, anchor="e",
+            font=ctk.CTkFont("Consolas", 10), text_color=THEME["muted"])
+        self._quota_lbl.pack(side="right")
+        self._bar = tk.Canvas(self._meter, width=self._BAR_W, height=self._BAR_H,
+                              highlightthickness=0, bd=0, bg=cc("card"))
+        self._bar.pack(side="right", padx=(0, 8))
+        self._bar_bg = self._bar.create_rectangle(
+            0, 0, self._BAR_W, self._BAR_H, fill=cc("border"), outline="")
+        self._bar_fill = self._bar.create_rectangle(
+            0, 0, 0, self._BAR_H, fill=cc("green"), outline="", state="hidden")
+
         self._detail_var = tk.StringVar(value="")
-        ctk.CTkLabel(text, textvariable=self._detail_var, anchor="w",
+        ctk.CTkLabel(bot, textvariable=self._detail_var, anchor="w",
                      justify="left", font=ctk.CTkFont("Consolas", 10),
-                     text_color=THEME["muted"]).pack(fill="x", pady=(1, 0))
+                     text_color=THEME["muted"]).pack(side="left", fill="x",
+                                                     expand=True)
 
     def update_status(self, st: dict, detail_line: str):
         colour_key, label = _PSTATE_UI.get(st["state"], _PSTATE_UI[rep.P_OFF])
@@ -746,6 +878,7 @@ class _ProviderRow(ctk.CTkFrame):
         self._state_var.set(label)
         self._state_lbl.configure(text_color=THEME[colour_key])
         self._detail_var.set(detail_line)
+        self._paint_meter((st.get("extra") or {}).get("quota"))
         # Flash on activity since the previous tick.
         self._flash = st["calls"] > self._calls
         self._calls = st["calls"]
@@ -757,29 +890,77 @@ class _ProviderRow(ctk.CTkFrame):
                                 outline=cc("text") if self._flash else "",
                                 width=2 if self._flash else 0)
 
+    def _paint_meter(self, quota):
+        """Show what today has spent of this key's daily budget. A source with
+        no key reports no quota at all, and gets no meter — an empty bar would
+        read as "nothing used" rather than "nothing to use"."""
+        cap = int((quota or {}).get("cap") or 0)
+        if cap <= 0:
+            self._meter.pack_forget()
+            return
+        self._meter.pack(side="right", padx=(12, 0))
+        used = int(quota.get("used") or 0)
+        self._frac = min(1.0, used / float(cap))
+        # Amber at four fifths: enough warning to notice before a key stops
+        # answering, without crying wolf over a normal day's browsing.
+        self._quota_key = ("red" if self._frac >= 1.0 else
+                           "yellow" if self._frac >= 0.8 else "green")
+        self._quota_var.set(f"{used:,} / {cap:,} today")
+        self._quota_lbl.configure(text_color=THEME[self._quota_key])
+        self._paint_bar()
+
+    def _paint_bar(self):
+        width = int(round(self._BAR_W * self._frac))
+        self._bar.itemconfig(self._bar_bg, fill=cc("border"))
+        self._bar.coords(self._bar_fill, 0, 0, max(width, 1), self._BAR_H)
+        self._bar.itemconfig(self._bar_fill, fill=cc(self._quota_key),
+                             state="normal" if width >= 1 else "hidden")
+
     def repaint_theme(self):
         self._canvas.configure(bg=cc("card"))
+        self._bar.configure(bg=cc("card"))
+        self._paint_bar()
 
 
 class ScanPanel(ctk.CTkFrame):
     """The Scanning tab: overall state, coverage counters, per-provider health
-    and the most recent detections."""
+    and the per-host rollup.
+
+    The summary stack and the sites table share the tab through a draggable
+    split. The table is the half that benefits from height, and how much of it
+    you want depends on whether you are watching the scanner or reading the
+    list — so the divider moves, and EXPAND collapses the summary to its hero
+    line in one click."""
+
+    _TOP_MIN = 80       # floor for the summary pane; EXPAND aims at the hero
+    _SITES_MIN = 120
 
     def __init__(self, parent, on_apply_blocks=None, **kwargs):
         super().__init__(parent, fg_color=THEME["bg"], corner_radius=0, **kwargs)
         self._on_apply_blocks = on_apply_blocks
+        self._expanded = False
+        self._restore_y = 0
+
+        self._split = tk.PanedWindow(self, orient="vertical", bg=cc("bg"),
+                                     bd=0, sashwidth=8, sashrelief="flat",
+                                     sashpad=0, showhandle=False,
+                                     opaqueresize=True)
+        self._split.pack(fill="both", expand=True)
+        self._top = tk.Frame(self._split, bg=cc("bg"))
+        self._bottom = tk.Frame(self._split, bg=cc("bg"))
 
         # Hero
-        self._hero = ctk.CTkFrame(self, fg_color=THEME["card"], corner_radius=12,
-                                  border_width=1, border_color=THEME["border"])
-        self._hero.pack(fill="x", padx=20, pady=(14, 10))
+        self._hero = ctk.CTkFrame(self._top, fg_color=THEME["card"],
+                                  corner_radius=12, border_width=1,
+                                  border_color=THEME["border"])
+        self._hero.pack(fill="x", padx=20, pady=(12, 8))
         inner = ctk.CTkFrame(self._hero, fg_color="transparent")
-        inner.pack(fill="x", padx=24, pady=18)
+        inner.pack(fill="x", padx=24, pady=14)
 
         self._hero_state = tk.StringVar(value="OFF")
         self._hero_lbl = ctk.CTkLabel(
             inner, textvariable=self._hero_state,
-            font=ctk.CTkFont("Segoe UI", 22, weight="bold"),
+            font=ctk.CTkFont("Segoe UI", 20, weight="bold"),
             text_color=THEME["muted"])
         self._hero_lbl.pack(anchor="w")
 
@@ -796,36 +977,66 @@ class ScanPanel(ctk.CTkFrame):
         # Only shown when blocks are pending — see set_pending_blocks.
 
         # Coverage counters
-        stats = ctk.CTkFrame(self, fg_color="transparent")
-        stats.pack(fill="x", padx=20, pady=(0, 10))
-        self._card_sites = StatCard(stats, "Sites seen", "0")
-        self._card_good  = StatCard(stats, "Known good", "0")
-        self._card_bad   = StatCard(stats, "Flagged",    "0")
-        self._card_queue = StatCard(stats, "Queued",     "0")
-        for c in (self._card_sites, self._card_good, self._card_bad,
-                  self._card_queue):
-            c.pack(side="left", fill="both", expand=True, padx=4)
+        self._counts = _CountStrip(self._top, (
+            ("sites", "sites seen"), ("good", "known good"),
+            ("bad", "flagged"), ("queue", "queued")))
+        self._counts.pack(fill="x", padx=24, pady=(0, 10))
 
         # Providers
-        box = ctk.CTkFrame(self, fg_color=THEME["card"], corner_radius=10,
+        box = ctk.CTkFrame(self._top, fg_color=THEME["card"], corner_radius=10,
                            border_width=1, border_color=THEME["border"])
-        box.pack(fill="x", padx=20, pady=(0, 10))
-        ctk.CTkLabel(box, text="SOURCES", anchor="w",
+        box.pack(fill="x", padx=20, pady=(0, 6))
+        box_hdr = ctk.CTkFrame(box, fg_color="transparent")
+        box_hdr.pack(fill="x", padx=16, pady=(8, 4))
+        ctk.CTkLabel(box_hdr, text="SOURCES", anchor="w",
                      font=ctk.CTkFont("Consolas", 10, weight="bold"),
-                     text_color=THEME["muted"]).pack(fill="x", padx=16, pady=(10, 6))
+                     text_color=THEME["muted"]).pack(side="left")
+        # Captions the meter column on the right of each row.
+        ctk.CTkLabel(box_hdr, text="DAILY API BUDGET", anchor="e",
+                     font=ctk.CTkFont("Consolas", 10, weight="bold"),
+                     text_color=THEME["muted"]).pack(side="right")
         self._rows = []
         for i in range(3):
             if i:
                 tk.Frame(box, bg=cc("border"), height=1).pack(fill="x", padx=16)
             row = _ProviderRow(box)
-            row.pack(fill="x", padx=16, pady=8)
+            row.pack(fill="x", padx=16, pady=6)
             self._rows.append(row)
 
         # Per-host rollup. Supersedes the old recent-detections list: filtered
         # to Flagged it shows the same thing, and the rest of the time it
         # answers "what has this machine talked to, and what came back".
-        self._sites = SitesPanel(self)
-        self._sites.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        self._sites = SitesPanel(self._bottom, on_expand=self.toggle_expand)
+        self._sites.pack(fill="both", expand=True, padx=20, pady=(0, 12))
+
+        # The summary keeps its natural height; everything the window has spare,
+        # and everything the divider gives up, goes to the table.
+        self._split.add(self._top, minsize=self._TOP_MIN, stretch="never")
+        self._split.add(self._bottom, minsize=self._SITES_MIN, stretch="always")
+
+    # ── the split ────────────────────────────────────────────────────
+    def toggle_expand(self):
+        """Give the table the whole tab, and put it back. Dragging the divider
+        is the fine control; this is the one click that covers the usual case."""
+        try:
+            if self._expanded:
+                self._split.sash_place(0, 0, self._restore_y
+                                       or self._top.winfo_reqheight())
+            else:
+                self._restore_y = self._split.sash_coord(0)[1]
+                self._split.sash_place(0, 0, self._collapsed_y())
+        except tk.TclError:
+            return
+        self._expanded = not self._expanded
+        self._sites.set_expanded(self._expanded)
+
+    def _collapsed_y(self) -> int:
+        """Where the divider sits when expanded: just below the hero card, so
+        the state line and the Apply Blocks button stay reachable."""
+        height = self._hero.winfo_height()
+        if height <= 1:                 # not laid out yet
+            height = self._hero.winfo_reqheight()
+        return max(self._TOP_MIN, height + 24)
 
     def _apply_clicked(self):
         if self._on_apply_blocks:
@@ -838,6 +1049,11 @@ class ScanPanel(ctk.CTkFrame):
             self._apply_btn.pack(anchor="w", pady=(12, 0))
         else:
             self._apply_btn.pack_forget()
+        if self._expanded:
+            # The hero just changed height; follow it, or the button the user
+            # is being asked to press ends up clipped by the divider.
+            self.after(20, lambda: self._split.sash_place(
+                0, 0, self._collapsed_y()))
 
     def update_view(self, overall, statuses, stats, flags):
         state, headline = overall
@@ -852,14 +1068,22 @@ class ScanPanel(ctk.CTkFrame):
             {rep.P_OK: "hero_run", rep.P_ERROR: "hero_err",
              rep.P_LIMITED: "hero_warn"}.get(state, "card")])
 
-        self._card_sites.update_value(f"{stats['sites']:,}")
-        self._card_good.update_value(f"{stats['known_good']:,}")
-        self._card_bad.update_value(f"{stats['flagged']:,}")
-        self._card_queue.update_value(
-            f"{stats['queued'] + stats['inflight']:,}")
+        self._counts.set("sites", f"{stats['sites']:,}")
+        self._counts.set("good", f"{stats['known_good']:,}", "green")
+        # Amber while there is a backlog, red the moment anything is flagged:
+        # the counters should be readable at a glance from across a desk.
+        self._counts.set("bad", f"{stats['flagged']:,}",
+                         "red" if stats["flagged"] else "muted")
+        queued = stats["queued"] + stats["inflight"]
+        self._counts.set("queue", f"{queued:,}",
+                         "yellow" if queued else "muted")
 
         for row, st in zip(self._rows, statuses):
             row.update_status(st, self._detail_for(st, stats))
+
+        # Keeps the "last seen" column honest while the tab is open; the rows
+        # themselves only rewrite when their text actually changes.
+        self._sites.tick()
 
     def upsert_site(self, record):
         self._sites.upsert(record)
@@ -867,8 +1091,11 @@ class ScanPanel(ctk.CTkFrame):
     @staticmethod
     def _detail_for(st, stats):
         """The one metrics line under each provider, phrased for that provider's
-        actual constraint rather than a generic call counter."""
+        actual constraint rather than a generic call counter. What is left of
+        the key's budget is the meter to the right of this line; the line says
+        what is being spent and when it comes back."""
         extra = st.get("extra") or {}
+        quota = extra.get("quota") or {}
         if st["state"] == rep.P_OFF:
             return st["detail"] or "not in use"
         if st["name"] == "feeds":
@@ -886,19 +1113,22 @@ class ScanPanel(ctk.CTkFrame):
                 parts.append("stale: " + ", ".join(stale))
             return " · ".join(parts)
         if st["name"] == "safebrowsing":
-            parts = [f"{st['hosts']:,} hosts checked",
-                     f"{st['calls']:,} batch{'es' if st['calls'] != 1 else ''}"]
+            # Hosts, not requests: one request carries a whole batch, so the
+            # number that answers "is the key worth it" is the coverage.
+            parts = [f"{quota.get('hosts', 0):,} hosts checked today"]
             if extra.get("queued"):
                 parts.append(f"{extra['queued']:,} waiting")
             parts.append(f"last reply {_ago(st['last_ok'])}")
+            if quota.get("resets_at"):
+                parts.append(f"budget resets in {_until(quota['resets_at'])}")
             if st["state"] == rep.P_ERROR and st["last_error"]:
                 parts.append(st["last_error"])
             return " · ".join(parts)
-        used, cap = extra.get("used_today", 0), extra.get("cap", 0)
-        parts = [f"{used}/{cap} today"]
+        parts = [f"1 every {extra.get('interval', 0):.0f}s"]
         if extra.get("queued"):
             parts.append(f"{extra['queued']:,} queued")
-        parts.append(f"1 every {extra.get('interval', 0):.0f}s")
+        if quota.get("resets_at"):
+            parts.append(f"budget resets in {_until(quota['resets_at'])}")
         if st["state"] == rep.P_ERROR and st["last_error"]:
             parts.append(st["last_error"])
         elif st["state"] == rep.P_LIMITED:
@@ -908,6 +1138,9 @@ class ScanPanel(ctk.CTkFrame):
     def repaint_theme(self):
         for row in self._rows:
             row.repaint_theme()
+        self._split.configure(bg=cc("bg"))
+        self._top.configure(bg=cc("bg"))
+        self._bottom.configure(bg=cc("bg"))
         self._sites.repaint_theme()
 
 
@@ -1320,7 +1553,11 @@ class ProxyForceApp(ctk.CTk):
 
         super().__init__()
         self.title("ProxyForce")
-        self.geometry("960x660")
+        # Tall enough that the Scanning and Log tables show a useful number of
+        # rows without being dragged, but clamped to the screen: this runs on
+        # 1366x768 corporate laptops as often as on a desktop.
+        self.geometry("%dx%d" % (min(1040, int(self.winfo_screenwidth() * 0.72)),
+                                 min(760, int(self.winfo_screenheight() * 0.86))))
         self.minsize(780, 520)
         self.configure(fg_color=THEME["bg"])
         self._set_window_icon()
@@ -2291,9 +2528,7 @@ class ProxyForceApp(ctk.CTk):
             btn.repaint()
         # Stat cards
         for card in (self._card_active, self._card_total, self._card_bytes,
-                     self._card_uptime, self._scan_panel._card_sites,
-                     self._scan_panel._card_good, self._scan_panel._card_bad,
-                     self._scan_panel._card_queue):
+                     self._card_uptime):
             card.repaint_theme()
         # Log panels, sites table and the scanning view
         self._full_log.repaint_theme()

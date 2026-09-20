@@ -49,8 +49,9 @@ import threading
 import time
 from collections import deque
 
-from core.rep_providers import (LocalFeedProvider, RateLimited,
-                                SafeBrowsingProvider, VirusTotalProvider)
+from core.rep_providers import (_GSB_MAX_BATCH, LocalFeedProvider,
+                                RateLimited, SafeBrowsingProvider,
+                                VirusTotalProvider)
 
 # Verdict states. "unknown" means every configured provider was asked and none
 # of them had anything to say, which is different from "not yet checked" (no
@@ -78,6 +79,12 @@ _TTL = {
 # smaller keeps a page load's worth of hosts moving quickly.
 _BATCH_SIZE = 100
 _BATCH_WAIT = 2.0
+
+# Google Safe Browsing's free quota is ~10k requests/day. One request carries a
+# whole batch, so a day of browsing costs a few hundred at most — which is why
+# this cap is counted rather than enforced: the Scanning tab shows how much of
+# the key's budget is actually being spent, and a 429 covers the edge case.
+_GSB_DAILY_CAP = 10000
 
 # VirusTotal free tier: 4 requests/minute, 500/day. 15.5s leaves margin against
 # the minute window so a burst cannot trip 429.
@@ -111,6 +118,25 @@ def _cache_path() -> str:
 
 def _quota_path() -> str:
     return os.path.join(_rep_dir(), "quota.json")
+
+
+# The sources a mark can come from, in tier order (see _scan_batch). Used when
+# reading back a cache entry written before the marks existed.
+_PROVIDER_NAMES = ("feeds", "safebrowsing", "virustotal")
+
+
+def _today() -> str:
+    """The key the daily API counters are filed under. Local date deliberately:
+    the countdown shown beside a quota should line up with the user's own
+    midnight, and drift against the provider's own window only ever makes us
+    spend less than the budget allows, never more."""
+    return time.strftime("%Y-%m-%d")
+
+
+def _quota_resets_at() -> float:
+    """Epoch seconds of the next local midnight, when _today() rolls over."""
+    nxt = time.localtime(time.time() + 86400)
+    return time.mktime((nxt.tm_year, nxt.tm_mon, nxt.tm_mday, 0, 0, 0, 0, 0, -1))
 
 
 def normalize_host(host) -> str:
@@ -157,16 +183,24 @@ def _is_unscannable_ip(host) -> bool:
 
 
 class Verdict(object):
-    """One provider's answer about one host, plus when it expires."""
+    """One host's standing answer: the verdict that won, which provider it came
+    from, and — in `checks` — what every provider that has looked at the host
+    had to say ({provider name: status}).
 
-    __slots__ = ("host", "status", "source", "detail", "checked_at", "expires_at")
+    The marks ride along with the verdict because they have the same lifetime:
+    a host is scanned once and then served from cache for weeks, so "which
+    sources have been past here" has to survive the cache round trip too."""
+
+    __slots__ = ("host", "status", "source", "detail", "checked_at",
+                 "expires_at", "checks")
 
     def __init__(self, host, status, source="", detail="", checked_at=None,
-                 expires_at=None):
+                 expires_at=None, checks=None):
         self.host = host
         self.status = status
         self.source = source
         self.detail = detail
+        self.checks = dict(checks or {})
         self.checked_at = time.time() if checked_at is None else checked_at
         if expires_at is None:
             expires_at = self.checked_at + _TTL.get(status, _TTL[UNKNOWN])
@@ -179,14 +213,24 @@ class Verdict(object):
     def to_dict(self) -> dict:
         return {"status": self.status, "source": self.source,
                 "detail": self.detail, "checked_at": self.checked_at,
-                "expires_at": self.expires_at}
+                "expires_at": self.expires_at, "checks": dict(self.checks)}
 
     @classmethod
     def from_dict(cls, host, d):
         try:
-            return cls(host, str(d["status"]), str(d.get("source") or ""),
+            source = str(d.get("source") or "")
+            raw = d.get("checks")
+            checks = ({str(k): str(v) for k, v in raw.items()}
+                      if isinstance(raw, dict) else {})
+            if not checks and source in _PROVIDER_NAMES:
+                # Cached before the per-provider marks existed: the source that
+                # won is the one check we can honestly recover for it. A verdict
+                # recorded by the scanner itself ("nobody could answer") names
+                # no provider, and must not claim one.
+                checks = {source: str(d["status"])}
+            return cls(host, str(d["status"]), source,
                        str(d.get("detail") or ""), float(d.get("checked_at") or 0),
-                       float(d["expires_at"]))
+                       float(d["expires_at"]), checks)
         except Exception:
             return None
 
@@ -216,6 +260,12 @@ class SiteRecord(object):
         if self.verdict is not None:
             return self.verdict.status
         return "pending" if self.pending else ""
+
+    @property
+    def checks(self) -> dict:
+        """{provider name: status} — which sources have looked at this host.
+        Empty until the first verdict lands."""
+        return self.verdict.checks if self.verdict is not None else {}
 
 
 # Provider states, in ascending order of "something is wrong". The Scanning tab
@@ -288,6 +338,7 @@ class ReputationScanner(object):
         self._flagged = deque(maxlen=50)    # recent hits, newest first
 
         self._quota = {}
+        self._quota_dirty = False
         self._cache_dirty = False
         self._stop = threading.Event()
         self._wake = threading.Event()
@@ -317,6 +368,7 @@ class ReputationScanner(object):
                 pass
         self._threads = []
         self._save_cache(force=True)
+        self._save_quota()
 
     def _log(self, msg, level="info"):
         if self._on_log:
@@ -429,6 +481,7 @@ class ReputationScanner(object):
             if time.time() - last_flush >= _CACHE_FLUSH_INTERVAL:
                 last_flush = time.time()
                 self._save_cache()
+                self._save_quota(force=False)
 
     def _take_batch(self):
         with self._lock:
@@ -449,14 +502,26 @@ class ReputationScanner(object):
     def _scan_batch(self, batch, cfg):
         remaining = list(batch)
         results = {}        # host -> (status, detail, ttl, source)
+        # host -> {provider: status}: who has actually looked at this host, for
+        # the per-source marks in the Sites table. A tier that is switched off,
+        # has no key, or failed leaves no mark — which is the useful part.
+        checks = {host: {} for host in batch}
 
         # Tier 0 — local feeds. Free and instant, so it sees every host.
         if self._feeds.available(cfg):
+            asked = list(remaining)
             try:
                 hits = self._feeds.lookup(remaining, cfg)
                 for host, value in hits.items():
                     status, detail, ttl = _unpack(value)
                     results[host] = (status, detail, ttl, self._feeds.name)
+                # Not being listed is not a clean bill of health (the feeds only
+                # answer about known-bad hosts) but it is a check that happened,
+                # so it earns the mark. The verdict column still says what is
+                # actually known about the host.
+                for host in asked:
+                    checks.setdefault(host, {})[self._feeds.name] = (
+                        MALICIOUS if host in hits else CLEAN)
                 self._mark(self._feeds.name, ok=True, hosts=len(remaining),
                            entries=self._feeds.entry_count(),
                            refreshed=self._feeds.last_refresh())
@@ -467,12 +532,20 @@ class ReputationScanner(object):
         # Tier 1 — Safe Browsing. Batched and effectively unlimited, so it also
         # sees every host the feeds did not already condemn.
         if remaining and self._gsb.available(cfg):
+            n_hosts = len(remaining)
+            # Charged to the key's daily budget before the call rather than
+            # after: Google counts the request whether it answers, errors or
+            # 429s, so the counter behind the meter must too.
+            requests = max(1, -(-n_hosts // _GSB_MAX_BATCH))
+            self._bump_quota("gsb", requests, hosts=n_hosts)
             try:
                 hits = self._gsb.lookup(remaining, cfg)
                 for host, value in hits.items():
                     status, detail, ttl = _unpack(value)
                     results[host] = (status, detail, ttl, self._gsb.name)
-                self._mark(self._gsb.name, ok=True, hosts=len(remaining), calls=1)
+                    checks.setdefault(host, {})[self._gsb.name] = status
+                self._mark(self._gsb.name, ok=True, hosts=n_hosts,
+                           calls=requests)
             except RateLimited:
                 self._mark(self._gsb.name, limited="daily quota exceeded")
                 raise
@@ -490,7 +563,8 @@ class ReputationScanner(object):
         for host, (status, detail, ttl, source) in results.items():
             expires = time.time() + ttl if ttl else None
             self._record(host, Verdict(host, status, source, detail,
-                                       expires_at=expires))
+                                       expires_at=expires,
+                                       checks=checks.get(host)))
             # Tier 2 — queue VirusTotal for a second opinion on anything not
             # already condemned. It cannot keep up with live traffic at 4/min, so
             # it drains in its own time, oldest first. Spending a 500/day budget
@@ -547,7 +621,14 @@ class ReputationScanner(object):
                 if status == MALICIOUS or prior is None or prior.status != MALICIOUS:
                     self._record(host, Verdict(
                         host, status, self._vt.name, detail,
-                        expires_at=time.time() + ttl if ttl else None))
+                        expires_at=time.time() + ttl if ttl else None,
+                        checks={self._vt.name: status}))
+                else:
+                    # Its answer did not win, but it did look, and the Sites
+                    # table answers "which sources have been past this host".
+                    self._note_check(host, self._vt.name, status)
+            else:
+                self._note_check(host, self._vt.name, ERROR)
             self._stop.wait(_VT_MIN_INTERVAL)
 
     def _next_vt_host(self):
@@ -558,26 +639,72 @@ class ReputationScanner(object):
                     return host
             return None
 
-    def _vt_take_quota(self) -> bool:
-        """Consume one VirusTotal daily-quota token. Persisted, so restarting the
-        app cannot reset the counter and blow through the 500/day cap."""
-        today = time.strftime("%Y-%m-%d")
+    def _quota_slot(self, name) -> dict:
+        """Today's counter for one API key, rolled over on a date change.
+        Caller holds the lock."""
+        slot = self._quota.get(name)
+        if not isinstance(slot, dict) or slot.get("date") != _today():
+            slot = {"date": _today(), "count": 0, "hosts": 0}
+            self._quota[name] = slot
+        return slot
+
+    def _bump_quota(self, name, calls=1, hosts=0):
+        """Count API calls against a daily budget. Nothing is gated here — see
+        _vt_take_quota for the one budget that is enforced — so the file write
+        waits for the next flush instead of happening per call."""
         with self._lock:
-            slot = self._quota.get("vt") or {}
-            if slot.get("date") != today:
-                slot = {"date": today, "count": 0}
-            if slot["count"] >= _VT_DAILY_CAP:
-                self._quota["vt"] = slot
+            slot = self._quota_slot(name)
+            slot["count"] = int(slot.get("count") or 0) + calls
+            slot["hosts"] = int(slot.get("hosts") or 0) + hosts
+            self._quota_dirty = True
+
+    def _quota_view(self, name, cap) -> dict:
+        """One key's daily budget, in the shape the Scanning tab renders.
+        Caller holds the lock."""
+        slot = self._quota_slot(name)
+        return {"used": int(slot.get("count") or 0),
+                "hosts": int(slot.get("hosts") or 0),
+                "cap": cap, "resets_at": _quota_resets_at()}
+
+    def _vt_take_quota(self) -> bool:
+        """Consume one VirusTotal daily-quota token. Written through
+        immediately, unlike the counters above: this budget is a hard cap, and
+        restarting the app must not hand out a fresh 500 lookups."""
+        with self._lock:
+            slot = self._quota_slot("vt")
+            if int(slot.get("count") or 0) >= _VT_DAILY_CAP:
                 return False
-            slot["count"] += 1
-            self._quota["vt"] = slot
+            slot["count"] = int(slot.get("count") or 0) + 1
+            slot["hosts"] = int(slot.get("hosts") or 0) + 1
             self._save_quota()
             return True
 
     # ── verdict bookkeeping ──────────────────────────────────────────────────
+    def _note_check(self, host, provider, status):
+        """Record that a provider looked at a host without disturbing the
+        standing verdict — a second opinion that agrees, or an error, is still
+        a source that has been past this host."""
+        with self._lock:
+            verdict = self._cache.get(host)
+            if verdict is None:
+                return
+            if verdict.checks.get(provider) == status:
+                return
+            verdict.checks[provider] = status
+            self._cache_dirty = True
+            record = self._sites.get(host)
+        if record is not None:
+            self._emit(record)
+
     def _record(self, host, verdict):
         with self._lock:
             prior = self._cache.get(host)
+            if prior is not None and prior.checks:
+                # Keep the marks the earlier tiers earned: this verdict may be
+                # VirusTotal's, arriving minutes after the rest.
+                merged = dict(prior.checks)
+                merged.update(verdict.checks)
+                verdict.checks = merged
             self._cache[host] = verdict
             self._cache_dirty = True
             self._inflight.discard(host)
@@ -655,19 +782,29 @@ class ReputationScanner(object):
             feeds.extra["refreshed"] = self._feeds.last_refresh()
             feeds.extra["sources"] = self._feeds.sources()
 
-            slot = self._quota.get("vt") or {}
-            used = int(slot.get("count") or 0) if slot.get(
-                "date") == time.strftime("%Y-%m-%d") else 0
+            # Daily API budgets, for the meters on the Scanning tab. Both
+            # are reported whatever the provider's state: what a key has spent
+            # today is still worth seeing after scanning is switched off.
+            vt_quota = self._quota_view("vt", _VT_DAILY_CAP)
+            gsb_quota = self._quota_view("gsb", _GSB_DAILY_CAP)
+            used = vt_quota["used"]
+            vt.extra["quota"] = vt_quota
             vt.extra["used_today"] = used
             vt.extra["cap"] = _VT_DAILY_CAP
             vt.extra["queued"] = len(self._vt_backlog)
             vt.extra["interval"] = _VT_MIN_INTERVAL
+            gsb.extra["quota"] = gsb_quota
             gsb.extra["queued"] = len(self._pending)
+            feeds.extra["quota"] = None         # no key, nothing to ration
 
             out = []
             for provider, st in ((self._feeds, feeds), (self._gsb, gsb),
                                  (self._vt, vt)):
                 available = provider.available(cfg)
+                if not available and provider is not self._feeds:
+                    # No key: report no budget rather than an untouched one,
+                    # which the Scanning tab would draw as an empty meter.
+                    st.extra["quota"] = None
                 if not scanning:
                     st.state = P_OFF
                     st.detail = "scanning is off"
@@ -688,6 +825,13 @@ class ReputationScanner(object):
                         and used >= _VT_DAILY_CAP):
                     st.state = P_LIMITED
                     st.detail = f"daily cap reached ({used}/{_VT_DAILY_CAP})"
+                # Safe Browsing is not gated on its counter, but a key that has
+                # spent its day is about to start answering 429 — say so first.
+                if (provider is self._gsb and st.state in (P_OK, P_IDLE)
+                        and gsb_quota["used"] >= _GSB_DAILY_CAP):
+                    st.state = P_LIMITED
+                    st.detail = (f"daily request budget spent "
+                                 f"({gsb_quota['used']:,}/{_GSB_DAILY_CAP:,})")
                 out.append(st.to_dict())
             return out
 
@@ -742,15 +886,17 @@ class ReputationScanner(object):
                           if v.status in (UNKNOWN, ERROR))
             unscanned = sum(1 for r in self._sites.values()
                             if r.verdict is None and not r.pending)
-            vt = self._quota.get("vt") or {}
-            used = int(vt.get("count") or 0) if vt.get(
-                "date") == time.strftime("%Y-%m-%d") else 0
+            vt_quota = self._quota_view("vt", _VT_DAILY_CAP)
+            gsb_quota = self._quota_view("gsb", _GSB_DAILY_CAP)
+            used = vt_quota["used"]
             return {"sites": len(self._sites), "known_good": known_good,
                     "flagged": flagged, "unknown": unknown,
                     "unscanned": unscanned, "queued": len(self._pending),
                     "inflight": len(self._inflight),
                     "vt_queued": len(self._vt_backlog), "vt_used_today": used,
                     "vt_cap": _VT_DAILY_CAP,
+                    "gsb_used_today": gsb_quota["used"],
+                    "gsb_cap": _GSB_DAILY_CAP,
                     "feed_entries": self._feeds.entry_count()}
 
     def conn_ids_for(self, host):
@@ -784,8 +930,16 @@ class ReputationScanner(object):
     def _load_quota(self):
         self._quota = _read_json(_quota_path()) or {}
 
-    def _save_quota(self):
-        _write_json(_quota_path(), self._quota)
+    def _save_quota(self, force=True):
+        """Persist the daily API counters. force=False is the periodic flush
+        that coalesces the Safe Browsing counts, mirroring _save_cache."""
+        with self._lock:
+            if not (self._quota_dirty or force):
+                return
+            payload = {k: dict(v) for k, v in self._quota.items()
+                       if isinstance(v, dict)}
+            self._quota_dirty = False
+        _write_json(_quota_path(), payload)
 
 
 def _unpack(value):

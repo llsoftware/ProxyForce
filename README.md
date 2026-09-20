@@ -140,8 +140,10 @@ No install wizard, no service to register. The folder can live anywhere.
 | Save settings | **Settings tab → Save Config** |
 | Test proxy reachability | **Settings tab → Test Proxy** |
 | Watch connections as they happen | **Dashboard** — live feed (PAUSE to hold it still) |
-| See every host and its verdict | **Scanning tab** — one row per host, filterable to Flagged |
-| Check scanner & source health | **Scanning tab** |
+| See every host and its verdict | **Scanning tab** — one row per host, filterable to Flagged, with a mark per source |
+| See which sources have checked a host | **Scanning tab** — the Feeds / GSB / VT columns |
+| Check scanner health & API key usage | **Scanning tab** — SOURCES, with each key's daily budget |
+| Get more rows out of the site list | **Scanning tab → EXPAND**, or drag the divider |
 | Read engine diagnostics | **Log tab** |
 | Switch light/dark theme | Toggle in the header: ☀ Light · 🖥 Auto · 🌙 Dark |
 
@@ -190,6 +192,37 @@ API endpoints.
 They are checked in that order, and a host that one source has already condemned
 is not passed to the next — VirusTotal's small daily budget is never spent
 re-confirming a known-bad host.
+
+### The Scanning tab
+
+**SOURCES** shows each source's health, and for the two that need an API key,
+how much of that key's daily budget today has spent: a meter plus `used / limit
+today`, amber past four fifths and red once it is gone, with the countdown to
+the reset on the line beside it. The limits are the free-tier ones the scanner
+paces itself against (10,000 requests/day for Safe Browsing, 500/day for
+VirusTotal); the counters are kept in
+`C:\ProgramData\ProxyForce
+eputation\quota.json` and survive a restart, so
+they cannot be reset by relaunching the app. The feeds need no key and get no
+meter — there is nothing to ration.
+
+The **table** below it has one row per host, with a column per source:
+
+| Mark | Means |
+|---|---|
+| `✓` | that source checked this host and had nothing against it |
+| `⚠` | that source is the one that flagged it |
+| `?` | checked, but the source has no data on it |
+| `!` | that source errored on it |
+| `·` | **not checked** — no key, still queued, or a tier that never ran |
+
+So a row reading `✓ ✓ ·` has been cleared by the feeds and Safe Browsing and is
+still waiting on VirusTotal, which works through its backlog at 4/minute. Any
+heading sorts by that column, including the source columns.
+
+The summary and the table are split by a **draggable divider**; **EXPAND**
+(top right of the table) collapses the summary to its hero line and gives the
+whole tab to the list, and **COLLAPSE** puts it back.
 
 ### What happens on a detection
 

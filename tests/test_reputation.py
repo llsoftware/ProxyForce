@@ -503,5 +503,154 @@ class ProviderStatusTests(_ScannerCase):
         self.assertEqual(s.overall_state()[0], rep.P_ERROR)
 
 
+class ProviderMarkTests(_ScannerCase):
+    """The Sites table shows one mark per source, so a row answers "who has
+    already looked at this host, and who has not got to it yet". That means
+    recording every tier that answered \u2014 not just the one whose verdict won."""
+
+    def test_every_tier_that_answered_leaves_a_mark(self):
+        s = self._scanner()
+        s.start()
+        s.observe("example.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(s.sites()[0].checks,
+                         {"feeds": rep.CLEAN, "safebrowsing": rep.CLEAN})
+
+    def test_a_source_with_no_key_leaves_no_mark(self):
+        """The mark has to mean "checked", or the column is worthless."""
+        s = self._scanner(cfg={"rep_scan": True, "rep_feeds": True,
+                               "rep_gsb_key": "", "rep_vt_key": ""})
+        s.start()
+        s.observe("example.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(s.sites()[0].checks, {"feeds": rep.CLEAN})
+
+    def test_the_source_that_flagged_a_host_is_marked_as_the_flagger(self):
+        s = self._scanner(feeds=_FakeFeeds(bad={"evil.example"}))
+        s.start()
+        s.observe("evil.example", 443, "proxy", "c1")
+        self._settle(s)
+        checks = s.sites()[0].checks
+        self.assertEqual(checks["feeds"], rep.MALICIOUS)
+        # Safe Browsing is never asked about a host the feeds condemned, so it
+        # must not claim to have checked it.
+        self.assertNotIn("safebrowsing", checks)
+
+    def test_a_late_backfill_adds_its_mark_without_erasing_the_others(self):
+        """VirusTotal answers minutes after the fast path, and writes a fresh
+        verdict when it does — the marks the earlier tiers earned have to
+        survive that."""
+        vt = _FakeVT(answers={"example.com": ("clean", "0/94 engines")})
+        s = self._scanner(cfg=dict(CFG_ALL, rep_vt_key="vt-key"), vt=vt)
+        s.start()
+        s.observe("example.com", 443, "proxy", "c1")
+        deadline = time.time() + 3
+        while time.time() < deadline and "virustotal" not in s.sites()[0].checks:
+            time.sleep(0.01)
+        self.assertEqual(s.sites()[0].checks,
+                         {"feeds": rep.CLEAN, "safebrowsing": rep.CLEAN,
+                          "virustotal": rep.CLEAN})
+
+    def test_a_second_opinion_that_loses_still_counts_as_checked(self):
+        """A VirusTotal "clean" must not downgrade a Safe Browsing "malicious",
+        but VirusTotal has still been past the host."""
+        s = self._scanner()
+        s._cache["evil.example"] = rep.Verdict(
+            "evil.example", rep.MALICIOUS, "safebrowsing", "Social Engineering",
+            checks={"safebrowsing": rep.MALICIOUS})
+        s._sites["evil.example"] = rep.SiteRecord("evil.example")
+        s._note_check("evil.example", "virustotal", rep.CLEAN)
+        self.assertEqual(s._cache["evil.example"].checks,
+                         {"safebrowsing": rep.MALICIOUS, "virustotal": rep.CLEAN})
+        self.assertEqual(s._cache["evil.example"].status, rep.MALICIOUS)
+
+    def test_marks_survive_the_cache_round_trip(self):
+        """Hosts are scanned once and remembered for weeks, so "who checked
+        this" has to come back from the cache with the verdict."""
+        s = self._scanner()
+        s.start()
+        s.observe("example.com", 443, "proxy", "c1")
+        self._settle(s)
+        s.stop()
+        s2 = self._scanner()
+        s2._load_cache()
+        self.assertEqual(s2._cache["example.com"].checks,
+                         {"feeds": rep.CLEAN, "safebrowsing": rep.CLEAN})
+
+    def test_an_entry_cached_before_marks_existed_keeps_its_source(self):
+        now = time.time()
+        verdict = rep.Verdict.from_dict("a.example", {
+            "status": rep.CLEAN, "source": "safebrowsing", "detail": "",
+            "checked_at": now, "expires_at": now + 3600})
+        self.assertEqual(verdict.checks, {"safebrowsing": rep.CLEAN})
+
+
+class ApiBudgetTests(_ScannerCase):
+    """The Scanning tab shows how much of each API key's daily budget today has
+    spent, so the counters behind those meters have to be real \u2014 and, like
+    VirusTotal's cap, have to survive a restart."""
+
+    def _quota(self, scanner, name):
+        return {p["name"]: p
+                for p in scanner.provider_status()}[name]["extra"]["quota"]
+
+    def test_safe_browsing_requests_and_hosts_are_counted(self):
+        s = self._scanner()
+        s.start()
+        for i in range(5):
+            s.observe(f"host{i}.example", 443, "proxy", f"c{i}")
+        self._settle(s)
+        quota = self._quota(s, "safebrowsing")
+        self.assertEqual(quota["cap"], rep._GSB_DAILY_CAP)
+        self.assertGreaterEqual(quota["used"], 1)
+        self.assertEqual(quota["hosts"], 5)
+
+    def test_the_counter_survives_a_restart(self):
+        s = self._scanner()
+        s.start()
+        s.observe("example.com", 443, "proxy", "c1")
+        self._settle(s)
+        s.stop()
+        s2 = self._scanner()
+        s2._load_quota()
+        self.assertGreaterEqual(self._quota(s2, "safebrowsing")["used"], 1)
+
+    def test_a_spent_budget_shows_the_source_as_rationed(self):
+        real_cap = rep._GSB_DAILY_CAP
+        try:
+            rep._GSB_DAILY_CAP = 1
+            s = self._scanner()
+            s.start()
+            s.observe("a.example", 443, "proxy", "c1")
+            self._settle(s)
+            s.observe("b.example", 443, "proxy", "c2")
+            self._settle(s)
+            by_name = {p["name"]: p for p in s.provider_status()}
+            self.assertEqual(by_name["safebrowsing"]["state"], rep.P_LIMITED)
+        finally:
+            rep._GSB_DAILY_CAP = real_cap
+
+    def test_a_source_with_no_key_reports_no_budget(self):
+        """No key is not the same as an untouched budget, and the meter would
+        read as "nothing used" rather than "nothing to use"."""
+        s = self._scanner(cfg={"rep_scan": True, "rep_feeds": True,
+                               "rep_gsb_key": "", "rep_vt_key": ""})
+        self.assertIsNone(self._quota(s, "safebrowsing"))
+        self.assertIsNone(self._quota(s, "feeds"))
+
+    def test_virustotal_reports_what_its_cap_has_left(self):
+        s = self._scanner(cfg=dict(CFG_ALL, rep_vt_key="vt-key"))
+        s._vt_take_quota()
+        s._vt_take_quota()
+        quota = self._quota(s, "virustotal")
+        self.assertEqual((quota["used"], quota["cap"]), (2, rep._VT_DAILY_CAP))
+
+    def test_the_budget_resets_at_the_next_local_midnight(self):
+        resets = rep._quota_resets_at()
+        self.assertGreater(resets, time.time())
+        self.assertLessEqual(resets - time.time(), 86400)
+        self.assertEqual(time.localtime(resets).tm_hour, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
