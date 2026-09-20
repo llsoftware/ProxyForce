@@ -114,7 +114,9 @@ def _stub_settings_panel(auth="Basic", channel="Stable", loglevel="Info",
             "host": _FakeVar("proxy.corp.local"),
         },
         _bypass_text=None,
+        _passthrough={},
         _refresh_auth_warning=lambda: None,
+        _refresh_rep_status=lambda: None,
     )
 
 

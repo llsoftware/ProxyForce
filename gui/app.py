@@ -12,7 +12,7 @@ import re
 import time
 from datetime import datetime
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, ttk
 
 import customtkinter as ctk
 
@@ -21,8 +21,9 @@ sys.path.insert(0, os.path.join(BASE_DIR, ".."))
 
 from core.config_store import (
     load_config, save_config, save_autostart, auth_config_warnings,
-    consume_legacy_auto_bypass_flag,
+    rep_config_warnings, consume_legacy_auto_bypass_flag,
 )
+from core import reputation as rep
 from core.singbox_controller import (
     SingBoxController, SingBoxState, make_proxy_config, normalize_bypass_entry,
     probe_connect, _CONNECT_PROBE_PORTS,
@@ -70,7 +71,7 @@ _APP_VERSION = _PF_VERSION
 DATA_DIR    = os.path.join(os.environ.get("ProgramData", r"C:\ProgramData"), "ProxyForce")
 SINGBOX_LOG = os.path.join(DATA_DIR, "singbox", "singbox.log")
 _ANSI_RE    = re.compile(r"\x1b\[[0-9;]*m")
-ANIM_INTERVAL_MS = 250  # sidebar pulse cadence while a state is animating (~4 fps)
+ANIM_INTERVAL_MS = 125  # sidebar pulse cadence while a state is animating (8 fps)
 
 
 # ── Palette ───────────────────────────────────────────────────────────────────
@@ -298,8 +299,498 @@ class LogPanel(ctk.CTkFrame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Sites panel  —  what the dashboard shows instead of a scrolling log
+# ─────────────────────────────────────────────────────────────────────────────
+def _ago(ts: float) -> str:
+    """Compact relative time: the Sites and Scanning views update every second,
+    so absolute clock times would just be noise."""
+    if not ts:
+        return "never"
+    d = max(0, int(time.time() - ts))
+    if d < 5:
+        return "just now"
+    if d < 60:
+        return f"{d}s ago"
+    if d < 3600:
+        return f"{d // 60}m ago"
+    if d < 86400:
+        return f"{d // 3600}h ago"
+    return f"{d // 86400}d ago"
+
+
+# Verdict -> (glyph, theme colour key, sort rank). Flagged sorts to the top so a
+# detection is never buried under hundreds of clean rows.
+_REP_UI = {
+    rep.MALICIOUS: ("⚠ FLAGGED", "red",    0),
+    rep.ERROR:     ("— error",   "yellow", 1),
+    "pending":     ("… checking", "accent", 2),
+    rep.UNKNOWN:   ("? unknown",      "muted",  3),
+    rep.CLEAN:     ("✓ clean",   "green",  4),
+    "":            ("—",         "muted",  5),
+}
+
+
+class SitesPanel(ctk.CTkFrame):
+    """A live, deduplicated table of every host connected to.
+
+    Replaces the dashboard's copy of the event log: the log answers "what is the
+    engine doing", which belongs on the Log tab, while the dashboard should
+    answer "what am I actually talking to". One row per host, updated in place,
+    so repeat connections bump a counter instead of scrolling anything away."""
+
+    _MAX_ROWS = 600     # bound the widget on long sessions; oldest rows evicted
+
+    def __init__(self, parent, on_select=None, **kwargs):
+        super().__init__(parent, fg_color=THEME["card"], corner_radius=10,
+                         border_width=1, border_color=THEME["border"], **kwargs)
+        self._on_select = on_select
+        self._rows = {}         # host -> last rendered tuple, for change detection
+
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", padx=14, pady=(10, 4))
+        ctk.CTkLabel(hdr, text="SITES",
+                     font=ctk.CTkFont("Consolas", 10, weight="bold"),
+                     text_color=THEME["muted"]).pack(side="left")
+
+        self._count_var = tk.StringVar(value="")
+        ctk.CTkLabel(hdr, textvariable=self._count_var,
+                     font=ctk.CTkFont("Consolas", 10),
+                     text_color=THEME["muted"]).pack(side="left", padx=(10, 0))
+
+        self._filter_var = tk.StringVar(value="All")
+        ctk.CTkSegmentedButton(
+            hdr, values=["All", "Flagged", "Direct"], variable=self._filter_var,
+            command=lambda _v: self.refilter(),
+            font=ctk.CTkFont("Segoe UI", 10),
+            fg_color=THEME["input_bg"], selected_color=THEME["accent_dk"],
+            selected_hover_color=THEME["accent"],
+            unselected_color=THEME["input_bg"],
+            unselected_hover_color=THEME["nav_hover"],
+            height=22).pack(side="right")
+
+        self._wrap = tk.Frame(self, bg=cc("input_bg"))
+        self._wrap.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+
+        # A private style name so theming this tree cannot disturb any other ttk
+        # widget CustomTkinter creates internally.
+        self._style = ttk.Style()
+        self._style_name = "ProxyForce.Sites.Treeview"
+        cols = ("host", "conns", "route", "rep", "seen")
+        self._tree = ttk.Treeview(self._wrap, columns=cols, show="headings",
+                                  style=self._style_name, selectmode="browse")
+        for key, text, width, anchor in (
+                ("host",  "Host",       320, "w"),
+                ("conns", "Conns",       60, "e"),
+                ("route", "Route",       90, "w"),
+                ("rep",   "Reputation", 130, "w"),
+                ("seen",  "Last seen",  100, "w")):
+            self._tree.heading(key, text=text,
+                               command=lambda k=key: self._sort_by(k))
+            self._tree.column(key, width=width, anchor=anchor,
+                              stretch=(key == "host"))
+
+        self._sb = tk.Scrollbar(self._wrap, command=self._tree.yview)
+        self._tree.configure(yscrollcommand=self._sb.set)
+        self._sb.pack(side="right", fill="y")
+        self._tree.pack(fill="both", expand=True)
+        self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        self._sort_key = "seen"
+        self._records = {}      # host -> SiteRecord
+        self.repaint_theme()
+
+    # ── data ─────────────────────────────────────────────────────────────────
+    def upsert(self, record):
+        """Insert or update one host's row. Cheap enough to call per connection."""
+        self._records[record.host] = record
+        if not self._passes_filter(record):
+            if self._tree.exists(record.host):
+                self._tree.delete(record.host)
+                self._rows.pop(record.host, None)
+            return
+        values = self._row_values(record)
+        if self._rows.get(record.host) == values:
+            return              # nothing visible changed; skip the widget write
+        self._rows[record.host] = values
+        tag = self._tag_for(record)
+        if self._tree.exists(record.host):
+            self._tree.item(record.host, values=values, tags=(tag,))
+        else:
+            self._tree.insert("", 0, iid=record.host, values=values, tags=(tag,))
+            self._evict()
+        self._count_var.set(self._summary())
+
+    def _row_values(self, record):
+        glyph = _REP_UI.get(record.status, _REP_UI[""])[0]
+        return (record.host, str(record.conns), record.route or "—",
+                glyph, _ago(record.last_seen))
+
+    @staticmethod
+    def _tag_for(record):
+        return {rep.MALICIOUS: "bad", rep.CLEAN: "good",
+                rep.ERROR: "warn"}.get(record.status, "plain")
+
+    def _summary(self):
+        total = len(self._records)
+        bad = sum(1 for r in self._records.values() if r.status == rep.MALICIOUS)
+        shown = len(self._tree.get_children(""))
+        base = f"{total:,} host{'s' if total != 1 else ''}"
+        if shown != total:
+            base += f" · {shown:,} shown"
+        if bad:
+            base += f" · {bad} flagged"
+        return base
+
+    def _evict(self):
+        children = self._tree.get_children("")
+        if len(children) <= self._MAX_ROWS:
+            return
+        for iid in children[self._MAX_ROWS:]:
+            self._tree.delete(iid)
+            self._rows.pop(iid, None)
+
+    # ── filtering / sorting ──────────────────────────────────────────────────
+    def _passes_filter(self, record):
+        mode = self._filter_var.get()
+        if mode == "Flagged":
+            return record.status == rep.MALICIOUS
+        if mode == "Direct":
+            return record.route == "direct"
+        return True
+
+    def refilter(self):
+        self._tree.delete(*self._tree.get_children(""))
+        self._rows.clear()
+        for record in self._sorted_records():
+            if not self._passes_filter(record):
+                continue
+            values = self._row_values(record)
+            self._rows[record.host] = values
+            self._tree.insert("", "end", iid=record.host, values=values,
+                              tags=(self._tag_for(record),))
+        self._evict()
+        self._count_var.set(self._summary())
+
+    def _sorted_records(self):
+        key = self._sort_key
+
+        def sort_key(r):
+            if key == "host":
+                return (r.host,)
+            if key == "conns":
+                return (-r.conns,)
+            if key == "route":
+                return (r.route or "",)
+            if key == "rep":
+                return (_REP_UI.get(r.status, _REP_UI[""])[2], r.host)
+            return (-r.last_seen,)
+
+        return sorted(self._records.values(), key=sort_key)
+
+    def _sort_by(self, key):
+        self._sort_key = key
+        self.refilter()
+
+    def _on_tree_select(self, _event=None):
+        if not self._on_select:
+            return
+        sel = self._tree.selection()
+        if sel:
+            self._on_select(self._records.get(sel[0]))
+
+    def selected_host(self):
+        sel = self._tree.selection()
+        return sel[0] if sel else None
+
+    def tick(self):
+        """Refresh the relative 'last seen' column without rebuilding rows."""
+        for host in list(self._tree.get_children("")):
+            record = self._records.get(host)
+            if record is None:
+                continue
+            values = self._row_values(record)
+            if self._rows.get(host) != values:
+                self._rows[host] = values
+                self._tree.item(host, values=values, tags=(self._tag_for(record),))
+
+    def clear(self):
+        self._tree.delete(*self._tree.get_children(""))
+        self._rows.clear()
+        self._records.clear()
+        self._count_var.set("")
+
+    # ── theming ──────────────────────────────────────────────────────────────
+    def repaint_theme(self):
+        ib, txt, border = cc("input_bg"), cc("text"), cc("border")
+        self._wrap.configure(bg=ib)
+        # "default" is the only built-in ttk theme that honours fieldbackground
+        # on Windows; the native "vista" theme ignores it and would render a
+        # white tree in dark mode.
+        try:
+            self._style.theme_use("default")
+        except Exception:
+            pass
+        self._style.configure(self._style_name, background=ib, fieldbackground=ib,
+                              foreground=txt, borderwidth=0, rowheight=22,
+                              font=("Consolas", 9))
+        self._style.configure(self._style_name + ".Heading",
+                              background=cc("card2"), foreground=cc("muted"),
+                              relief="flat", font=("Segoe UI", 9, "bold"))
+        self._style.map(self._style_name + ".Heading",
+                        background=[("active", cc("nav_hover"))])
+        self._style.map(self._style_name,
+                        background=[("selected", cc("nav_act"))],
+                        foreground=[("selected", txt)])
+        self._tree.tag_configure("bad", foreground=cc("red"))
+        self._tree.tag_configure("good", foreground=cc("green"))
+        self._tree.tag_configure("warn", foreground=cc("yellow"))
+        self._tree.tag_configure("plain", foreground=txt)
+        self._sb.configure(bg=border, troughcolor=ib, activebackground=cc("muted"))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scanning panel  —  scanner + per-provider live status
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider state -> (theme colour key, label)
+_PSTATE_UI = {
+    rep.P_OK:      ("green",  "OK"),
+    rep.P_IDLE:    ("accent", "READY"),
+    rep.P_LIMITED: ("yellow", "LIMITED"),
+    rep.P_ERROR:   ("red",    "ERROR"),
+    rep.P_OFF:     ("muted",  "OFF"),
+}
+
+
+class _ProviderRow(ctk.CTkFrame):
+    """One provider's live status: a beacon, its role, and its own metrics.
+
+    The beacon brightens for one refresh whenever the provider's call count has
+    moved since the last tick, which is what makes the panel read as live rather
+    than as a static summary."""
+
+    _DOT = 12
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, fg_color="transparent", **kwargs)
+        self._calls = 0
+        self._flash = False
+
+        self._canvas = tk.Canvas(self, width=self._DOT + 8, height=self._DOT + 8,
+                                 highlightthickness=0, bd=0, bg=cc("card"))
+        self._canvas.pack(side="left", padx=(0, 10))
+        self._dot = self._canvas.create_oval(4, 4, 4 + self._DOT, 4 + self._DOT,
+                                             fill=cc("muted"), outline="")
+
+        text = ctk.CTkFrame(self, fg_color="transparent")
+        text.pack(side="left", fill="x", expand=True)
+
+        top = ctk.CTkFrame(text, fg_color="transparent")
+        top.pack(fill="x")
+        self._name_var = tk.StringVar(value="")
+        ctk.CTkLabel(top, textvariable=self._name_var, anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 12, weight="bold"),
+                     text_color=THEME["text"]).pack(side="left")
+        self._role_var = tk.StringVar(value="")
+        ctk.CTkLabel(top, textvariable=self._role_var, anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 10),
+                     text_color=THEME["muted"]).pack(side="left", padx=(8, 0))
+
+        self._state_var = tk.StringVar(value="")
+        self._state_lbl = ctk.CTkLabel(top, textvariable=self._state_var,
+                                       font=ctk.CTkFont("Consolas", 10, weight="bold"),
+                                       text_color=THEME["muted"])
+        self._state_lbl.pack(side="right")
+
+        self._detail_var = tk.StringVar(value="")
+        ctk.CTkLabel(text, textvariable=self._detail_var, anchor="w",
+                     justify="left", font=ctk.CTkFont("Consolas", 10),
+                     text_color=THEME["muted"]).pack(fill="x", pady=(1, 0))
+
+    def update_status(self, st: dict, detail_line: str):
+        colour_key, label = _PSTATE_UI.get(st["state"], _PSTATE_UI[rep.P_OFF])
+        self._name_var.set(st["label"])
+        self._role_var.set("· " + st["role"])
+        self._state_var.set(label)
+        self._state_lbl.configure(text_color=THEME[colour_key])
+        self._detail_var.set(detail_line)
+        # Flash on activity since the previous tick.
+        self._flash = st["calls"] > self._calls
+        self._calls = st["calls"]
+        self._paint_dot(colour_key)
+
+    def _paint_dot(self, colour_key):
+        colour = cc(colour_key)
+        self._canvas.itemconfig(self._dot, fill=colour,
+                                outline=cc("text") if self._flash else "",
+                                width=2 if self._flash else 0)
+
+    def repaint_theme(self):
+        self._canvas.configure(bg=cc("card"))
+
+
+class ScanPanel(ctk.CTkFrame):
+    """The Scanning tab: overall state, coverage counters, per-provider health
+    and the most recent detections."""
+
+    def __init__(self, parent, on_apply_blocks=None, **kwargs):
+        super().__init__(parent, fg_color=THEME["bg"], corner_radius=0, **kwargs)
+        self._on_apply_blocks = on_apply_blocks
+
+        # Hero
+        self._hero = ctk.CTkFrame(self, fg_color=THEME["card"], corner_radius=12,
+                                  border_width=1, border_color=THEME["border"])
+        self._hero.pack(fill="x", padx=20, pady=(14, 10))
+        inner = ctk.CTkFrame(self._hero, fg_color="transparent")
+        inner.pack(fill="x", padx=24, pady=18)
+
+        self._hero_state = tk.StringVar(value="OFF")
+        self._hero_lbl = ctk.CTkLabel(
+            inner, textvariable=self._hero_state,
+            font=ctk.CTkFont("Segoe UI", 22, weight="bold"),
+            text_color=THEME["muted"])
+        self._hero_lbl.pack(anchor="w")
+
+        self._hero_detail = tk.StringVar(value="Site scanning is disabled.")
+        ctk.CTkLabel(inner, textvariable=self._hero_detail, anchor="w",
+                     font=ctk.CTkFont("Segoe UI", 11),
+                     text_color=THEME["muted"]).pack(anchor="w", pady=(2, 0))
+
+        self._apply_btn = ctk.CTkButton(
+            inner, text="APPLY BLOCKS NOW", width=170, height=30,
+            font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
+            fg_color=THEME["stop_bg"], hover_color=THEME["stop_hov"],
+            command=self._apply_clicked)
+        # Only shown when blocks are pending — see set_pending_blocks.
+
+        # Coverage counters
+        stats = ctk.CTkFrame(self, fg_color="transparent")
+        stats.pack(fill="x", padx=20, pady=(0, 10))
+        self._card_sites = StatCard(stats, "Sites seen", "0")
+        self._card_good  = StatCard(stats, "Known good", "0")
+        self._card_bad   = StatCard(stats, "Flagged",    "0")
+        self._card_queue = StatCard(stats, "Queued",     "0")
+        for c in (self._card_sites, self._card_good, self._card_bad,
+                  self._card_queue):
+            c.pack(side="left", fill="both", expand=True, padx=4)
+
+        # Providers
+        box = ctk.CTkFrame(self, fg_color=THEME["card"], corner_radius=10,
+                           border_width=1, border_color=THEME["border"])
+        box.pack(fill="x", padx=20, pady=(0, 10))
+        ctk.CTkLabel(box, text="SOURCES", anchor="w",
+                     font=ctk.CTkFont("Consolas", 10, weight="bold"),
+                     text_color=THEME["muted"]).pack(fill="x", padx=16, pady=(10, 6))
+        self._rows = []
+        for i in range(3):
+            if i:
+                tk.Frame(box, bg=cc("border"), height=1).pack(fill="x", padx=16)
+            row = _ProviderRow(box)
+            row.pack(fill="x", padx=16, pady=8)
+            self._rows.append(row)
+
+        # Recent detections
+        self._flags = LogPanel(self, title="RECENT DETECTIONS")
+        self._flags.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        self._flag_seen = set()
+
+    def _apply_clicked(self):
+        if self._on_apply_blocks:
+            self._on_apply_blocks()
+
+    def set_pending_blocks(self, count: int):
+        if count > 0:
+            self._apply_btn.configure(
+                text=f"APPLY {count} BLOCK{'S' if count != 1 else ''} NOW")
+            self._apply_btn.pack(anchor="w", pady=(12, 0))
+        else:
+            self._apply_btn.pack_forget()
+
+    def update_view(self, overall, statuses, stats, flags):
+        state, headline = overall
+        colour_key, _label = _PSTATE_UI.get(state, _PSTATE_UI[rep.P_OFF])
+        self._hero_state.set(
+            {rep.P_OK: "SCANNING", rep.P_IDLE: "SCANNING",
+             rep.P_LIMITED: "RATIONED", rep.P_ERROR: "PROBLEM",
+             rep.P_OFF: "OFF"}.get(state, "OFF"))
+        self._hero_lbl.configure(text_color=THEME[colour_key])
+        self._hero_detail.set(headline)
+        self._hero.configure(fg_color=THEME[
+            {rep.P_OK: "hero_run", rep.P_ERROR: "hero_err",
+             rep.P_LIMITED: "hero_warn"}.get(state, "card")])
+
+        self._card_sites.update_value(f"{stats['sites']:,}")
+        self._card_good.update_value(f"{stats['known_good']:,}")
+        self._card_bad.update_value(f"{stats['flagged']:,}")
+        self._card_queue.update_value(
+            f"{stats['queued'] + stats['inflight']:,}")
+
+        for row, st in zip(self._rows, statuses):
+            row.update_status(st, self._detail_for(st, stats))
+
+        for flag in reversed(flags):
+            key = (flag["host"], flag["at"])
+            if key in self._flag_seen:
+                continue
+            self._flag_seen.add(key)
+            self._flags.log(
+                f"{flag['host']}  —  {flag['source']}: {flag['detail']}",
+                "error")
+
+    @staticmethod
+    def _detail_for(st, stats):
+        """The one metrics line under each provider, phrased for that provider's
+        actual constraint rather than a generic call counter."""
+        extra = st.get("extra") or {}
+        if st["state"] == rep.P_OFF:
+            return st["detail"] or "not in use"
+        if st["name"] == "feeds":
+            entries = extra.get("entries") or 0
+            refreshed = extra.get("refreshed") or 0
+            if not refreshed:
+                # Downloaded on the first scan cycle, not at startup — saying
+                # "stale" here would read as a fault rather than "not yet".
+                return "waiting for the first feed download"
+            parts = [f"{entries:,} known-bad hosts",
+                     f"refreshed {_ago(refreshed)}"]
+            stale = [n for n, _t, is_stale in (extra.get("sources") or [])
+                     if is_stale]
+            if stale:
+                parts.append("stale: " + ", ".join(stale))
+            return " · ".join(parts)
+        if st["name"] == "safebrowsing":
+            parts = [f"{st['hosts']:,} hosts checked",
+                     f"{st['calls']:,} batch{'es' if st['calls'] != 1 else ''}"]
+            if extra.get("queued"):
+                parts.append(f"{extra['queued']:,} waiting")
+            parts.append(f"last reply {_ago(st['last_ok'])}")
+            if st["state"] == rep.P_ERROR and st["last_error"]:
+                parts.append(st["last_error"])
+            return " · ".join(parts)
+        used, cap = extra.get("used_today", 0), extra.get("cap", 0)
+        parts = [f"{used}/{cap} today"]
+        if extra.get("queued"):
+            parts.append(f"{extra['queued']:,} queued")
+        parts.append(f"1 every {extra.get('interval', 0):.0f}s")
+        if st["state"] == rep.P_ERROR and st["last_error"]:
+            parts.append(st["last_error"])
+        elif st["state"] == rep.P_LIMITED:
+            parts.append(st["detail"])
+        return " · ".join(parts)
+
+    def repaint_theme(self):
+        for row in self._rows:
+            row.repaint_theme()
+        self._flags.repaint_theme()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Settings panel
 # ─────────────────────────────────────────────────────────────────────────────
+# Config keys the panel must carry through a load/save round trip even though
+# no widget edits them — they are maintained by the scanner at runtime.
+_PASSTHROUGH_KEYS = ("rep_blocklist", "rep_allowlist")
+
+
 class SettingsPanel(ctk.CTkScrollableFrame):
     def __init__(self, parent, **kwargs):
         super().__init__(parent, fg_color="transparent",
@@ -309,6 +800,7 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._vars         = {}
         self._bypass_frame = None
         self._bypass_text  = None
+        self._passthrough  = {k: [] for k in _PASSTHROUGH_KEYS}
         self._build()
 
     def _section(self, title: str) -> ctk.CTkFrame:
@@ -428,6 +920,35 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         cert_var.trace_add("write", lambda *_: self._refresh_ca_status())
         self._refresh_ca_status()
 
+        s3c = self._section("SITE SCANNING")
+        self._check(s3c, "rep_scan",
+                    "Check every site against reputation services (each host is "
+                    "looked up once, then remembered)")
+        self._check(s3c, "rep_block",
+                    "Block sites that come back flagged")
+        self._lbl(s3c, "Sources — the free feeds need no key and work offline "
+                       "once downloaded.")
+        self._check(s3c, "rep_feeds",
+                    "Free malware & phishing feeds (URLhaus, OpenPhish)")
+        self._lbl(s3c, "Google Safe Browsing API key  —  batched and effectively "
+                       "unlimited; the main filter.")
+        self._entry(s3c, "rep_gsb_key", show="●",
+                    placeholder="(no key — Safe Browsing disabled)")
+        self._lbl(s3c, "VirusTotal API key  —  optional second opinion. The free "
+                       "tier allows 4 lookups/minute, so it backfills in the "
+                       "background rather than checking sites as you visit them.")
+        self._entry(s3c, "rep_vt_key", show="●",
+                    placeholder="(no key — VirusTotal disabled)")
+        self._rep_status_lbl = ctk.CTkLabel(
+            s3c, text="", justify="left", wraplength=260, anchor="w",
+            font=ctk.CTkFont("Segoe UI", 10), text_color=THEME["yellow"])
+        self._rep_status_lbl.pack(anchor="w", pady=(6, 0))
+        for k in ("rep_scan", "rep_feeds", "rep_gsb_key", "rep_vt_key",
+                  "rep_block"):
+            self._vars[k].trace_add("write",
+                                    lambda *_: self._refresh_rep_status())
+        self._refresh_rep_status()
+
         s4 = self._section("APP OPTIONS")
         self._check(s4, "autostart",       "Launch & connect at logon  (runs elevated, no prompt)")
         self._check(s4, "start_minimized", "Start minimized to system tray")
@@ -474,7 +995,12 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         ctk.CTkFrame(self, fg_color="transparent", height=8).pack()
 
     def get_values(self) -> dict:
-        d = {}
+        # Values with no widget of their own still have to survive a Save. The
+        # block list is written by the scanner, not typed by the user, and
+        # _save_to_file rewrites the whole JSON document — so omitting it here
+        # would silently erase it whenever settings were saved on a machine
+        # using the ProgramData fallback store.
+        d = dict(self._passthrough)
         for k, v in self._vars.items():
             if k == "_auth_display":
                 d["auth_type"] = _AUTH_INTERNAL.get(v.get(), "none")
@@ -541,7 +1067,43 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         if "bypass_list" in d and self._bypass_text:
             self._bypass_text.delete("1.0", "end")
             self._bypass_text.insert("1.0", "\n".join(d["bypass_list"]))
+        for k in _PASSTHROUGH_KEYS:
+            if k in d:
+                self._passthrough[k] = d[k]
         self._refresh_auth_warning()
+        self._refresh_rep_status()
+
+    def _refresh_rep_status(self):
+        """Live feedback on the scanning configuration, same model as
+        _refresh_auth_warning: a setting that looks enabled but can produce no
+        verdicts is worse than one that is plainly off, because the user
+        believes they are covered."""
+        lbl = getattr(self, "_rep_status_lbl", None)
+        if lbl is None:
+            return
+        try:
+            vals = {k: self._vars[k].get()
+                    for k in ("rep_scan", "rep_feeds", "rep_gsb_key",
+                              "rep_vt_key", "rep_block")}
+        except Exception:
+            return
+        if not vals["rep_scan"]:
+            lbl.configure(text="Scanning is off — no site is checked and nothing "
+                               "leaves this machine.",
+                          text_color=THEME["muted"])
+            return
+        warnings = rep_config_warnings(vals)
+        if warnings:
+            lbl.configure(text="⚠ " + warnings[0], text_color=THEME["yellow"])
+            return
+        sources = ["feeds"] if vals["rep_feeds"] else []
+        if (vals["rep_gsb_key"] or "").strip():
+            sources.append("Safe Browsing")
+        if (vals["rep_vt_key"] or "").strip():
+            sources.append("VirusTotal")
+        lbl.configure(text="✓ Active: " + ", ".join(sources) +
+                           ". Each host is checked once and remembered.",
+                      text_color=THEME["green"])
 
     def _pick_ca_cert(self):
         path = filedialog.askopenfilename(
@@ -657,6 +1219,20 @@ class ProxyForceApp(ctk.CTk):
         self._running    = True
         self._cur_page   = "dashboard"
 
+        # Site reputation. Created unconditionally: the Sites view is populated
+        # from observe() whether or not scanning is switched on, and the scanner
+        # itself does no network work until rep_scan is true. Both callbacks fire
+        # on worker threads, so they only ever touch the queue — _poll_queue does
+        # the widget writes on the Tk thread.
+        self._scanner = rep.ReputationScanner(
+            load_config,
+            on_update=lambda record: self._queue.put(("site", record)),
+            on_log=lambda m, l: self._queue.put(("log", m, l)))
+        self._scanner.start()
+        self._pending_blocks = 0
+        self._flagged_seen = set()   # hosts already alerted on, this session
+        self._rep_last_scan_on = bool(load_config().get("rep_scan"))
+
         try:
             self._sb_log_pos = (os.path.getsize(SINGBOX_LOG)
                                 if os.path.exists(SINGBOX_LOG) else 0)
@@ -675,6 +1251,7 @@ class ProxyForceApp(ctk.CTk):
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_queue()
         self._poll_singbox_log()
+        self._refresh_scan_view()
 
         if _HAS_TRAY:
             self._setup_tray()
@@ -918,6 +1495,7 @@ class ProxyForceApp(ctk.CTk):
         self._nav_btns = {}
         for key, icon, label in [
             ("dashboard", "⬡", "Dashboard"),
+            ("scan",      "◎", "Scanning"),
             ("settings",  "⚙", "Settings"),
             ("log",       "☰", "Log"),
         ]:
@@ -935,27 +1513,32 @@ class ProxyForceApp(ctk.CTk):
                                           fg_color=THEME["bg"], corner_radius=0)
         self._pg_log       = ctk.CTkFrame(self._content,
                                           fg_color=THEME["bg"], corner_radius=0)
+        self._pg_scan      = ctk.CTkFrame(self._content,
+                                          fg_color=THEME["bg"], corner_radius=0)
 
         self._build_dashboard(self._pg_dashboard)
+        self._build_scan(self._pg_scan)
         self._build_settings(self._pg_settings)
         self._build_log(self._pg_log)
 
     # ── Navigation ────────────────────────────────────────────────────────────
 
+    _PAGES = ("dashboard", "scan", "settings", "log")
+
     def _nav(self, key: str):
         self._cur_page = key
-        titles = {"dashboard": "Dashboard", "settings": "Settings", "log": "Log"}
+        titles = {"dashboard": "Dashboard", "scan": "Scanning",
+                  "settings": "Settings", "log": "Log"}
         self._page_title.configure(text=titles.get(key, key.capitalize()))
 
         for k, btn in self._nav_btns.items():
             btn.set_active(k == key)
 
-        for pg in (self._pg_dashboard, self._pg_settings, self._pg_log):
+        pages = {"dashboard": self._pg_dashboard, "scan": self._pg_scan,
+                 "settings":  self._pg_settings,  "log": self._pg_log}
+        for pg in pages.values():
             pg.pack_forget()
-
-        {"dashboard": self._pg_dashboard,
-         "settings":  self._pg_settings,
-         "log":       self._pg_log}[key].pack(fill="both", expand=True)
+        pages[key].pack(fill="both", expand=True)
 
     # ── Dashboard ─────────────────────────────────────────────────────────────
 
@@ -1003,9 +1586,26 @@ class ProxyForceApp(ctk.CTk):
                   self._card_uptime):
             c.pack(side="left", fill="both", expand=True, padx=4)
 
-        # Event log
-        self._dash_log = LogPanel(parent)
-        self._dash_log.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        # Sites — one row per host, replacing the dashboard's old copy of the
+        # event log. The log answers "what is the engine doing" and lives on the
+        # Log tab; the dashboard answers "what am I actually talking to", which
+        # is what the diagnostic chatter used to bury.
+        self._sites_panel = SitesPanel(parent, on_select=self._on_site_selected)
+        self._sites_panel.pack(fill="both", expand=True, padx=20, pady=(0, 4))
+
+        # One-line status strip: warnings and errors still need to reach the
+        # dashboard, they just no longer get a scrolling log to do it in.
+        self._dash_status_var = tk.StringVar(value="")
+        self._dash_status_lbl = ctk.CTkLabel(
+            parent, textvariable=self._dash_status_var, anchor="w",
+            font=ctk.CTkFont("Consolas", 10), text_color=THEME["muted"])
+        self._dash_status_lbl.pack(fill="x", padx=24, pady=(0, 12))
+
+    # ── Scanning ──────────────────────────────────────────────────────────────
+
+    def _build_scan(self, parent):
+        self._scan_panel = ScanPanel(parent, on_apply_blocks=self._apply_blocks)
+        self._scan_panel.pack(fill="both", expand=True)
 
     # ── Settings ──────────────────────────────────────────────────────────────
 
@@ -1089,6 +1689,17 @@ class ProxyForceApp(ctk.CTk):
         self._proxy_info_var.set(f"→ {vals['host']}:{vals['port']}{auth_str}")
         self._log("Configuration saved.", "success")
 
+        for w in rep_config_warnings(vals):
+            self._log(w, "warning")
+        # Switching scanning on should check the hosts already seen while it was
+        # off, rather than leaving them blank until they are visited again.
+        scan_on = bool(vals.get("rep_scan"))
+        if scan_on and not self._rep_last_scan_on:
+            self._scanner.rescan_all()
+            self._log("Site scanning enabled — checking the sites seen so far.",
+                      "info")
+        self._rep_last_scan_on = scan_on
+
         # Apply changes live: if a proxy-affecting field changed while the engine is
         # running, restart it so sing-box re-renders config.json with the new rules
         # (e.g. a freshly added bypass entry). sing-box has no hot-reload, so a
@@ -1165,7 +1776,8 @@ class ProxyForceApp(ctk.CTk):
                 engine       = SingBoxController(proxy_cfg,
                                                   on_state_change=on_state,
                                                   on_stats_update=on_stats,
-                                                  on_log=on_log)
+                                                  on_log=on_log,
+                                                  on_host_seen=self._scanner.observe)
                 self._engine  = engine
                 engine.start()
             except Exception as e:
@@ -1482,8 +2094,17 @@ class ProxyForceApp(ctk.CTk):
     # ── Logging ───────────────────────────────────────────────────────────────
 
     def _log(self, msg: str, level: str = "info"):
-        self._dash_log.log(msg, level)
+        """Everything goes to the Log tab. The dashboard used to mirror it, which
+        buried the connection lines under diagnostics — now only warnings and
+        errors surface there, on a single status line."""
         self._full_log.log(msg, level)
+        if level in ("warning", "error"):
+            self._dash_status_var.set(msg)
+            self._dash_status_lbl.configure(
+                text_color=THEME["red" if level == "error" else "yellow"])
+        elif level == "success" and not self._dash_status_var.get():
+            self._dash_status_var.set(msg)
+            self._dash_status_lbl.configure(text_color=THEME["muted"])
 
     # ── State display ─────────────────────────────────────────────────────────
 
@@ -1554,11 +2175,14 @@ class ProxyForceApp(ctk.CTk):
             btn.repaint()
         # Stat cards
         for card in (self._card_active, self._card_total, self._card_bytes,
-                     self._card_uptime):
+                     self._card_uptime, self._scan_panel._card_sites,
+                     self._scan_panel._card_good, self._scan_panel._card_bad,
+                     self._scan_panel._card_queue):
             card.repaint_theme()
-        # Log panels
-        self._dash_log.repaint_theme()
+        # Log panels, sites table and the scanning view
         self._full_log.repaint_theme()
+        self._sites_panel.repaint_theme()
+        self._scan_panel.repaint_theme()
         # Settings bypass text
         self._settings_panel.repaint_theme()
         # Re-apply state to refresh colours
@@ -1624,6 +2248,12 @@ class ProxyForceApp(ctk.CTk):
                 eng.stop()
             except Exception:
                 pass
+        # Flushes the verdict cache, so the next launch starts with everything
+        # already known-good rather than re-scanning it.
+        try:
+            self._scanner.stop()
+        except Exception:
+            pass
         try:
             self.destroy()
         except Exception:
@@ -1656,6 +2286,117 @@ class ProxyForceApp(ctk.CTk):
         if self._running:
             self.after(2000, self._poll_singbox_log)
 
+    # ── Site reputation ───────────────────────────────────────────────────────
+
+    def _on_site_update(self, record):
+        """One host changed. Runs on the Tk thread via _poll_queue."""
+        self._sites_panel.upsert(record)
+        if record.status != rep.MALICIOUS:
+            return
+        if record.host in self._flagged_seen:
+            return
+        self._flagged_seen.add(record.host)
+        self._raise_alert(record)
+
+    def _raise_alert(self, record):
+        """Alert, then act. Alerting always happens; blocking is opt-in."""
+        verdict = record.verdict
+        detail = verdict.detail if verdict else ""
+        source = verdict.source if verdict else "scanner"
+        self._log(f"⚠ {record.host} flagged by {source}: {detail}", "error")
+        self._notify_tray("ProxyForce blocked a site"
+                          if load_config().get("rep_block")
+                          else "ProxyForce flagged a site",
+                          f"{record.host} — {detail}")
+
+        cfg = load_config()
+        if not cfg.get("rep_block"):
+            return
+        if record.host in (cfg.get("rep_allowlist") or []):
+            self._log(f"{record.host} is on your allow list — not blocked.",
+                      "warning")
+            return
+
+        # 1. Close what is already open. The reject rule below only applies from
+        #    the next engine start, so without this the flagged host stays
+        #    connected until the user restarts.
+        engine = self._engine
+        if engine is not None:
+            try:
+                closed = engine.close_connections_to(record.host)
+                if closed:
+                    self._log(f"Closed {closed} live connection(s) to "
+                              f"{record.host}.", "warning")
+            except Exception:
+                pass
+
+        # 2. Persist it, so the reject rule is rendered from the next start.
+        blocklist = list(cfg.get("rep_blocklist") or [])
+        if record.host not in blocklist:
+            blocklist.append(record.host)
+            cfg["rep_blocklist"] = blocklist
+            if save_config(cfg):
+                self._settings_panel.set_values({"rep_blocklist": blocklist})
+            else:
+                self._log("Could not save the block list.", "error")
+                return
+        self._pending_blocks += 1
+        self._scan_panel.set_pending_blocks(self._pending_blocks)
+
+    def _apply_blocks(self):
+        """Restart the engine so pending reject rules take effect.
+
+        Deliberately a button rather than automatic: a restart tears down the TUN
+        and kills every open TCP connection, which is a 10-40s outage. That is
+        the user's call to make, not a side effect of a background scan."""
+        if self._pending_blocks <= 0:
+            return
+        if self._last_state not in ("running", "waiting", "starting"):
+            self._pending_blocks = 0
+            self._scan_panel.set_pending_blocks(0)
+            return
+        if not messagebox.askyesno(
+                "ProxyForce",
+                f"Apply {self._pending_blocks} new block"
+                f"{'s' if self._pending_blocks != 1 else ''}?\n\n"
+                "The engine restarts to load the new rules. Every open "
+                "connection drops and the network is unavailable for roughly "
+                "10-40 seconds."):
+            return
+        self._pending_blocks = 0
+        self._scan_panel.set_pending_blocks(0)
+        self._log("Applying block list — reconnecting…", "info")
+        self._start_engine()
+
+    def _on_site_selected(self, record):
+        if record is None:
+            return
+        verdict = record.verdict
+        if verdict is not None and verdict.detail:
+            self._dash_status_var.set(f"{record.host} — {verdict.detail}")
+            self._dash_status_lbl.configure(
+                text_color=THEME["red" if verdict.status == rep.MALICIOUS
+                                 else "muted"])
+
+    def _refresh_scan_view(self):
+        """Repaint the Scanning tab and the Sites 'last seen' column.
+
+        Only does the work when the relevant page is visible — this runs once a
+        second for the whole life of the process."""
+        try:
+            if self._cur_page == "scan":
+                self._scan_panel.update_view(
+                    self._scanner.overall_state(),
+                    self._scanner.provider_status(),
+                    self._scanner.stats(),
+                    self._scanner.recent_flags())
+            elif self._cur_page == "dashboard":
+                self._sites_panel.tick()
+        except Exception:
+            pass
+        if self._running:
+            self.after(1000, self._refresh_scan_view)
+
     def _poll_queue(self):
         try:
             while True:
@@ -1667,6 +2408,8 @@ class ProxyForceApp(ctk.CTk):
                     self._apply_state(item[1])
                 elif tag == "stats":
                     self._update_stats(item[1])
+                elif tag == "site":
+                    self._on_site_update(item[1])
                 elif tag == "tray_start":
                     self._tray_show()
                     self._start_engine()
