@@ -68,6 +68,8 @@ a = Analysis(
         'core.env_certs',
         'core.java_trust',
         'core.local_proxy',
+        'core.reputation',
+        'core.rep_providers',
         # auto-updater (lazily imported in main.py for --apply-update)
         'core.updater',
         'core._version',

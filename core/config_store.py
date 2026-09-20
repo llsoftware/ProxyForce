@@ -58,7 +58,38 @@ _DEFAULTS = {
     "auto_update_check": True,      # nightly background check while running
     "update_hour": 3,               # local hour (0-23) for the nightly check / "install tonight"
     "update_channel": "stable",     # "stable" (releases) | "dev" (incl. pre-releases)
+    # ── Site reputation scanning (see core/reputation) ──
+    # OPT-IN. Checks the hostname of every NEW connection against reputation
+    # sources, once per host, and remembers the verdict. Off by default: it sends
+    # the names of the sites you visit to a third party, which is not something a
+    # proxy tool should start doing uninvited.
+    "rep_scan": False,
+    # Free malware/phishing feeds (URLhaus + OpenPhish), downloaded and matched
+    # locally. No API key, no per-host quota — so this tier stays on by default
+    # and is the only one that works out of the box.
+    "rep_feeds": True,
+    # Google Safe Browsing key. Batched (up to 500 hosts per request), ~10k
+    # requests/day — effectively unlimited for one machine. The primary filter.
+    "rep_gsb_key": "",
+    # VirusTotal key. 4 lookups/minute and 500/day on the free tier, so it is a
+    # queued second opinion for hosts the tiers above said nothing about, never a
+    # primary filter.
+    "rep_vt_key": "",
+    "rep_block": True,          # add flagged hosts to rep_blocklist
+    "rep_blocklist": [],        # hosts flagged malicious -> sing-box reject rules
+    # False-positive overrides: hosts the user chose to allow after a flag. These
+    # are still SCANNED (there are no scan exemptions — every host is looked up
+    # exactly once and then served from cache); they are simply never blocked.
+    "rep_allowlist": [],
 }
+
+# Values obfuscated at rest in both stores. Base64 is obfuscation, NOT encryption
+# — see _simple_obfuscate. An API key is no more protected here than the proxy
+# password is; HKLM\SOFTWARE\ProxyForce is readable by any local user.
+_SECRET_KEYS = frozenset({"password", "rep_gsb_key", "rep_vt_key"})
+
+# Values persisted as JSON strings because the registry has no list type.
+_LIST_KEYS = frozenset(k for k, v in _DEFAULTS.items() if isinstance(v, list))
 
 
 def _simple_obfuscate(s: str) -> str:
@@ -80,7 +111,7 @@ def _save_to_registry(config_dict: dict):
     key = winreg.CreateKey(REG_ROOT, REG_KEY)
     try:
         for k, v in config_dict.items():
-            if k == "password" and v:
+            if k in _SECRET_KEYS and v:
                 v = _simple_obfuscate(v)
             if isinstance(v, bool):
                 winreg.SetValueEx(key, k, 0, winreg.REG_DWORD, int(v))
@@ -97,8 +128,9 @@ def _save_to_registry(config_dict: dict):
 def _save_to_file(config_dict: dict):
     os.makedirs(os.path.dirname(CONFIG_FILE_FALLBACK), exist_ok=True)
     data = dict(config_dict)
-    if data.get("password"):
-        data["password"] = _simple_obfuscate(data["password"])
+    for k in _SECRET_KEYS:
+        if data.get(k):
+            data[k] = _simple_obfuscate(data[k])
     with open(CONFIG_FILE_FALLBACK, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -139,12 +171,14 @@ def load_config() -> dict:
                     val, vtype = winreg.QueryValueEx(key, k)
                 except FileNotFoundError:
                     continue
-                if k == "password" and val:
+                if k in _SECRET_KEYS and val:
                     val = _simple_deobfuscate(val)
-                if k == "bypass_list" and isinstance(val, str):
+                if k in _LIST_KEYS and isinstance(val, str):
                     try:
                         val = json.loads(val)
                     except Exception:
+                        val = []
+                    if not isinstance(val, list):
                         val = []
                 if vtype == winreg.REG_DWORD:
                     val = bool(val) if isinstance(_DEFAULTS[k], bool) else int(val)
@@ -162,8 +196,9 @@ def load_config() -> dict:
         try:
             with open(CONFIG_FILE_FALLBACK) as f:
                 data = json.load(f)
-            if data.get("password"):
-                data["password"] = _simple_deobfuscate(data["password"])
+            for k in _SECRET_KEYS:
+                if data.get(k):
+                    data[k] = _simple_deobfuscate(data[k])
             result.update({k: data[k] for k in _DEFAULTS if k in data})
         except Exception:
             pass
@@ -206,6 +241,47 @@ def auth_config_warnings(cfg: dict) -> list:
             'Auth Type is "NTLM", which ProxyForce does not implement — the '
             "credentials will NOT be sent (NTLM behaves exactly like None). "
             "Use Basic if the proxy accepts it.")
+    return warnings
+
+
+def rep_config_warnings(cfg: dict) -> list:
+    """Warn when reputation scanning is enabled but cannot actually do anything,
+    or is configured in a way that silently degrades. Returns [] when sane.
+
+    Mirrors auth_config_warnings: the failure mode being guarded against is a
+    setting that LOOKS on but produces no verdicts, which is worse than off
+    because the user believes they are covered."""
+    if not cfg.get("rep_scan"):
+        return []
+    feeds = bool(cfg.get("rep_feeds"))
+    gsb = bool((cfg.get("rep_gsb_key") or "").strip())
+    vt = bool((cfg.get("rep_vt_key") or "").strip())
+    warnings = []
+    if not (feeds or gsb or vt):
+        warnings.append(
+            "Site scanning is ON but every source is disabled — no site will "
+            "ever be checked. Enable the free feeds, or add a Google Safe "
+            "Browsing or VirusTotal API key.")
+        return warnings
+    if not gsb:
+        if vt and not feeds:
+            # The worst realistic combination: VT alone is 4 lookups/minute and
+            # 500/day, so a normal browsing session queues faster than it drains
+            # and most hosts stay unknown for days.
+            warnings.append(
+                "VirusTotal is the only source configured. Its free tier allows "
+                "4 lookups/minute (500/day), so new sites will be checked slowly "
+                "and a backlog will build. Add a Google Safe Browsing key — it "
+                "batches and covers everything — or enable the free feeds.")
+        else:
+            warnings.append(
+                "No Google Safe Browsing key — only the offline feeds are "
+                "active, which catch known malware and phishing hosts but "
+                "nothing newer than the last feed download.")
+    if not cfg.get("rep_block"):
+        warnings.append(
+            "Blocking is off — flagged sites will be reported but still "
+            "reachable.")
     return warnings
 
 
