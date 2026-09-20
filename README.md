@@ -84,6 +84,10 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
   connection that was already open before you hit Start keeps its old path until it
   closes (the OS can't reroute a live socket); anything opened after Start is
   captured from its first packet.
+- **Every site you connect to is listed on the Dashboard**, one row per host with
+  its connection count and route. Optionally those hostnames can be checked
+  against malware/phishing reputation sources — once each, then remembered — and
+  flagged hosts blocked. Off by default; see **Site Scanning** below.
 - The **GUI** owns and manages sing-box directly as a child process. Closing the
   window minimises to the **system tray** — enforcement keeps running until you
   choose **Quit** from the tray menu.
@@ -133,6 +137,8 @@ No install wizard, no service to register. The folder can live anywhere.
 | Quit completely | **Tray icon → Quit** (stops sing-box and exits) |
 | Save settings | **Settings tab → Save Config** |
 | Test proxy reachability | **Settings tab → Test Proxy** |
+| See the sites you're connecting to | **Dashboard** — one row per host, live |
+| Check scanner & source health | **Scanning tab** |
 | Switch light/dark theme | Toggle in the header: ☀ Light · 🖥 Auto · 🌙 Dark |
 
 > **Enforcement lifetime:** redirection runs while ProxyForce is in the tray.
@@ -152,6 +158,63 @@ No install wizard, no service to register. The folder can live anywhere.
 > time, to pick up the value at all. If something else on the machine is already
 > using one of those ports, ProxyForce falls back to an ephemeral one for just that
 > slot (logged in the Log tab) and that one case still needs a reopen.
+
+---
+
+## Site Scanning  *(optional, off by default)*
+
+Because DNS is hijacked to fakeip, ProxyForce already knows the hostname behind
+every connection — including HTTPS. Turning on **Settings → SITE SCANNING** puts
+those hostnames through a reputation check, alerts you when one comes back bad,
+and blocks it.
+
+**Each host is looked up exactly once.** The verdict is written to
+`C:\ProgramData\ProxyForce\reputation\cache.json` and reused from then on, so
+after the first few days of normal browsing the scanner makes almost no requests
+at all — a site you visit every day is checked once and remembered as known-good.
+There are no exemptions: every hostname is scanned, including the scanner's own
+API endpoints.
+
+### Sources
+
+| Source | Covers | Key | Quota |
+|---|---|---|---|
+| **Malware & phishing feeds** (URLhaus, OpenPhish) | every host | none | unlimited — matched locally, works offline once downloaded |
+| **Google Safe Browsing** | every host | free | ~10k requests/day, but **500 hosts per request** — effectively unlimited for one machine |
+| **VirusTotal** | backfill | free | 4/minute, 500/day — far too slow to check sites as you visit them, so it works through a queue in the background and flags anything the other two missed |
+
+They are checked in that order, and a host that one source has already condemned
+is not passed to the next — VirusTotal's small daily budget is never spent
+re-confirming a known-bad host.
+
+### What happens on a detection
+
+1. A tray notification and a red row on the Dashboard, immediately.
+2. Every **live** connection to that host is closed via the Clash API.
+3. The host is added to the block list and saved.
+4. The blocking rule itself (a sing-box `reject` route rule plus an NXDOMAIN DNS
+   rule) applies from the **next Start**. Use **Scanning → Apply Blocks Now** to
+   take it immediately — that restarts the engine, which drops every open
+   connection and takes roughly 10–40 seconds.
+
+The restart is deliberately a button and never automatic: a background scan
+should not be able to drop your network on its own.
+
+### What is and isn't covered
+
+**HTTPS is scanned** — the hostname is visible for every connection, and blocking
+a host blocks every URL under it. What is *not* visible for HTTPS is the URL
+**path**, because ProxyForce never terminates TLS. Plaintext HTTP on port 80 goes
+through ProxyForce's own forward proxy, where the full URL is available.
+
+So a phishing domain, a malware/C2 domain or a newly-registered junk domain is
+caught. A malicious *path* on an otherwise-reputable HTTPS host — a bad file on a
+file-sharing service — is not. Closing that gap would require intercepting TLS
+with a locally-trusted CA, which this tool deliberately does not do.
+
+> **Privacy:** with scanning on, the hostnames you connect to are sent to
+> whichever sources you enable. That is why it ships off, and why the offline
+> feeds — which send nothing — are the only tier enabled by default.
 
 ---
 
@@ -488,8 +551,10 @@ Manager.
 
 ## Security Notes
 
-- Passwords are base64-obfuscated in `HKLM`. For production, replace with a
-  machine-scoped DPAPI blob in `core/config_store.py`.
+- Passwords **and reputation API keys** are base64-obfuscated in `HKLM`. That is
+  obfuscation, not encryption — any local user can read them back. For
+  production, replace with a machine-scoped DPAPI blob in
+  `core/config_store.py`; the keys to cover are listed in `_SECRET_KEYS`.
 - Whitelist the ProxyForce folder and `_internal\singbox\sing-box.exe` in AV/EDR
   if those paths are quarantined. (sing-box lives on disk in `_internal\singbox\`
   inside the extracted zip — it is NOT extracted to `%TEMP%` at runtime.)
