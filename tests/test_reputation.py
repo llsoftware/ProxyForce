@@ -438,6 +438,49 @@ class AlertTests(_ScannerCase):
         self.assertEqual(s.conn_ids_for("evil.example"), {"conn-1", "conn-2"})
 
 
+class FeedAccessorTests(_ScannerCase):
+    """verdict_for/is_pending back the dashboard's live connection feed, which
+    calls them once per connection — so they must answer from cache only and
+    never block or trigger a lookup."""
+
+    def test_verdict_for_returns_none_for_an_unseen_host(self):
+        s = self._scanner()
+        self.assertIsNone(s.verdict_for("nothing.example"))
+
+    def test_verdict_for_returns_a_cached_verdict(self):
+        s = self._scanner()
+        s._cache["a.example"] = rep.Verdict("a.example", rep.CLEAN, "gsb", "ok")
+        self.assertEqual(s.verdict_for("a.example").status, rep.CLEAN)
+
+    def test_verdict_for_normalizes_the_host(self):
+        """The feed passes whatever sing-box reported, ports and all."""
+        s = self._scanner()
+        s._cache["a.example"] = rep.Verdict("a.example", rep.CLEAN, "gsb", "ok")
+        self.assertIsNotNone(s.verdict_for("A.Example.:443"))
+
+    def test_verdict_for_ignores_an_expired_entry(self):
+        s = self._scanner()
+        s._cache["a.example"] = rep.Verdict(
+            "a.example", rep.CLEAN, "gsb", "ok", expires_at=time.time() - 1)
+        self.assertIsNone(s.verdict_for("a.example"))
+
+    def test_is_pending_is_true_only_while_in_flight(self):
+        s = self._scanner()
+        self.assertFalse(s.is_pending("a.example"))
+        s._inflight.add("a.example")
+        self.assertTrue(s.is_pending("a.example"))
+
+    def test_accessors_do_not_queue_a_lookup(self):
+        gsb = _FakeGSB()
+        s = self._scanner(gsb=gsb)
+        s.start()
+        s.verdict_for("never.example")
+        s.is_pending("never.example")
+        time.sleep(0.2)
+        self.assertEqual(gsb.calls, 0)
+        self.assertEqual(s.stats()["sites"], 0)
+
+
 class ProviderStatusTests(_ScannerCase):
 
     def test_states_reflect_configuration(self):

@@ -84,10 +84,12 @@ Any App → [sing-box TUN adapter] → ProxyForce (elevated GUI) → [HTTP CONNE
   connection that was already open before you hit Start keeps its old path until it
   closes (the OS can't reroute a live socket); anything opened after Start is
   captured from its first packet.
-- **Every site you connect to is listed on the Dashboard**, one row per host with
-  its connection count and route. Optionally those hostnames can be checked
-  against malware/phishing reputation sources — once each, then remembered — and
-  flagged hosts blocked. Off by default; see **Site Scanning** below.
+- **The Dashboard is a live feed of outbound connections** — each one appears as
+  it is made, with its destination, whether it went through the proxy or direct,
+  and (when scanning is on) its reputation, so anything unexpected stands out as
+  it happens. Optionally those hostnames are checked against malware/phishing
+  reputation sources — once each, then remembered — and flagged hosts blocked.
+  Off by default; see **Site Scanning** below.
 - The **GUI** owns and manages sing-box directly as a child process. Closing the
   window minimises to the **system tray** — enforcement keeps running until you
   choose **Quit** from the tray menu.
@@ -137,8 +139,10 @@ No install wizard, no service to register. The folder can live anywhere.
 | Quit completely | **Tray icon → Quit** (stops sing-box and exits) |
 | Save settings | **Settings tab → Save Config** |
 | Test proxy reachability | **Settings tab → Test Proxy** |
-| See the sites you're connecting to | **Dashboard** — one row per host, live |
+| Watch connections as they happen | **Dashboard** — live feed (PAUSE to hold it still) |
+| See every host and its verdict | **Scanning tab** — one row per host, filterable to Flagged |
 | Check scanner & source health | **Scanning tab** |
+| Read engine diagnostics | **Log tab** |
 | Switch light/dark theme | Toggle in the header: ☀ Light · 🖥 Auto · 🌙 Dark |
 
 > **Enforcement lifetime:** redirection runs while ProxyForce is in the tray.
@@ -189,7 +193,7 @@ re-confirming a known-bad host.
 
 ### What happens on a detection
 
-1. A tray notification and a red row on the Dashboard, immediately.
+1. A tray notification and a red line in the Dashboard feed, immediately.
 2. Every **live** connection to that host is closed via the Clash API.
 3. The host is added to the block list and saved.
 4. The blocking rule itself (a sing-box `reject` route rule plus an NXDOMAIN DNS

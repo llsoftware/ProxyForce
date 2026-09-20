@@ -330,6 +330,139 @@ _REP_UI = {
 }
 
 
+class ConnectionFeed(ctk.CTkFrame):
+    """Live scrolling view of connections as sing-box makes them.
+
+    This is the dashboard's whole job: watch what is actually going out, in
+    order, as it happens, and notice anything that looks wrong. It is a feed
+    rather than a table on purpose — the sequence and timing are the signal.
+    Diagnostics do not belong here; they stay on the Log tab.
+    """
+
+    _MAX_LINES = 2000
+
+    def __init__(self, parent, **kwargs):
+        super().__init__(parent, fg_color=THEME["card"], corner_radius=10,
+                         border_width=1, border_color=THEME["border"], **kwargs)
+        self._paused = False
+        self._count = 0
+
+        hdr = ctk.CTkFrame(self, fg_color="transparent")
+        hdr.pack(fill="x", padx=14, pady=(10, 4))
+        ctk.CTkLabel(hdr, text="LIVE CONNECTIONS",
+                     font=ctk.CTkFont("Consolas", 10, weight="bold"),
+                     text_color=THEME["muted"]).pack(side="left")
+        self._count_var = tk.StringVar(value="")
+        ctk.CTkLabel(hdr, textvariable=self._count_var,
+                     font=ctk.CTkFont("Consolas", 10),
+                     text_color=THEME["muted"]).pack(side="left", padx=(10, 0))
+
+        clr = ctk.CTkLabel(hdr, text="CLEAR",
+                           font=ctk.CTkFont("Consolas", 10, weight="bold"),
+                           text_color=THEME["muted"], cursor="hand2")
+        clr.pack(side="right")
+        clr.bind("<Button-1>", lambda e: self.clear())
+        clr.bind("<Enter>", lambda e: clr.configure(text_color=THEME["accent"]))
+        clr.bind("<Leave>", lambda e: clr.configure(text_color=THEME["muted"]))
+
+        # Pausing matters on a busy machine: without it the view scrolls away
+        # from whatever the user just spotted and wanted to read.
+        self._pause_lbl = ctk.CTkLabel(
+            hdr, text="PAUSE", font=ctk.CTkFont("Consolas", 10, weight="bold"),
+            text_color=THEME["muted"], cursor="hand2")
+        self._pause_lbl.pack(side="right", padx=(0, 14))
+        self._pause_lbl.bind("<Button-1>", lambda e: self.toggle_pause())
+
+        self._wrap = tk.Frame(self, bg=cc("input_bg"))
+        self._wrap.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        self._text = tk.Text(self._wrap, bg=cc("input_bg"), fg=cc("text"),
+                             font=("Consolas", 9), relief="flat",
+                             padx=10, pady=8, state="disabled", wrap="none",
+                             insertbackground=cc("accent"),
+                             selectbackground=cc("border"))
+        self._sb = tk.Scrollbar(self._wrap, command=self._text.yview)
+        self._text.configure(yscrollcommand=self._sb.set)
+        self._sb.pack(side="right", fill="y")
+        self._text.pack(fill="both", expand=True)
+        self._apply_tags()
+
+    def _apply_tags(self):
+        self._text.tag_config("ts", foreground=cc("muted"))
+        self._text.tag_config("host", foreground=cc("text"))
+        self._text.tag_config("proxy", foreground=cc("green"))
+        self._text.tag_config("direct", foreground=cc("yellow"))
+        self._text.tag_config("other", foreground=cc("muted"))
+        self._text.tag_config("clean", foreground=cc("muted"))
+        self._text.tag_config("pending", foreground=cc("accent"))
+        self._text.tag_config("bad", foreground=cc("red"))
+        self._text.tag_config("alert", foreground=cc("red"))
+
+    def toggle_pause(self):
+        self._paused = not self._paused
+        self._pause_lbl.configure(
+            text="RESUME" if self._paused else "PAUSE",
+            text_color=THEME["yellow"] if self._paused else THEME["muted"])
+
+    def add(self, host, port, route, status):
+        """One line per connection, in the order they are made."""
+        self._count += 1
+        self._count_var.set(f"{self._count:,} this session"
+                            + ("  ·  PAUSED" if self._paused else ""))
+        if self._paused:
+            return
+        dest = f"{host}:{port}" if port else str(host)
+        route_tag = route if route in ("proxy", "direct") else "other"
+        glyph, rep_tag = {
+            rep.MALICIOUS: ("⚠ FLAGGED", "bad"),
+            rep.CLEAN:     ("✓", "clean"),
+            "pending":     ("…", "pending"),
+        }.get(status, ("", "other"))
+
+        self._text.configure(state="normal")
+        self._text.insert("end", time.strftime("%H:%M:%S") + "  ", "ts")
+        self._text.insert("end", f"{dest:<38.38}", "bad" if rep_tag == "bad"
+                          else "host")
+        self._text.insert("end", f"{route:<8.8}", route_tag)
+        self._text.insert("end", glyph + "\n", rep_tag)
+        self._trim()
+        self._text.see("end")
+        self._text.configure(state="disabled")
+
+    def alert(self, host, detail):
+        """A verdict that arrived after the connection was already made. The
+        line above it has scrolled on, so the detection needs its own entry."""
+        self._text.configure(state="normal")
+        self._text.insert("end", time.strftime("%H:%M:%S") + "  ", "ts")
+        self._text.insert("end", f"⚠ FLAGGED  {host}  —  {detail}\n",
+                          "alert")
+        self._trim()
+        if not self._paused:
+            self._text.see("end")
+        self._text.configure(state="disabled")
+
+    def _trim(self):
+        overflow = int(self._text.index("end-1c").split(".")[0]) - self._MAX_LINES
+        if overflow > 0:
+            self._text.delete("1.0", f"{overflow + 1}.0")
+
+    def clear(self):
+        self._text.configure(state="normal")
+        self._text.delete("1.0", "end")
+        self._text.configure(state="disabled")
+        self._count = 0
+        self._count_var.set("")
+
+    def repaint_theme(self):
+        ib = cc("input_bg")
+        self._wrap.configure(bg=ib)
+        self._text.configure(bg=ib, fg=cc("text"),
+                             insertbackground=cc("accent"),
+                             selectbackground=cc("border"))
+        self._sb.configure(bg=cc("border"), troughcolor=ib,
+                           activebackground=cc("muted"))
+        self._apply_tags()
+
+
 class SitesPanel(ctk.CTkFrame):
     """A live, deduplicated table of every host connected to.
 
@@ -688,10 +821,11 @@ class ScanPanel(ctk.CTkFrame):
             row.pack(fill="x", padx=16, pady=8)
             self._rows.append(row)
 
-        # Recent detections
-        self._flags = LogPanel(self, title="RECENT DETECTIONS")
-        self._flags.pack(fill="both", expand=True, padx=20, pady=(0, 14))
-        self._flag_seen = set()
+        # Per-host rollup. Supersedes the old recent-detections list: filtered
+        # to Flagged it shows the same thing, and the rest of the time it
+        # answers "what has this machine talked to, and what came back".
+        self._sites = SitesPanel(self)
+        self._sites.pack(fill="both", expand=True, padx=20, pady=(0, 14))
 
     def _apply_clicked(self):
         if self._on_apply_blocks:
@@ -727,14 +861,8 @@ class ScanPanel(ctk.CTkFrame):
         for row, st in zip(self._rows, statuses):
             row.update_status(st, self._detail_for(st, stats))
 
-        for flag in reversed(flags):
-            key = (flag["host"], flag["at"])
-            if key in self._flag_seen:
-                continue
-            self._flag_seen.add(key)
-            self._flags.log(
-                f"{flag['host']}  —  {flag['source']}: {flag['detail']}",
-                "error")
+    def upsert_site(self, record):
+        self._sites.upsert(record)
 
     @staticmethod
     def _detail_for(st, stats):
@@ -780,7 +908,7 @@ class ScanPanel(ctk.CTkFrame):
     def repaint_theme(self):
         for row in self._rows:
             row.repaint_theme()
-        self._flags.repaint_theme()
+        self._sites.repaint_theme()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1586,20 +1714,12 @@ class ProxyForceApp(ctk.CTk):
                   self._card_uptime):
             c.pack(side="left", fill="both", expand=True, padx=4)
 
-        # Sites — one row per host, replacing the dashboard's old copy of the
-        # event log. The log answers "what is the engine doing" and lives on the
-        # Log tab; the dashboard answers "what am I actually talking to", which
-        # is what the diagnostic chatter used to bury.
-        self._sites_panel = SitesPanel(parent, on_select=self._on_site_selected)
-        self._sites_panel.pack(fill="both", expand=True, padx=20, pady=(0, 4))
-
-        # One-line status strip: warnings and errors still need to reach the
-        # dashboard, they just no longer get a scrolling log to do it in.
-        self._dash_status_var = tk.StringVar(value="")
-        self._dash_status_lbl = ctk.CTkLabel(
-            parent, textvariable=self._dash_status_var, anchor="w",
-            font=ctk.CTkFont("Consolas", 10), text_color=THEME["muted"])
-        self._dash_status_lbl.pack(fill="x", padx=24, pady=(0, 12))
+        # Live connections. The dashboard's job is to show what is going out
+        # right now, in order, so anything odd stands out as it happens. The
+        # diagnostic chatter that used to share this panel lives on the Log tab
+        # only; the per-host reputation rollup lives on the Scanning tab.
+        self._conn_feed = ConnectionFeed(parent)
+        self._conn_feed.pack(fill="both", expand=True, padx=20, pady=(0, 14))
 
     # ── Scanning ──────────────────────────────────────────────────────────────
 
@@ -1777,7 +1897,7 @@ class ProxyForceApp(ctk.CTk):
                                                   on_state_change=on_state,
                                                   on_stats_update=on_stats,
                                                   on_log=on_log,
-                                                  on_host_seen=self._scanner.observe)
+                                                  on_host_seen=self._on_host_seen)
                 self._engine  = engine
                 engine.start()
             except Exception as e:
@@ -2094,17 +2214,13 @@ class ProxyForceApp(ctk.CTk):
     # ── Logging ───────────────────────────────────────────────────────────────
 
     def _log(self, msg: str, level: str = "info"):
-        """Everything goes to the Log tab. The dashboard used to mirror it, which
-        buried the connection lines under diagnostics — now only warnings and
-        errors surface there, on a single status line."""
+        """Diagnostics go to the Log tab and nowhere else.
+
+        The dashboard used to mirror this, which buried the connection lines it
+        exists to show. Nothing is lost — the Log tab keeps every line it always
+        did, and a detection still reaches the user through the live feed and a
+        tray notification."""
         self._full_log.log(msg, level)
-        if level in ("warning", "error"):
-            self._dash_status_var.set(msg)
-            self._dash_status_lbl.configure(
-                text_color=THEME["red" if level == "error" else "yellow"])
-        elif level == "success" and not self._dash_status_var.get():
-            self._dash_status_var.set(msg)
-            self._dash_status_lbl.configure(text_color=THEME["muted"])
 
     # ── State display ─────────────────────────────────────────────────────────
 
@@ -2181,7 +2297,7 @@ class ProxyForceApp(ctk.CTk):
             card.repaint_theme()
         # Log panels, sites table and the scanning view
         self._full_log.repaint_theme()
-        self._sites_panel.repaint_theme()
+        self._conn_feed.repaint_theme()
         self._scan_panel.repaint_theme()
         # Settings bypass text
         self._settings_panel.repaint_theme()
@@ -2288,9 +2404,35 @@ class ProxyForceApp(ctk.CTk):
 
     # ── Site reputation ───────────────────────────────────────────────────────
 
+    def _on_host_seen(self, host, port, route, conn_id):
+        """Every new connection, from the sing-box supervisor thread.
+
+        Two consumers: the scanner (deduplicated, one lookup per host) and the
+        dashboard feed (one line per connection, because the sequence is the
+        point). Must not raise — it runs inside the supervisor loop."""
+        try:
+            self._scanner.observe(host, port, route, conn_id)
+        except Exception:
+            pass
+        try:
+            self._queue.put(("conn", host, port, route))
+        except Exception:
+            pass
+
+    def _on_conn(self, host, port, route):
+        """Render one connection. Runs on the Tk thread via _poll_queue."""
+        verdict = self._scanner.verdict_for(host)
+        if verdict is not None:
+            status = verdict.status
+        elif self._scanner.is_pending(host):
+            status = "pending"
+        else:
+            status = ""
+        self._conn_feed.add(host, port, route, status)
+
     def _on_site_update(self, record):
-        """One host changed. Runs on the Tk thread via _poll_queue."""
-        self._sites_panel.upsert(record)
+        """One host's verdict changed. Runs on the Tk thread via _poll_queue."""
+        self._scan_panel.upsert_site(record)
         if record.status != rep.MALICIOUS:
             return
         if record.host in self._flagged_seen:
@@ -2304,6 +2446,9 @@ class ProxyForceApp(ctk.CTk):
         detail = verdict.detail if verdict else ""
         source = verdict.source if verdict else "scanner"
         self._log(f"⚠ {record.host} flagged by {source}: {detail}", "error")
+        # The verdict arrives seconds after the connection, by which point that
+        # line has scrolled on — so the detection gets its own entry in the feed.
+        self._conn_feed.alert(record.host, f"{source}: {detail}")
         self._notify_tray("ProxyForce blocked a site"
                           if load_config().get("rep_block")
                           else "ProxyForce flagged a site",
@@ -2368,21 +2513,9 @@ class ProxyForceApp(ctk.CTk):
         self._log("Applying block list — reconnecting…", "info")
         self._start_engine()
 
-    def _on_site_selected(self, record):
-        if record is None:
-            return
-        verdict = record.verdict
-        if verdict is not None and verdict.detail:
-            self._dash_status_var.set(f"{record.host} — {verdict.detail}")
-            self._dash_status_lbl.configure(
-                text_color=THEME["red" if verdict.status == rep.MALICIOUS
-                                 else "muted"])
-
     def _refresh_scan_view(self):
-        """Repaint the Scanning tab and the Sites 'last seen' column.
-
-        Only does the work when the relevant page is visible — this runs once a
-        second for the whole life of the process."""
+        """Repaint the Scanning tab once a second, and only while it is the
+        visible page — this loop runs for the whole life of the process."""
         try:
             if self._cur_page == "scan":
                 self._scan_panel.update_view(
@@ -2390,8 +2523,6 @@ class ProxyForceApp(ctk.CTk):
                     self._scanner.provider_status(),
                     self._scanner.stats(),
                     self._scanner.recent_flags())
-            elif self._cur_page == "dashboard":
-                self._sites_panel.tick()
         except Exception:
             pass
         if self._running:
@@ -2408,6 +2539,8 @@ class ProxyForceApp(ctk.CTk):
                     self._apply_state(item[1])
                 elif tag == "stats":
                     self._update_stats(item[1])
+                elif tag == "conn":
+                    self._on_conn(item[1], item[2], item[3])
                 elif tag == "site":
                     self._on_site_update(item[1])
                 elif tag == "tray_start":

@@ -122,14 +122,17 @@ def normalize_host(host) -> str:
     """
     if not host:
         return ""
-    host = str(host).strip().lower().rstrip(".")
+    host = str(host).strip().lower()
     if not host or " " in host:
         return ""
-    # Strip a :port and unwrap a bracketed IPv6 literal.
+    # Strip a :port and unwrap a bracketed IPv6 literal. This must happen
+    # BEFORE the trailing dot is removed: a rooted FQDN with a port reads
+    # "example.com.:443", where the dot is not at the end of the string.
     if host.startswith("["):
         host = host[1:].split("]", 1)[0]
     elif host.count(":") == 1:
         host = host.split(":", 1)[0]
+    host = host.rstrip(".")
     if not host:
         return ""
     try:
@@ -709,6 +712,23 @@ class ReputationScanner(object):
     def recent_flags(self) -> list:
         with self._lock:
             return list(self._flagged)
+
+    def verdict_for(self, host):
+        """The cached verdict for a host, or None if it has not been checked.
+        Cheap enough to call once per connection as the live feed renders."""
+        key = normalize_host(host) or str(host or "").strip().lower()
+        with self._lock:
+            verdict = self._cache.get(key)
+            if verdict is not None and not verdict.expired:
+                return verdict
+            if key in self._inflight:
+                return None
+            return None
+
+    def is_pending(self, host) -> bool:
+        key = normalize_host(host) or str(host or "").strip().lower()
+        with self._lock:
+            return key in self._inflight
 
     def sites(self):
         with self._lock:
