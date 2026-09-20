@@ -406,3 +406,87 @@ class NoProxyBypassConsistencyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+def _rendered(**kwargs):
+    cfg = ProxyConfig(host="203.0.113.10", port=800, **kwargs)
+    return SingBoxController(cfg)._render_config(12345)
+
+
+class ReputationBlocklistTests(unittest.TestCase):
+    """Hosts flagged by core/reputation are enforced in the RENDERED config, so
+    they survive a restart and apply to TUN-captured traffic that no Python code
+    ever sees. Two layers: an NXDOMAIN DNS rule so the name does not resolve, and
+    a route `reject` rule that is the actual enforcement."""
+
+    def test_empty_blocklist_adds_no_rules(self):
+        cfg = _rendered()
+        self.assertFalse([r for r in cfg["route"]["rules"]
+                          if r.get("action") == "reject" and "domain_suffix" in r])
+        self.assertFalse([r for r in cfg["dns"]["rules"]
+                          if r.get("rcode") == "NXDOMAIN"])
+
+    def test_blocklist_emits_reject_route_rule(self):
+        rules = _rendered(rep_blocklist=["evil.example"])["route"]["rules"]
+        match = [r for r in rules
+                 if r.get("action") == "reject" and "domain_suffix" in r]
+        self.assertEqual(len(match), 1)
+        self.assertEqual(match[0]["domain_suffix"], ["evil.example"])
+
+    def test_blocklist_emits_nxdomain_dns_rule(self):
+        rules = _rendered(rep_blocklist=["evil.example"])["dns"]["rules"]
+        match = [r for r in rules if r.get("rcode") == "NXDOMAIN"]
+        self.assertEqual(len(match), 1)
+        self.assertEqual(match[0]["domain_suffix"], ["evil.example"])
+
+    def test_nxdomain_rule_precedes_the_catch_all_fakeip_rule(self):
+        """The blanket A -> fakeip rule matches everything, so a block placed
+        after it would never be reached."""
+        rules = _rendered(rep_blocklist=["evil.example"])["dns"]["rules"]
+        block = next(i for i, r in enumerate(rules) if r.get("rcode") == "NXDOMAIN")
+        fakeip = next(i for i, r in enumerate(rules)
+                      if r.get("server") == "fakeip")
+        self.assertLess(block, fakeip)
+
+    def test_reject_rule_precedes_every_direct_rule(self):
+        """First match wins. A flagged host must not be rescued by also being in
+        the bypass list, or by landing in a private range."""
+        rules = _rendered(rep_blocklist=["evil.example"],
+                          bypass_list=["evil.example"])["route"]["rules"]
+        reject = next(i for i, r in enumerate(rules)
+                      if r.get("action") == "reject" and "domain_suffix" in r)
+        directs = [i for i, r in enumerate(rules)
+                   if r.get("outbound") == "direct"]
+        self.assertTrue(directs)
+        self.assertLess(reject, min(directs))
+
+    def test_reject_rule_precedes_the_port_80_override(self):
+        rules = _rendered(rep_blocklist=["evil.example"])["route"]["rules"]
+        reject = next(i for i, r in enumerate(rules)
+                      if r.get("action") == "reject" and "domain_suffix" in r)
+        port80 = next(i for i, r in enumerate(rules)
+                      if r.get("port") == 80 and "override_port" in r)
+        self.assertLess(reject, port80)
+
+    def test_allowlisted_host_is_not_blocked(self):
+        """A user who clears a false positive must not keep being blocked."""
+        cfg = _rendered(rep_blocklist=["ok.example", "evil.example"],
+                        rep_allowlist=["ok.example"])
+        match = [r for r in cfg["route"]["rules"]
+                 if r.get("action") == "reject" and "domain_suffix" in r]
+        self.assertEqual(match[0]["domain_suffix"], ["evil.example"])
+
+    def test_entries_are_normalized_and_deduplicated(self):
+        cfg = _rendered(rep_blocklist=["https://Evil.Example:443/path",
+                                       "evil.example", "  "])
+        match = [r for r in cfg["route"]["rules"]
+                 if r.get("action") == "reject" and "domain_suffix" in r]
+        self.assertEqual(match[0]["domain_suffix"], ["evil.example"])
+
+    def test_blocklist_is_apex_inclusive(self):
+        """domain_suffix without a leading dot matches the apex AND subdomains,
+        which is what blocking a malicious domain has to mean."""
+        cfg = _rendered(rep_blocklist=["evil.example"])
+        match = [r for r in cfg["route"]["rules"]
+                 if r.get("action") == "reject" and "domain_suffix" in r]
+        self.assertFalse(match[0]["domain_suffix"][0].startswith("."))

@@ -131,9 +131,14 @@ def run_selftest(logger):
         print("[FAIL] could not run sing-box:", e)
         sys.exit(3)
 
+    # The blocklist is included deliberately: it is the only thing that emits a
+    # `reject` route rule and an NXDOMAIN `predefined` DNS rule, and a schema
+    # mistake there would otherwise only surface the first time a user's scanner
+    # flagged something — i.e. at the worst possible moment.
     cfg      = ProxyConfig(host="203.0.113.10", port=800, auth_type="basic",
                            username="u", password="p",
-                           bypass_list=["10.0.0.0/8", "intranet.local"])
+                           bypass_list=["10.0.0.0/8", "intranet.local"],
+                           rep_blocklist=["evil.example", "phish.example"])
     data     = SingBoxController(cfg)._render_config(12345)
     cfg_path = os.path.join(get_data_dir(), "selftest_config.json")
     os.makedirs(get_data_dir(), exist_ok=True)

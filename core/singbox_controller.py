@@ -168,10 +168,18 @@ class ProxyConfig:
     log_level: str = "info"         # sing-box log verbosity (see _SINGBOX_LOG_LEVELS)
     ca_inject: bool = False         # trust the corporate TLS-inspection CA (core/env_certs)
     ca_cert_path: str = ""          # "" = the CA ProxyForce ships with
+    # Hosts flagged malicious by core/reputation. Rendered as route reject rules
+    # plus NXDOMAIN DNS rules, so a flagged host neither resolves nor connects.
+    rep_blocklist: list = None
+    rep_allowlist: list = None      # false-positive overrides; never blocked
 
     def __post_init__(self):
         if self.bypass_list is None:
             self.bypass_list = []
+        if self.rep_blocklist is None:
+            self.rep_blocklist = []
+        if self.rep_allowlist is None:
+            self.rep_allowlist = []
 
 
 @dataclass
@@ -475,6 +483,8 @@ def make_proxy_config(cfg: dict) -> "ProxyConfig":
         log_level=cfg.get("log_level", _DEFAULT_LOG_LEVEL),
         ca_inject=cfg.get("ca_inject", False),
         ca_cert_path=cfg.get("ca_cert_path", ""),
+        rep_blocklist=cfg.get("rep_blocklist", []),
+        rep_allowlist=cfg.get("rep_allowlist", []),
     )
 
 
@@ -482,11 +492,16 @@ class SingBoxController:
     """Runs and supervises sing-box; presents the Redirector interface."""
 
     def __init__(self, config: ProxyConfig, on_state_change: Callable = None,
-                 on_stats_update: Callable = None, on_log: Callable = None):
+                 on_stats_update: Callable = None, on_log: Callable = None,
+                 on_host_seen: Callable = None):
         self.config = config
         self.on_state_change = on_state_change
         self.on_stats_update = on_stats_update
         self.on_log = on_log
+        # Called once per NEW connection with (host, port, route_tag, conn_id).
+        # Feeds the Sites view and core/reputation. Must be cheap and must not
+        # raise — it runs on the supervisor thread between Clash API polls.
+        self.on_host_seen = on_host_seen
         self.state = SingBoxState.STOPPED
         self.stats = ConnectionStats()
 
@@ -550,6 +565,32 @@ class SingBoxController:
                 domains.append(base if apex_included else f".{base}")
         return cidrs, domains, warnings
 
+    def _normalized_blocklist(self) -> List[str]:
+        """Normalize cfg.rep_blocklist into sing-box `domain_suffix` entries.
+
+        Reuses normalize_bypass_entry so a flagged host is parsed exactly like a
+        bypass entry (scheme/port/path stripped, junk rejected). Unlike the
+        bypass list these are always apex-inclusive: blocking `evil.example`
+        must also block `cdn.evil.example`, and domain_suffix without a leading
+        dot does both. Entries the user has explicitly allowed are dropped.
+        """
+        allow = set()
+        for entry in (getattr(self.config, "rep_allowlist", None) or []):
+            base, _apex, err = normalize_bypass_entry(entry)
+            if not err and base:
+                allow.add(base)
+        out: List[str] = []
+        seen = set()
+        for entry in (self.config.rep_blocklist or []):
+            base, _apex, err = normalize_bypass_entry(entry)
+            if err or not base or "/" in base:
+                continue        # a CIDR is not a site; skip rather than guess
+            if base in allow or base in seen:
+                continue
+            seen.add(base)
+            out.append(base)
+        return out
+
     # ── config rendering ────────────────────────────────────────────────────────
 
     def _render_config(self, clash_port: int) -> dict:
@@ -557,6 +598,7 @@ class SingBoxController:
         sbdir = _singbox_dir()
 
         bypass_cidrs, bypass_domains, _bypass_warnings = self._normalized_bypass()
+        blocked_domains = self._normalized_blocklist()
 
         # ── DNS: EVERYTHING goes to fakeip, bypass domains included ──
         # Bypass domains deliberately do NOT get real resolution here. Keeping
@@ -590,8 +632,16 @@ class SingBoxController:
             # a fakeip reverse-map entry. Must precede the blanket A → fakeip rule.
             {"domain": [ncsi_probe_host], "query_type": ["A"], "action": "predefined",
              "answer": [f"{ncsi_probe_host}. IN A {ncsi_probe_content}"]},
-            {"query_type": ["A"], "server": "fakeip"},
         ]
+        # Flagged hosts fail to RESOLVE as well as failing to connect. The route
+        # reject rule below is the real enforcement; answering NXDOMAIN here just
+        # means the client gives up immediately with a name error instead of
+        # burning a connection attempt on a fakeip that will be rejected. Must
+        # precede the blanket A → fakeip rule, which matches everything.
+        if blocked_domains:
+            dns_rules.append({"domain_suffix": blocked_domains,
+                              "action": "predefined", "rcode": "NXDOMAIN"})
+        dns_rules.append({"query_type": ["A"], "server": "fakeip"})
 
         # ── route rules ──
         route_rules = [
@@ -605,6 +655,15 @@ class SingBoxController:
             {"network": "udp", "port": 53, "action": "hijack-dns"},
             {"network": "tcp", "port": 53, "action": "hijack-dns"},
         ]
+        # Hosts flagged by core/reputation. Placed immediately after the DNS
+        # hijack rules and BEFORE every direct/bypass rule below, so a flagged
+        # host cannot be rescued by sitting in the bypass list or in a private
+        # range — first match wins in sing-box, and a block should be the first
+        # thing that matches. `reject` is the same action already used for UDP
+        # at the end of this list.
+        if blocked_domains:
+            route_rules.append({"domain_suffix": blocked_domains,
+                                "action": "reject"})
         # Never route traffic destined to the proxy server itself back through the
         # proxy — send it DIRECT (covers raw-IP proxy hosts; prevents any loop).
         # Also cover the pre-resolved real IP when cfg.host is a hostname (resolved
@@ -1116,6 +1175,17 @@ class SingBoxController:
         except Exception:
             return None
 
+    def _clash_delete(self, path: str) -> bool:
+        """DELETE against the Clash API — used to close a live connection.
+        Same loopback-only opener as _clash_get, for the same reason."""
+        try:
+            url = f"http://127.0.0.1:{self._clash_port}{path}"
+            req = urllib.request.Request(url, method="DELETE")
+            with _LOOPBACK_OPENER.open(req, timeout=2):
+                return True
+        except Exception:
+            return False
+
     _CONN_TRACE_CAP = 8   # max connection lines logged per 2s poll (anti-flood)
 
     def _poll_stats(self):
@@ -1135,8 +1205,14 @@ class SingBoxController:
             active_ids.add(cid)
             if cid not in self._seen_conn_ids:
                 new.append(c)
-        if self._trace_conns and new:
-            self._emit_conn_trace(new)
+        if new:
+            # Report EVERY new connection to the host observer before tracing.
+            # _emit_conn_trace caps itself at _CONN_TRACE_CAP lines per tick to
+            # keep the log readable; that cap must not silently drop hosts from
+            # the Sites view or leave a flagged host unscanned.
+            self._emit_host_seen(new)
+            if self._trace_conns:
+                self._emit_conn_trace(new)
         # Bound _seen_conn_ids to the currently-active ids (Clash ids are unique per
         # connection and never reused, so dropping closed ones is safe and keeps the
         # set from growing without limit on long runs); track the lifetime total in a
@@ -1149,6 +1225,56 @@ class SingBoxController:
         self.stats.bytes_forwarded = down + up
         if self.on_stats_update:
             self.on_stats_update(self.stats)
+
+    @staticmethod
+    def _conn_route_tag(c: dict) -> str:
+        chains = c.get("chains") or []
+        if "proxy-out" in chains:
+            return "proxy"
+        if "direct" in chains:
+            return "direct"
+        return (chains[0] if chains else (c.get("rule") or "?"))
+
+    def _emit_host_seen(self, new: list):
+        """Hand every new connection's destination host to the observer.
+
+        Uncapped and best-effort: an exception from the observer must never take
+        down the supervisor loop that also enforces capture routes."""
+        if not self.on_host_seen:
+            return
+        for c in new:
+            try:
+                md = c.get("metadata") or {}
+                host = md.get("host") or md.get("destinationIP") or ""
+                if not host:
+                    continue
+                self.on_host_seen(host, md.get("destinationPort"),
+                                  self._conn_route_tag(c), c.get("id"))
+            except Exception:
+                continue
+
+    def close_connections_to(self, host: str) -> int:
+        """Close every live connection whose destination is `host`. Returns how
+        many were closed.
+
+        Used when a verdict arrives for a site that is already open: the reject
+        route rule only applies from the next engine start, so without this a
+        flagged host stays connected until the user restarts."""
+        data = self._clash_get("/connections")
+        if not data:
+            return 0
+        target = str(host or "").strip().lower().rstrip(".")
+        closed = 0
+        for c in (data.get("connections") or []):
+            md = c.get("metadata") or {}
+            dest = str(md.get("host") or "").strip().lower().rstrip(".")
+            cid = c.get("id")
+            if not cid or not dest:
+                continue
+            if dest == target or dest.endswith("." + target):
+                if self._clash_delete(f"/connections/{cid}"):
+                    closed += 1
+        return closed
 
     def _emit_conn_trace(self, new: list):
         """Log each newly-established connection to the GUI: host:port → outbound.
