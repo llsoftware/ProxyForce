@@ -476,6 +476,23 @@ class ReputationBlocklistTests(unittest.TestCase):
                  if r.get("action") == "reject" and "domain_suffix" in r]
         self.assertEqual(match[0]["domain_suffix"], ["evil.example"])
 
+    def test_allowlisting_a_domain_unblocks_its_subdomains(self):
+        """The block reaches subdomains, so the override has to: clearing
+        "example.com" and staying blocked on "www.example.com" would look to the
+        user exactly like the override not working."""
+        cfg = _rendered(rep_blocklist=["www.ok.example", "evil.example"],
+                        rep_allowlist=["ok.example"])
+        match = [r for r in cfg["route"]["rules"]
+                 if r.get("action") == "reject" and "domain_suffix" in r]
+        self.assertEqual(match[0]["domain_suffix"], ["evil.example"])
+
+    def test_allowlisting_does_not_unblock_a_lookalike_domain(self):
+        cfg = _rendered(rep_blocklist=["notok.example"],
+                        rep_allowlist=["ok.example"])
+        match = [r for r in cfg["route"]["rules"]
+                 if r.get("action") == "reject" and "domain_suffix" in r]
+        self.assertEqual(match[0]["domain_suffix"], ["notok.example"])
+
     def test_entries_are_normalized_and_deduplicated(self):
         cfg = _rendered(rep_blocklist=["https://Evil.Example:443/path",
                                        "evil.example", "  "])

@@ -18,6 +18,15 @@ Only things that are not hostnames are skipped: raw IPs, loopback, private
 ranges, and sing-box's fakeip range (a fakeip address is an internal placeholder,
 never a real destination).
 
+...and one thing the user skips: a host listed in cfg["rep_allowlist"]. Providers
+get false positives — a household-name domain turns up on a feed for an hour —
+and the person at the keyboard is often the one who can tell. Overriding a
+verdict therefore does BOTH halves of the job: the host is never blocked, and it
+is never looked up again, because clearing a flag only to have the next scan
+re-raise it would not be an override at all. The list is the source of truth, so
+deleting an entry puts the host straight back under the scanner. Matching is by
+suffix, the same reach a block has (see host_matches).
+
 HTTPS is covered. sing-box hijacks DNS to fakeip, so it knows the destination
 hostname for every connection including HTTPS, and the Clash API reports it.
 What is NOT visible for HTTPS is the URL path, because ProxyForce never
@@ -60,6 +69,11 @@ CLEAN = "clean"
 MALICIOUS = "malicious"
 UNKNOWN = "unknown"
 ERROR = "error"
+# Not a provider verdict: the user looked at a flag and overrode it. It lives in
+# cfg["rep_allowlist"], never on disk in the verdict cache — the list is the one
+# record of the decision, so removing an entry restores scanning immediately
+# instead of waiting for a cached override to lapse.
+ALLOWED = "allowed"
 
 # Cache lifetimes, in seconds. Module-level so tests can shrink them, matching
 # the convention at core/updater.py:_HEALTH_INTERVAL.
@@ -172,6 +186,59 @@ def normalize_host(host) -> str:
     return host
 
 
+def host_matches(host, entry) -> bool:
+    """True when `host` IS `entry` or a subdomain of it.
+
+    Suffix matching, because that is the reach a block has: a flag on
+    `evil.example` also blocks `cdn.evil.example` (sing-box `domain_suffix`,
+    see SingBoxController._normalized_blocklist). An override that matched
+    exactly would therefore clear the flag and leave the user blocked on every
+    subdomain of it — the same breakage, one level down.
+    """
+    host = str(host or "").strip().lower().rstrip(".")
+    entry = str(entry or "").strip().lower().rstrip(".")
+    if not host or not entry:
+        return False
+    return host == entry or host.endswith("." + entry)
+
+
+def normalize_override(entry) -> str:
+    """Tidy one rep_allowlist line into a bare lowercase hostname, or "".
+
+    Entries are already normalized where they are written — both the Sites
+    context menu and the Settings box run them through
+    core.singbox_controller.normalize_bypass_entry, the same parser the engine
+    uses to decide what it will refuse to block, so the two can never disagree
+    about what an entry means. This is the defensive pass for a config edited by
+    hand or carried over from an older build.
+    """
+    raw = str(entry or "").strip().lower()
+    if raw.startswith("*."):
+        raw = raw[2:]
+    raw = raw.lstrip(".")
+    if not raw or "/" in raw:
+        return ""
+    return normalize_host(raw)
+
+
+def allowlist_match(host, entries) -> str:
+    """The allowlist entry covering `host`, or "".
+
+    Returns the entry rather than a bool because a subdomain needs to be able to
+    say WHICH override is keeping it clear — "allowed by you" on a row nobody
+    remembers clearing is exactly the kind of unexplained state this feature
+    exists to remove.
+    """
+    host = str(host or "").strip().lower().rstrip(".")
+    if not host:
+        return ""
+    for raw in (entries or []):
+        entry = normalize_override(raw)
+        if entry and host_matches(host, entry):
+            return entry
+    return ""
+
+
 def _is_unscannable_ip(host) -> bool:
     """True for addresses that should not even appear in the Sites list."""
     try:
@@ -260,6 +327,11 @@ class SiteRecord(object):
         if self.verdict is not None:
             return self.verdict.status
         return "pending" if self.pending else ""
+
+    @property
+    def overridden(self) -> bool:
+        """True when the user cleared this host's verdict by hand."""
+        return self.status == ALLOWED
 
     @property
     def checks(self) -> dict:
@@ -426,6 +498,14 @@ class ReputationScanner(object):
             return False
         if not normalize_host(key):
             return False
+        entry = allowlist_match(key, cfg.get("rep_allowlist"))
+        if entry:
+            # Checked ahead of the cache so an entry added by hand in Settings
+            # takes effect on the very next connection, without waiting for a
+            # cached verdict to lapse.
+            if record.status != ALLOWED:
+                self._allow(key, record, entry)
+            return False
         if key in self._inflight:
             return False
         cached = self._cache.get(key)
@@ -441,6 +521,100 @@ class ReputationScanner(object):
         record.pending = True
         self._pending.append(key)
         return True
+
+    def _allow(self, key, record, entry):
+        """Put a host into the overridden state and take it out of the queues.
+        Caller holds the lock.
+
+        The verdict is kept in the cache (so the dashboard feed can label a live
+        connection, and so a host nobody is looking at still skips its lookup)
+        but never written to disk — see _save_cache."""
+        detail = ("cleared by you" if entry == key
+                  else f"cleared by you (override on {entry})")
+        verdict = Verdict(key, ALLOWED, "you", detail, expires_at=float("inf"))
+        prior = self._cache.get(key)
+        if prior is not None and prior.checks:
+            # What the providers said is still worth showing: an override is the
+            # user disagreeing with a verdict, not a claim nobody ever looked.
+            verdict.checks = dict(prior.checks)
+        self._cache[key] = verdict
+        self._inflight.discard(key)
+        if record is not None:
+            record.verdict = verdict
+            record.pending = False
+
+    def set_override(self, host, allowed=True):
+        """Apply or lift a user override, for `host` and everything under it.
+
+        The override itself lives in cfg["rep_allowlist"] and is the caller's to
+        persist; this brings the scanner's own state into line with it in one
+        step, so the Sites table does not sit on a stale verdict until the host
+        is visited again. Lifting one re-queues the host rather than blanking
+        it: the user asked for a real answer back."""
+        key = normalize_override(host)
+        if not key:
+            return
+        queued = False
+        touched = []
+        with self._lock:
+            targets = {h for h in self._cache if host_matches(h, key)}
+            targets |= {h for h in self._sites if host_matches(h, key)}
+            targets.add(key)
+            for h in sorted(targets):
+                record = self._sites.get(h)
+                if allowed:
+                    self._vt_done.discard(h)
+                    self._allow(h, record, key)
+                else:
+                    cached = self._cache.get(h)
+                    if cached is not None and cached.status == ALLOWED:
+                        self._cache.pop(h, None)
+                    if record is not None:
+                        record.verdict = None
+                        record.pending = False
+                        if self._consider(h, record):
+                            queued = True
+                if record is not None:
+                    touched.append(record)
+            self._cache_dirty = True
+        for record in touched:
+            self._emit(record)
+        if queued:
+            self._wake.set()
+
+    def note_blocked(self, hosts):
+        """Put the hosts the block list already carries into the Sites table.
+
+        A blocked host stops connecting — DNS answers NXDOMAIN and the route
+        rejects — so after a restart the one row a user needs in order to clear
+        a wrong verdict is the one row that never appears again. Seeding from
+        the list itself means every block is right-clickable on the tab where
+        overriding lives, not just the ones flagged since the app started.
+
+        last_seen stays 0 ("never"), because it has not been seen: this says
+        what is blocked, it does not invent traffic."""
+        touched = []
+        with self._lock:
+            for raw in (hosts or []):
+                key = normalize_override(raw)
+                if not key or key in self._sites:
+                    continue
+                record = SiteRecord(key)
+                record.first_seen = record.last_seen = 0.0
+                record.route = "blocked"
+                verdict = self._cache.get(key)
+                if verdict is None or verdict.expired:
+                    # The verdict that put it on the list has aged out of the
+                    # cache; the list itself is what is left of it, and it is
+                    # honest about being that rather than naming a source.
+                    verdict = Verdict(key, MALICIOUS, "block list",
+                                      "blocked in an earlier session")
+                record.verdict = verdict
+                self._sites[key] = record
+                touched.append(record)
+        for record in touched:
+            self._emit(record)
+        return [r.host for r in touched]
 
     def _cfg(self) -> dict:
         try:
@@ -487,7 +661,12 @@ class ReputationScanner(object):
         with self._lock:
             batch = []
             while self._pending and len(batch) < _BATCH_SIZE:
-                batch.append(self._pending.popleft())
+                host = self._pending.popleft()
+                # An override can lift a host out of _inflight after it was
+                # queued. _inflight is the authority, so drop it here rather
+                # than spending a provider call on an answer nobody wants.
+                if host in self._inflight:
+                    batch.append(host)
             return batch
 
     def _requeue(self, hosts):
@@ -635,6 +814,9 @@ class ReputationScanner(object):
         with self._lock:
             while self._vt_backlog:
                 host = self._vt_backlog.popleft()
+                cached = self._cache.get(host)
+                if cached is not None and cached.status == ALLOWED:
+                    continue    # overridden since it queued; 500/day is scarce
                 if host not in self._vt_done:
                     return host
             return None
@@ -699,6 +881,13 @@ class ReputationScanner(object):
     def _record(self, host, verdict):
         with self._lock:
             prior = self._cache.get(host)
+            if (prior is not None and prior.status == ALLOWED
+                    and verdict.status != ALLOWED):
+                # Overridden while this lookup was in flight. The override wins:
+                # clearing a false positive is worth nothing if the verdict
+                # already on its way quietly puts it back.
+                self._inflight.discard(host)
+                return
             if prior is not None and prior.checks:
                 # Keep the marks the earlier tiers earned: this verdict may be
                 # VirusTotal's, arriving minutes after the rest.
@@ -882,6 +1071,7 @@ class ReputationScanner(object):
         with self._lock:
             known_good = sum(1 for v in self._cache.values() if v.status == CLEAN)
             flagged = sum(1 for v in self._cache.values() if v.status == MALICIOUS)
+            allowed = sum(1 for v in self._cache.values() if v.status == ALLOWED)
             unknown = sum(1 for v in self._cache.values()
                           if v.status in (UNKNOWN, ERROR))
             unscanned = sum(1 for r in self._sites.values()
@@ -890,7 +1080,7 @@ class ReputationScanner(object):
             gsb_quota = self._quota_view("gsb", _GSB_DAILY_CAP)
             used = vt_quota["used"]
             return {"sites": len(self._sites), "known_good": known_good,
-                    "flagged": flagged, "unknown": unknown,
+                    "flagged": flagged, "allowed": allowed, "unknown": unknown,
                     "unscanned": unscanned, "queued": len(self._pending),
                     "inflight": len(self._inflight),
                     "vt_queued": len(self._vt_backlog), "vt_used_today": used,
@@ -919,7 +1109,11 @@ class ReputationScanner(object):
             if not (self._cache_dirty or force):
                 return
             now = time.time()
-            items = [(h, v) for h, v in self._cache.items() if v.expires_at > now]
+            # ALLOWED is deliberately excluded: cfg["rep_allowlist"] is the only
+            # record of an override, so deleting an entry there has to be enough
+            # to put the host back under the scanner on the next start.
+            items = [(h, v) for h, v in self._cache.items()
+                     if v.expires_at > now and v.status != ALLOWED]
             if len(items) > _MAX_CACHE_ENTRIES:
                 items.sort(key=lambda kv: kv[1].checked_at, reverse=True)
                 items = items[:_MAX_CACHE_ENTRIES]

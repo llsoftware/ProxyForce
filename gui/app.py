@@ -227,8 +227,8 @@ class _CountStrip(ctk.CTkFrame):
     """The same counters a row of StatCards would show, on one line.
 
     The Scanning tab exists for the table at the bottom of it; these numbers
-    are a header for that table, and four 70-pixel cards cost more rows than
-    they are worth once the page also carries the per-source panel."""
+    are a header for that table, and a row of 70-pixel cards costs more height
+    than it is worth once the page also carries the per-source panel."""
 
     def __init__(self, parent, cells, **kwargs):
         super().__init__(parent, fg_color="transparent", **kwargs)
@@ -368,7 +368,10 @@ _REP_UI = {
     "pending":     ("… checking", "accent", 2),
     rep.UNKNOWN:   ("? unknown",      "muted",  3),
     rep.CLEAN:     ("✓ clean",   "green",  4),
-    "":            ("—",         "muted",  5),
+    # Your decision, not a provider's — and it reads as one, so a row nobody
+    # remembers clearing can be traced back to a person rather than a source.
+    rep.ALLOWED:   ("★ allowed",  "accent", 5),
+    "":            ("—",         "muted",  6),
 }
 
 
@@ -453,6 +456,7 @@ class ConnectionFeed(ctk.CTkFrame):
         self._text.tag_config("other", foreground=cc("muted"))
         self._text.tag_config("clean", foreground=cc("muted"))
         self._text.tag_config("pending", foreground=cc("accent"))
+        self._text.tag_config("allow", foreground=cc("accent"))
         self._text.tag_config("bad", foreground=cc("red"))
         self._text.tag_config("alert", foreground=cc("red"))
 
@@ -474,6 +478,7 @@ class ConnectionFeed(ctk.CTkFrame):
         glyph, rep_tag = {
             rep.MALICIOUS: ("⚠ FLAGGED", "bad"),
             rep.CLEAN:     ("✓", "clean"),
+            rep.ALLOWED:   ("★ allowed", "allow"),
             "pending":     ("…", "pending"),
         }.get(status, ("", "other"))
 
@@ -532,10 +537,12 @@ class SitesPanel(ctk.CTkFrame):
 
     _MAX_ROWS = 600     # bound the widget on long sessions; oldest rows evicted
 
-    def __init__(self, parent, on_select=None, on_expand=None, **kwargs):
+    def __init__(self, parent, on_select=None, on_expand=None,
+                 on_override=None, **kwargs):
         super().__init__(parent, fg_color=THEME["card"], corner_radius=10,
                          border_width=1, border_color=THEME["border"], **kwargs)
         self._on_select = on_select
+        self._on_override = on_override
         self._rows = {}         # host -> last rendered tuple, for change detection
         self._expand_lbl = None
 
@@ -569,7 +576,8 @@ class SitesPanel(ctk.CTkFrame):
 
         self._filter_var = tk.StringVar(value="All")
         ctk.CTkSegmentedButton(
-            hdr, values=["All", "Flagged", "Direct"], variable=self._filter_var,
+            hdr, values=["All", "Flagged", "Allowed", "Direct"],
+            variable=self._filter_var,
             command=lambda _v: self.refilter(),
             font=ctk.CTkFont("Segoe UI", 10),
             fg_color=THEME["input_bg"], selected_color=THEME["accent_dk"],
@@ -586,6 +594,16 @@ class SitesPanel(ctk.CTkFrame):
                      font=ctk.CTkFont("Consolas", 9),
                      text_color=THEME["muted"]).pack(fill="x", padx=14,
                                                      pady=(0, 4))
+
+        # A wrong verdict is only fixable if the fix is findable. The one place
+        # a user looks after being blocked is the row that blocked them.
+        if on_override is not None:
+            ctk.CTkLabel(self, anchor="w",
+                         text="Right-click a site to clear a wrong verdict, "
+                              "or to put a cleared one back under the scanner.",
+                         font=ctk.CTkFont("Consolas", 9),
+                         text_color=THEME["muted"]).pack(fill="x", padx=14,
+                                                         pady=(0, 4))
 
         self._wrap = tk.Frame(self, bg=cc("input_bg"))
         self._wrap.pack(fill="both", expand=True, padx=14, pady=(0, 14))
@@ -617,6 +635,12 @@ class SitesPanel(ctk.CTkFrame):
         self._sb.pack(side="right", fill="y")
         self._tree.pack(fill="both", expand=True)
         self._tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+
+        self._menu = tk.Menu(self, tearoff=0)
+        # Button-3 everywhere; Button-2 as well, because a three-button mouse is
+        # not a given on the laptops this runs on.
+        for seq in ("<Button-3>", "<Button-2>"):
+            self._tree.bind(seq, self._popup)
 
         self._sort_key = "seen"
         self._records = {}      # host -> SiteRecord
@@ -654,7 +678,36 @@ class SitesPanel(ctk.CTkFrame):
     @staticmethod
     def _tag_for(record):
         return {rep.MALICIOUS: "bad", rep.CLEAN: "good",
-                rep.ERROR: "warn"}.get(record.status, "plain")
+                rep.ALLOWED: "allow", rep.ERROR: "warn"}.get(record.status,
+                                                             "plain")
+
+    # ── the override menu ────────────────────────────────────────────────────
+    def _popup(self, event):
+        """Offer the one action this table can take on a row. Built per click
+        rather than once, because which way the override goes depends on the
+        row that was hit."""
+        if self._on_override is None:
+            return
+        iid = self._tree.identify_row(event.y)
+        if not iid:
+            return
+        record = self._records.get(iid)
+        if record is None:
+            return
+        self._tree.selection_set(iid)
+        self._menu.delete(0, "end")
+        if record.status == rep.ALLOWED:
+            self._menu.add_command(
+                label=f"Scan {iid} again  (remove your override)",
+                command=lambda h=iid: self._on_override(h, False))
+        else:
+            self._menu.add_command(
+                label=f"Allow {iid}  —  wrong verdict, never block or scan it",
+                command=lambda h=iid: self._on_override(h, True))
+        try:
+            self._menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self._menu.grab_release()
 
     def _summary(self):
         total = len(self._records)
@@ -680,6 +733,8 @@ class SitesPanel(ctk.CTkFrame):
         mode = self._filter_var.get()
         if mode == "Flagged":
             return record.status == rep.MALICIOUS
+        if mode == "Allowed":
+            return record.status == rep.ALLOWED
         if mode == "Direct":
             return record.route == "direct"
         return True
@@ -780,9 +835,13 @@ class SitesPanel(ctk.CTkFrame):
                         foreground=[("selected", txt)])
         self._tree.tag_configure("bad", foreground=cc("red"))
         self._tree.tag_configure("good", foreground=cc("green"))
+        self._tree.tag_configure("allow", foreground=cc("accent"))
         self._tree.tag_configure("warn", foreground=cc("yellow"))
         self._tree.tag_configure("plain", foreground=txt)
         self._sb.configure(bg=border, troughcolor=ib, activebackground=cc("muted"))
+        self._menu.configure(bg=cc("card2"), fg=txt, activebackground=cc("accent_dk"),
+                             activeforeground=txt, borderwidth=0,
+                             activeborderwidth=0, font=("Segoe UI", 9))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -935,7 +994,7 @@ class ScanPanel(ctk.CTkFrame):
     _TOP_MIN = 80       # floor for the summary pane; EXPAND aims at the hero
     _SITES_MIN = 120
 
-    def __init__(self, parent, on_apply_blocks=None, **kwargs):
+    def __init__(self, parent, on_apply_blocks=None, on_override=None, **kwargs):
         super().__init__(parent, fg_color=THEME["bg"], corner_radius=0, **kwargs)
         self._on_apply_blocks = on_apply_blocks
         self._expanded = False
@@ -970,16 +1029,17 @@ class ScanPanel(ctk.CTkFrame):
                      text_color=THEME["muted"]).pack(anchor="w", pady=(2, 0))
 
         self._apply_btn = ctk.CTkButton(
-            inner, text="APPLY BLOCKS NOW", width=170, height=30,
+            inner, text="APPLY RULE CHANGES NOW", width=210, height=30,
             font=ctk.CTkFont("Segoe UI", 11, weight="bold"),
             fg_color=THEME["stop_bg"], hover_color=THEME["stop_hov"],
             command=self._apply_clicked)
-        # Only shown when blocks are pending — see set_pending_blocks.
+        # Only shown when changes are pending — see set_pending_rules.
 
         # Coverage counters
         self._counts = _CountStrip(self._top, (
             ("sites", "sites seen"), ("good", "known good"),
-            ("bad", "flagged"), ("queue", "queued")))
+            ("bad", "flagged"), ("allowed", "overrides"),
+            ("queue", "queued")))
         self._counts.pack(fill="x", padx=24, pady=(0, 10))
 
         # Providers
@@ -1006,7 +1066,8 @@ class ScanPanel(ctk.CTkFrame):
         # Per-host rollup. Supersedes the old recent-detections list: filtered
         # to Flagged it shows the same thing, and the rest of the time it
         # answers "what has this machine talked to, and what came back".
-        self._sites = SitesPanel(self._bottom, on_expand=self.toggle_expand)
+        self._sites = SitesPanel(self._bottom, on_expand=self.toggle_expand,
+                                 on_override=on_override)
         self._sites.pack(fill="both", expand=True, padx=20, pady=(0, 12))
 
         # The summary keeps its natural height; everything the window has spare,
@@ -1042,10 +1103,13 @@ class ScanPanel(ctk.CTkFrame):
         if self._on_apply_blocks:
             self._on_apply_blocks()
 
-    def set_pending_blocks(self, count: int):
+    def set_pending_rules(self, count: int):
+        """Blocks added AND overrides cleared both wait on the same restart, so
+        the button counts rule changes rather than blocks — an unblock the user
+        has asked for must not hide behind a label that says BLOCKS."""
         if count > 0:
             self._apply_btn.configure(
-                text=f"APPLY {count} BLOCK{'S' if count != 1 else ''} NOW")
+                text=f"APPLY {count} RULE CHANGE{'S' if count != 1 else ''} NOW")
             self._apply_btn.pack(anchor="w", pady=(12, 0))
         else:
             self._apply_btn.pack_forget()
@@ -1074,6 +1138,9 @@ class ScanPanel(ctk.CTkFrame):
         # the counters should be readable at a glance from across a desk.
         self._counts.set("bad", f"{stats['flagged']:,}",
                          "red" if stats["flagged"] else "muted")
+        allowed = stats.get("allowed", 0)
+        self._counts.set("allowed", f"{allowed:,}",
+                         "accent" if allowed else "muted")
         queued = stats["queued"] + stats["inflight"]
         self._counts.set("queue", f"{queued:,}",
                          "yellow" if queued else "muted")
@@ -1149,7 +1216,9 @@ class ScanPanel(ctk.CTkFrame):
 # ─────────────────────────────────────────────────────────────────────────────
 # Config keys the panel must carry through a load/save round trip even though
 # no widget edits them — they are maintained by the scanner at runtime.
-_PASSTHROUGH_KEYS = ("rep_blocklist", "rep_allowlist")
+# rep_allowlist is NOT one of them: it is the user's own list of overrides, and
+# a list you cannot see or edit is not an override mechanism.
+_PASSTHROUGH_KEYS = ("rep_blocklist",)
 
 
 class SettingsPanel(ctk.CTkScrollableFrame):
@@ -1161,6 +1230,8 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         self._vars         = {}
         self._bypass_frame = None
         self._bypass_text  = None
+        self._allow_frame  = None
+        self._allow_text   = None
         self._passthrough  = {k: [] for k in _PASSTHROUGH_KEYS}
         self._build()
 
@@ -1300,6 +1371,19 @@ class SettingsPanel(ctk.CTkScrollableFrame):
                        "background rather than checking sites as you visit them.")
         self._entry(s3c, "rep_vt_key", show="●",
                     placeholder="(no key — VirusTotal disabled)")
+        self._lbl(s3c, "Allowed sites  —  one hostname per line. A site listed "
+                       "here is never blocked and never scanned again, so this "
+                       "is where a wrong verdict goes. Covers subdomains too. "
+                       "Right-click a row on the Scanning tab to add one; "
+                       "delete the line to put the site back under the scanner.")
+        self._allow_frame = tk.Frame(s3c, bg=cc("input_bg"))
+        self._allow_frame.pack(fill="x", pady=(0, 4))
+        self._allow_text = tk.Text(
+            self._allow_frame, bg=cc("input_bg"), fg=cc("text"),
+            insertbackground=cc("accent"), selectbackground=cc("border"),
+            relief="flat", font=("Consolas", 10), height=4, padx=10, pady=8)
+        self._allow_text.pack(fill="x")
+
         self._rep_status_lbl = ctk.CTkLabel(
             s3c, text="", justify="left", wraplength=260, anchor="w",
             font=ctk.CTkFont("Segoe UI", 10), text_color=THEME["yellow"])
@@ -1399,6 +1483,34 @@ class SettingsPanel(ctk.CTkScrollableFrame):
             self._bypass_text.delete("1.0", "end")
             self._bypass_text.insert("1.0", "\n".join(normalized))
         d["bypass_list"] = normalized
+
+        # Overrides go through the SAME parser as a bypass entry, which is also
+        # the one the engine uses to decide what it will refuse to block — so
+        # what is typed here, what the scanner skips and what the reject rules
+        # leave out can never drift apart on syntax. Always apex-inclusive: an
+        # override means this site and everything under it.
+        raw = self._allow_text.get("1.0", "end").strip() if self._allow_text else ""
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        allowed, seen = [], set()
+        self._allow_warnings = []
+        for line in lines:
+            base, _apex, err = normalize_bypass_entry(line)
+            if err or not base:
+                if err:
+                    self._allow_warnings.append(err.replace("bypass entry",
+                                                            "allowed site"))
+                continue
+            if "/" in base:
+                self._allow_warnings.append(
+                    f"allowed site ignored (a CIDR is not a site): {line!r}")
+                continue
+            if base not in seen:
+                seen.add(base)
+                allowed.append(base)
+        if self._allow_text and allowed != lines:
+            self._allow_text.delete("1.0", "end")
+            self._allow_text.insert("1.0", "\n".join(allowed))
+        d["rep_allowlist"] = allowed
         return d
 
     def set_values(self, d: dict):
@@ -1428,6 +1540,9 @@ class SettingsPanel(ctk.CTkScrollableFrame):
         if "bypass_list" in d and self._bypass_text:
             self._bypass_text.delete("1.0", "end")
             self._bypass_text.insert("1.0", "\n".join(d["bypass_list"]))
+        if "rep_allowlist" in d and self._allow_text:
+            self._allow_text.delete("1.0", "end")
+            self._allow_text.insert("1.0", "\n".join(d["rep_allowlist"] or []))
         for k in _PASSTHROUGH_KEYS:
             if k in d:
                 self._passthrough[k] = d[k]
@@ -1534,6 +1649,12 @@ class SettingsPanel(ctk.CTkScrollableFrame):
             self._bypass_text.configure(bg=ib, fg=cc("text"),
                                         insertbackground=cc("accent"),
                                         selectbackground=cc("border"))
+        if self._allow_frame:
+            self._allow_frame.configure(bg=ib)
+        if self._allow_text:
+            self._allow_text.configure(bg=ib, fg=cc("text"),
+                                       insertbackground=cc("accent"),
+                                       selectbackground=cc("border"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1594,7 +1715,7 @@ class ProxyForceApp(ctk.CTk):
             on_update=lambda record: self._queue.put(("site", record)),
             on_log=lambda m, l: self._queue.put(("log", m, l)))
         self._scanner.start()
-        self._pending_blocks = 0
+        self._pending_rules = 0      # staged block/unblock changes, see _apply_blocks
         self._flagged_seen = set()   # hosts already alerted on, this session
         self._rep_last_scan_on = bool(load_config().get("rep_scan"))
 
@@ -1961,7 +2082,8 @@ class ProxyForceApp(ctk.CTk):
     # ── Scanning ──────────────────────────────────────────────────────────────
 
     def _build_scan(self, parent):
-        self._scan_panel = ScanPanel(parent, on_apply_blocks=self._apply_blocks)
+        self._scan_panel = ScanPanel(parent, on_apply_blocks=self._apply_blocks,
+                                     on_override=self._override_site)
         self._scan_panel.pack(fill="both", expand=True)
 
     # ── Settings ──────────────────────────────────────────────────────────────
@@ -2019,6 +2141,18 @@ class ProxyForceApp(ctk.CTk):
         self._theme_var.set(mode_label)
         for w in auth_config_warnings(cfg):
             self._log(w, "warning")
+
+        # Show what is already blocked, on the tab where it can be cleared. The
+        # alert is suppressed for these: they were alerted on when they were
+        # flagged, and a tray notification per blocked host at every launch
+        # would be noise rather than news.
+        blocked = self._scanner.note_blocked(cfg.get("rep_blocklist"))
+        self._flagged_seen.update(blocked)
+        if blocked:
+            self._log(f"{len(blocked)} site(s) are blocked. Scanning tab → "
+                      f"right-click a row to clear one you believe is wrong.",
+                      "warning")
+
         if consume_legacy_auto_bypass_flag() and cfg.get("bypass_list"):
             self._log("Automatic bypass discovery has been removed. Review "
                       "Settings ▸ Bypass List and delete any entries you did not "
@@ -2026,8 +2160,16 @@ class ProxyForceApp(ctk.CTk):
                       "their own.", "warning")
 
     def _save_config(self):
+        # Normalized both sides: get_values() rewrites what was typed, and a
+        # stored entry that only differs in case would otherwise read as one
+        # override deleted and another added.
+        prev_allow = {rep.normalize_override(a)
+                      for a in (load_config().get("rep_allowlist") or [])}
+        prev_allow.discard("")
         vals = self._settings_panel.get_values()
         for w in getattr(self._settings_panel, "_bypass_warnings", []):
+            self._log(w, "warning")
+        for w in getattr(self._settings_panel, "_allow_warnings", []):
             self._log(w, "warning")
         for w in auth_config_warnings(vals):
             self._log(w, "warning")
@@ -2057,6 +2199,19 @@ class ProxyForceApp(ctk.CTk):
                       "info")
         self._rep_last_scan_on = scan_on
 
+        # An override deleted by hand here has to put the host back under the
+        # scanner, exactly as removing it from the Scanning tab would — the two
+        # routes to the same list must not behave differently.
+        now_allow = {rep.normalize_override(a)
+                     for a in (vals.get("rep_allowlist") or [])}
+        now_allow.discard("")
+        for host in sorted(prev_allow - now_allow):
+            self._scanner.set_override(host, False)
+            self._log(f"{host} is back under the scanner.", "info")
+        for host in sorted(now_allow - prev_allow):
+            self._scanner.set_override(host, True)
+            self._log(f"{host} will not be blocked or scanned.", "info")
+
         # Apply changes live: if a proxy-affecting field changed while the engine is
         # running, restart it so sing-box re-renders config.json with the new rules
         # (e.g. a freshly added bypass entry). sing-box has no hot-reload, so a
@@ -2072,7 +2227,11 @@ class ProxyForceApp(ctk.CTk):
     # update_*) are intentionally excluded so they never cause a disconnect.
     _PROXY_FIELDS = ("host", "port", "auth_type", "username", "password",
                      "exclude_private", "exclude_loopback", "bypass_list",
-                     "log_level", "ca_inject", "ca_cert_path")
+                     "log_level", "ca_inject", "ca_cert_path",
+                     # Clearing a verdict here drops a reject rule the running
+                     # engine has already loaded; without a restart the site
+                     # stays blocked and the override looks broken.
+                     "rep_allowlist")
 
     def _proxy_settings_changed(self, vals: dict) -> bool:
         """True if any proxy-affecting field in `vals` differs from the config the
@@ -2692,8 +2851,10 @@ class ProxyForceApp(ctk.CTk):
         cfg = load_config()
         if not cfg.get("rep_block"):
             return
-        if record.host in (cfg.get("rep_allowlist") or []):
-            self._log(f"{record.host} is on your allow list — not blocked.",
+        override = rep.allowlist_match(record.host, cfg.get("rep_allowlist"))
+        if override:
+            via = "" if override == record.host else f" (override on {override})"
+            self._log(f"{record.host} is allowed by you{via} — not blocked.",
                       "warning")
             return
 
@@ -2720,8 +2881,72 @@ class ProxyForceApp(ctk.CTk):
             else:
                 self._log("Could not save the block list.", "error")
                 return
-        self._pending_blocks += 1
-        self._scan_panel.set_pending_blocks(self._pending_blocks)
+        self._stage_rule_change()
+
+    def _override_site(self, host, allowed=True):
+        """Clear a wrong verdict, or put a cleared host back under the scanner.
+
+        Reputation providers get it wrong — a feed lists a CDN for an hour, Safe
+        Browsing flags a domain over one bad subpath — and until now the only
+        way out was to switch blocking off for everything. Clearing one verdict
+        has to do three things or it is not worth having: stop the host being
+        looked up again (or the next scan re-raises the same flag), take it off
+        the block list, and drop the reject rule the running engine already
+        loaded — which needs a restart, so it is staged next to every other rule
+        change rather than dropping the network under the user."""
+        entry, _apex, err = normalize_bypass_entry(host)
+        if err or not entry or "/" in entry:
+            self._log(f"Cannot override {host!r}: "
+                      f"{err or 'that is not a hostname'}.", "error")
+            return
+
+        cfg = load_config()
+        allow = [a for a in (cfg.get("rep_allowlist") or [])
+                 if rep.normalize_override(a) not in ("", entry)]
+        blocked = list(cfg.get("rep_blocklist") or [])
+        unblocked = []
+        if allowed:
+            allow.append(entry)
+            # Everything the override now covers comes off the block list, not
+            # just the exact name: the block reaches subdomains, so the clear
+            # has to as well.
+            unblocked = [b for b in blocked
+                         if rep.host_matches(rep.normalize_override(b), entry)]
+            blocked = [b for b in blocked if b not in unblocked]
+        cfg["rep_allowlist"] = allow
+        cfg["rep_blocklist"] = blocked
+        if not save_config(cfg):
+            messagebox.showerror("ProxyForce",
+                "Could not save the override.\nRun ProxyForce as administrator.")
+            self._log("Could not save the site override.", "error")
+            return
+        self._settings_panel.set_values({"rep_allowlist": allow,
+                                         "rep_blocklist": blocked})
+
+        # The scanner keeps its own copy of every verdict; bring it into line now
+        # rather than leaving a stale FLAGGED row until the host is visited again.
+        self._scanner.set_override(entry, allowed)
+        for seen in [h for h in self._flagged_seen
+                     if rep.host_matches(h, entry)]:
+            self._flagged_seen.discard(seen)
+
+        if allowed:
+            self._log(f"{entry} cleared — it will not be blocked or scanned "
+                      f"again. Delete it from Settings → Site Scanning to undo.",
+                      "success")
+            if unblocked:
+                self._stage_rule_change()
+                self._log("The engine is still running the old reject rule — "
+                          "press APPLY RULE CHANGES to restore access.",
+                          "warning")
+        else:
+            self._log(f"{entry} is back under the scanner; it will be checked "
+                      f"on its next connection.", "info")
+
+    def _stage_rule_change(self):
+        """Count one block-list change that the running engine has not loaded."""
+        self._pending_rules += 1
+        self._scan_panel.set_pending_rules(self._pending_rules)
 
     def _apply_blocks(self):
         """Restart the engine so pending reject rules take effect.
@@ -2729,23 +2954,23 @@ class ProxyForceApp(ctk.CTk):
         Deliberately a button rather than automatic: a restart tears down the TUN
         and kills every open TCP connection, which is a 10-40s outage. That is
         the user's call to make, not a side effect of a background scan."""
-        if self._pending_blocks <= 0:
+        if self._pending_rules <= 0:
             return
         if self._last_state not in ("running", "waiting", "starting"):
-            self._pending_blocks = 0
-            self._scan_panel.set_pending_blocks(0)
+            self._pending_rules = 0
+            self._scan_panel.set_pending_rules(0)
             return
         if not messagebox.askyesno(
                 "ProxyForce",
-                f"Apply {self._pending_blocks} new block"
-                f"{'s' if self._pending_blocks != 1 else ''}?\n\n"
+                f"Apply {self._pending_rules} rule change"
+                f"{'s' if self._pending_rules != 1 else ''}?\n\n"
                 "The engine restarts to load the new rules. Every open "
                 "connection drops and the network is unavailable for roughly "
                 "10-40 seconds."):
             return
-        self._pending_blocks = 0
-        self._scan_panel.set_pending_blocks(0)
-        self._log("Applying block list — reconnecting…", "info")
+        self._pending_rules = 0
+        self._scan_panel.set_pending_rules(0)
+        self._log("Applying block-list changes — reconnecting…", "info")
         self._start_engine()
 
     def _refresh_scan_view(self):

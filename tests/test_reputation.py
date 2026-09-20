@@ -3,7 +3,9 @@ Tests for core/reputation — the scan-once-and-remember scanner.
 
 The behaviours that matter here are the ones the feature was asked for:
 
-  * EVERY hostname is scanned — there are no allowlist exemptions.
+  * EVERY hostname is scanned — there is no bundled allowlist. The only
+    exemption is one the user made themselves, by clearing a verdict they
+    could see was wrong (OverrideTests).
   * Each host is scanned exactly ONCE, then served from cache, including
     across a restart. This is what stops a reputation check turning into
     constant traffic to a third party.
@@ -140,6 +142,9 @@ class _ScannerCase(unittest.TestCase):
         scanner._feeds = feeds or _FakeFeeds()
         scanner._gsb = gsb or _FakeGSB()
         scanner._vt = vt or _FakeVT()
+        # The dict the scanner actually reads (the copy above), so a test that
+        # changes a setting mid-run changes the one being consulted.
+        scanner.cfg = cfg
         self._scanners.append(scanner)
         return scanner
 
@@ -650,6 +655,213 @@ class ApiBudgetTests(_ScannerCase):
         self.assertGreater(resets, time.time())
         self.assertLessEqual(resets - time.time(), 86400)
         self.assertEqual(time.localtime(resets).tm_hour, 0)
+
+
+class OverrideTests(_ScannerCase):
+    """Clearing a false positive.
+
+    A reputation provider that flags google.com is not a hypothetical: feeds
+    carry bad entries, and a machine whose only recourse is to switch blocking
+    off for everything is worse protected than one where the user can say "not
+    this one". The behaviours that make an override worth having:
+
+      * the host stops being LOOKED UP, not merely stops being blocked — a flag
+        cleared only for the next scan to raise it again is not an override;
+      * it reaches subdomains, because a block does;
+      * it survives a verdict that was already in flight when it was made;
+      * and it is undone by deleting the entry, with nothing cached anywhere
+        that could keep the host exempt afterwards.
+    """
+
+    def test_an_allowed_host_is_never_looked_up(self):
+        gsb = _FakeGSB(bad=["google.com"])
+        cfg = dict(CFG_ALL, rep_allowlist=["google.com"])
+        s = self._scanner(cfg=cfg, gsb=gsb)
+        s.start()
+        s.observe("google.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(gsb.calls, 0)
+        self.assertEqual(s.sites()[0].status, rep.ALLOWED)
+
+    def test_an_allowed_host_covers_its_subdomains(self):
+        gsb = _FakeGSB()
+        cfg = dict(CFG_ALL, rep_allowlist=["google.com"])
+        s = self._scanner(cfg=cfg, gsb=gsb)
+        s.start()
+        s.observe("www.google.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(gsb.calls, 0)
+        record = s.sites()[0]
+        self.assertEqual(record.status, rep.ALLOWED)
+        self.assertIn("google.com", record.verdict.detail)
+
+    def test_a_lookalike_domain_is_not_covered(self):
+        """"notgoogle.com" ends with "google.com" as a string but is a different
+        domain; suffix matching has to be on label boundaries."""
+        gsb = _FakeGSB()
+        s = self._scanner(cfg=dict(CFG_ALL, rep_allowlist=["google.com"]),
+                          gsb=gsb)
+        s.start()
+        s.observe("notgoogle.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(gsb.batches, [["notgoogle.com"]])
+
+    def test_overriding_a_flagged_host_clears_the_verdict(self):
+        gsb = _FakeGSB(bad=["google.com"])
+        cfg = dict(CFG_ALL)
+        s = self._scanner(cfg=cfg, gsb=gsb)
+        s.start()
+        s.observe("google.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(s.sites()[0].status, rep.MALICIOUS)
+
+        s.cfg["rep_allowlist"] = ["google.com"]      # what the GUI persists
+        s.set_override("google.com", True)
+        self.assertEqual(s.sites()[0].status, rep.ALLOWED)
+
+        # ...and it is not looked up again on the next visit.
+        calls = gsb.calls
+        s.observe("google.com", 443, "proxy", "c2")
+        self._settle(s)
+        self.assertEqual(gsb.calls, calls)
+
+    def test_an_override_survives_a_verdict_already_in_flight(self):
+        cfg = dict(CFG_ALL)
+        s = self._scanner(cfg=cfg)
+        s._cache["google.com"] = rep.Verdict("google.com", rep.ALLOWED, "you",
+                                             "cleared by you",
+                                             expires_at=float("inf"))
+        s._sites["google.com"] = rep.SiteRecord("google.com")
+        s._sites["google.com"].verdict = s._cache["google.com"]
+        s._record("google.com", rep.Verdict("google.com", rep.MALICIOUS,
+                                            "feeds", "listed"))
+        self.assertEqual(s._cache["google.com"].status, rep.ALLOWED)
+        self.assertEqual(s.recent_flags(), [])
+
+    def test_the_providers_marks_survive_the_override(self):
+        """An override is the user disagreeing with a source, not a claim that
+        nobody ever looked — the Sites table still has to say who flagged it."""
+        gsb = _FakeGSB(bad=["google.com"])
+        cfg = dict(CFG_ALL)
+        s = self._scanner(cfg=cfg, gsb=gsb)
+        s.start()
+        s.observe("google.com", 443, "proxy", "c1")
+        self._settle(s)
+        s.cfg["rep_allowlist"] = ["google.com"]
+        s.set_override("google.com", True)
+        self.assertEqual(s.sites()[0].checks.get("safebrowsing"),
+                         rep.MALICIOUS)
+
+    def test_removing_the_override_puts_the_host_back_under_the_scanner(self):
+        gsb = _FakeGSB(bad=["google.com"])
+        cfg = dict(CFG_ALL, rep_allowlist=["google.com"])
+        s = self._scanner(cfg=cfg, gsb=gsb)
+        s.start()
+        s.observe("google.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(gsb.calls, 0)
+
+        s.cfg["rep_allowlist"] = []
+        s.set_override("google.com", False)
+        self._settle(s)
+        self.assertEqual(gsb.calls, 1)
+        self.assertEqual(s.sites()[0].status, rep.MALICIOUS)
+
+    def test_an_override_is_never_written_to_the_verdict_cache(self):
+        """The allow list is the only record of the decision. A cached ALLOWED
+        verdict would outlive an entry the user deleted, and the host would stay
+        silently exempt."""
+        cfg = dict(CFG_ALL, rep_allowlist=["google.com"])
+        s = self._scanner(cfg=cfg)
+        s.start()
+        s.observe("google.com", 443, "proxy", "c1")
+        self._settle(s)
+        s.stop()
+
+        cfg["rep_allowlist"] = []
+        s2 = self._scanner(cfg=cfg, gsb=_FakeGSB())
+        s2.start()
+        self.assertNotIn("google.com", s2._cache)
+        s2.observe("google.com", 443, "proxy", "c1")
+        self._settle(s2)
+        self.assertEqual(s2.sites()[0].status, rep.CLEAN)
+
+    def test_an_allowed_host_is_not_spent_on_the_virustotal_budget(self):
+        vt = _FakeVT()
+        cfg = dict(CFG_ALL, rep_vt_key="vt-key")
+        s = self._scanner(cfg=cfg, vt=vt)
+        s.start()
+        s.observe("google.com", 443, "proxy", "c1")
+        self._settle(s)
+        s.cfg["rep_allowlist"] = ["google.com"]
+        s.set_override("google.com", True)
+        # Queued for the second opinion before the override; the backlog must
+        # drop it rather than spend one of 500 daily lookups on it.
+        self.assertIsNone(s._next_vt_host())
+
+    def test_stats_counts_the_overrides(self):
+        cfg = dict(CFG_ALL, rep_allowlist=["google.com"])
+        s = self._scanner(cfg=cfg)
+        s.start()
+        s.observe("www.google.com", 443, "proxy", "c1")
+        self._settle(s)
+        self.assertEqual(s.stats()["allowed"], 1)
+
+    def test_blocked_hosts_are_listed_so_they_can_be_cleared(self):
+        """A block stops the host connecting, so it never reappears in the
+        table by itself — and the row is the only place an override can be
+        reached. Seeded from the block list, it is there after a restart."""
+        s = self._scanner()
+        listed = s.note_blocked(["evil.example", "Google.COM.", "  ", "8.8.8.8"])
+        self.assertEqual(sorted(listed), ["evil.example", "google.com"])
+        record = next(r for r in s.sites() if r.host == "google.com")
+        self.assertEqual(record.status, rep.MALICIOUS)
+        self.assertEqual(record.last_seen, 0.0)     # blocked, not seen
+
+    def test_seeding_keeps_the_verdict_that_caused_the_block(self):
+        gsb = _FakeGSB(bad=["google.com"])
+        s = self._scanner(gsb=gsb)
+        s.start()
+        s.observe("google.com", 443, "proxy", "c1")
+        self._settle(s)
+        s.note_blocked(["google.com"])              # already listed; no clobber
+        record = next(r for r in s.sites() if r.host == "google.com")
+        self.assertEqual(record.verdict.source, "safebrowsing")
+        self.assertEqual(record.conns, 1)
+
+    def test_a_seeded_block_can_be_overridden(self):
+        s = self._scanner(cfg=dict(CFG_ALL))
+        s.note_blocked(["google.com"])
+        s.cfg["rep_allowlist"] = ["google.com"]
+        s.set_override("google.com", True)
+        self.assertEqual(s.sites()[0].status, rep.ALLOWED)
+
+
+class MatchingTests(unittest.TestCase):
+
+    def test_host_matches_the_apex_and_its_subdomains(self):
+        for host in ("google.com", "www.google.com", "a.b.google.com"):
+            self.assertTrue(rep.host_matches(host, "google.com"), host)
+
+    def test_host_does_not_match_a_lookalike_or_a_parent(self):
+        for host in ("notgoogle.com", "google.com.evil.test", "com"):
+            self.assertFalse(rep.host_matches(host, "google.com"), host)
+
+    def test_normalize_override_tidies_what_a_hand_edit_may_leave(self):
+        for raw in ("Google.COM", "*.google.com", ".google.com",
+                    "google.com.", "google.com:443", "  google.com  "):
+            self.assertEqual(rep.normalize_override(raw), "google.com", raw)
+
+    def test_normalize_override_rejects_what_is_not_a_site(self):
+        for raw in ("", "10.0.0.0/8", "8.8.8.8", "localhost",
+                    "google.com/path"):
+            self.assertEqual(rep.normalize_override(raw), "", raw)
+
+    def test_allowlist_match_returns_the_entry_that_covered_the_host(self):
+        self.assertEqual(
+            rep.allowlist_match("www.google.com", ["evil.test", "google.com"]),
+            "google.com")
+        self.assertEqual(rep.allowlist_match("example.com", ["google.com"]), "")
 
 
 if __name__ == "__main__":

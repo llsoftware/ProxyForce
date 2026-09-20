@@ -144,6 +144,8 @@ No install wizard, no service to register. The folder can live anywhere.
 | See which sources have checked a host | **Scanning tab** — the Feeds / GSB / VT columns |
 | Check scanner health & API key usage | **Scanning tab** — SOURCES, with each key's daily budget |
 | Get more rows out of the site list | **Scanning tab → EXPAND**, or drag the divider |
+| Clear a site that was flagged wrongly | **Scanning tab → right-click the row → Allow**, then **Apply Rule Changes** |
+| Review or undo your overrides | **Settings tab → SITE SCANNING → Allowed sites** |
 | Read engine diagnostics | **Log tab** |
 | Switch light/dark theme | Toggle in the header: ☀ Light · 🖥 Auto · 🌙 Dark |
 
@@ -178,8 +180,9 @@ and blocks it.
 `C:\ProgramData\ProxyForce\reputation\cache.json` and reused from then on, so
 after the first few days of normal browsing the scanner makes almost no requests
 at all — a site you visit every day is checked once and remembered as known-good.
-There are no exemptions: every hostname is scanned, including the scanner's own
-API endpoints.
+Nothing is exempt out of the box: every hostname is scanned, including the
+scanner's own API endpoints. The only exemptions are the ones **you** make — see
+**Clearing a false positive** below.
 
 ### Sources
 
@@ -230,12 +233,45 @@ whole tab to the list, and **COLLAPSE** puts it back.
 2. Every **live** connection to that host is closed via the Clash API.
 3. The host is added to the block list and saved.
 4. The blocking rule itself (a sing-box `reject` route rule plus an NXDOMAIN DNS
-   rule) applies from the **next Start**. Use **Scanning → Apply Blocks Now** to
+   rule) applies from the **next Start**. Use **Scanning → Apply Rule Changes Now** to
    take it immediately — that restarts the engine, which drops every open
    connection and takes roughly 10–40 seconds.
 
 The restart is deliberately a button and never automatic: a background scan
 should not be able to drop your network on its own.
+
+### Clearing a false positive
+
+Reputation sources get it wrong. A feed carries a bad entry for an hour, Safe
+Browsing condemns a whole domain over one bad subpath, and suddenly a site you
+know is fine stops loading. You do not have to switch blocking off for
+everything to get it back.
+
+**Right-click the site on the Scanning tab → "Allow …".** That does three
+things:
+
+1. **Takes it off the block list**, and everything under it — the block reaches
+   subdomains, so the override does too. Clearing `example.com` also clears
+   `www.example.com`.
+2. **Stops it being scanned again.** This is the part that makes an override
+   stick: a cleared flag that the next lookup simply raises again would not be
+   an override at all. The row reads `★ allowed` from then on, and the marks
+   from whichever source flagged it stay visible — you disagreed with a source,
+   you did not erase what it said.
+3. **Stages the engine restart**, because the `reject` rule the running engine
+   loaded is still live. Press **APPLY RULE CHANGES NOW** on the Scanning tab to
+   take it — same 10–40 second reconnect as applying a block, and for the same
+   reason it is a button and not automatic.
+
+Every override is a line in **Settings → SITE SCANNING → Allowed sites**, which
+is where you go to review them or type one in ahead of time. That list is the
+*whole* record of the decision — nothing is cached anywhere else — so **deleting
+the line is the undo**: the site goes straight back under the scanner and is
+checked on its next connection.
+
+> **This is an override, so treat it as one.** A site you allow is never checked
+> against any source again while it is on the list. Clear a verdict because you
+> know the site, not because it is inconvenient.
 
 ### What is and isn't covered
 

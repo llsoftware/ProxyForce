@@ -573,19 +573,25 @@ class SingBoxController:
         bypass list these are always apex-inclusive: blocking `evil.example`
         must also block `cdn.evil.example`, and domain_suffix without a leading
         dot does both. Entries the user has explicitly allowed are dropped.
+
+        The allow test is by suffix for the same reason the block is: an
+        override of `example.com` has to clear `www.example.com` too, or the
+        user clears a false positive and stays blocked one level down.
         """
-        allow = set()
+        allow = []
         for entry in (getattr(self.config, "rep_allowlist", None) or []):
             base, _apex, err = normalize_bypass_entry(entry)
-            if not err and base:
-                allow.add(base)
+            if not err and base and "/" not in base:
+                allow.append(base)
         out: List[str] = []
         seen = set()
         for entry in (self.config.rep_blocklist or []):
             base, _apex, err = normalize_bypass_entry(entry)
             if err or not base or "/" in base:
                 continue        # a CIDR is not a site; skip rather than guess
-            if base in allow or base in seen:
+            if base in seen:
+                continue
+            if any(base == a or base.endswith("." + a) for a in allow):
                 continue
             seen.add(base)
             out.append(base)

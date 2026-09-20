@@ -77,9 +77,13 @@ _DEFAULTS = {
     "rep_vt_key": "",
     "rep_block": True,          # add flagged hosts to rep_blocklist
     "rep_blocklist": [],        # hosts flagged malicious -> sing-box reject rules
-    # False-positive overrides: hosts the user chose to allow after a flag. These
-    # are still SCANNED (there are no scan exemptions — every host is looked up
-    # exactly once and then served from cache); they are simply never blocked.
+    # False-positive overrides: hosts the user cleared after a wrong flag. An
+    # entry here does both halves of the job — the host is never blocked, and it
+    # is never looked up again — because a cleared flag that the next scan simply
+    # raises again is not an override. Matched by suffix, the same reach a block
+    # has: clearing "example.com" also clears "www.example.com". This list is the
+    # whole record of the decision, so deleting a line puts the host straight
+    # back under the scanner. See core/reputation.py:allowlist_match.
     "rep_allowlist": [],
 }
 
